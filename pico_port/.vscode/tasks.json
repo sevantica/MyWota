@@ -1,0 +1,108 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Configure Build",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-Command",
+                "if (-not (Test-Path '${workspaceFolder}/build')) { New-Item -ItemType Directory -Path '${workspaceFolder}/build' }; Set-Location '${workspaceFolder}/build'; cmake -G Ninja .."
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Build",
+            "type": "process",
+            "command": "${env:USERPROFILE}/.pico-sdk/ninja/v1.12.1/ninja.exe",
+            "args": [
+                "-C",
+                "${workspaceFolder}/build",
+                "-j4"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            },
+            "problemMatcher": "$gcc"
+        },
+        {
+            "label": "Clean Build",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-Command",
+                "if (Test-Path '${workspaceFolder}/build') { Remove-Item -Recurse -Force '${workspaceFolder}/build' }; Write-Host 'Build directory cleaned'"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Clean and Build",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "Clean Build",
+                "Build"
+            ],
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Flash with Picotool",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                "${workspaceFolder}\\scripts\\flash-picotool.ps1"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "Build and Flash (Picotool)",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "Build",
+                "Flash with Picotool"
+            ],
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            },
+            "problemMatcher": []
+        }
+    ]
+}

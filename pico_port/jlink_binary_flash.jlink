@@ -1,0 +1,7 @@
+// J-Link script for flashing RP2040 binary - optimized for speed
+si 1
+speed 4000
+r
+h
+loadbin C:/Projects/Projects/Project-miWota/Projects/miWota/EE-Firmware/miWota/pico_port/build/UI_PICO_PORT.bin,0x10000000
+qc

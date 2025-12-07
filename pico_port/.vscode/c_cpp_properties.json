@@ -1,0 +1,34 @@
+{
+    "configurations": [
+        {
+            "name": "Pico",
+            "includePath": [
+                "${workspaceFolder}/**",
+                "${workspaceFolder}/build/generated/**",
+                "${userHome}/.pico-sdk/sdk/2.2.0/**"
+            ],
+            "forcedInclude": [
+                "${workspaceFolder}/build/generated/pico_base/pico/config_autogen.h",
+                "${userHome}/.pico-sdk/sdk/2.2.0/src/common/pico_base_headers/include/pico.h"
+            ],
+            "defines": [
+                "PICO_BOARD=pico",
+                "PICO_BUILD=1",
+                "PICO_CMAKE_BUILD_TYPE=Release",
+                "PICO_COPY_TO_RAM=0",
+                "PICO_CXX_ENABLE_EXCEPTIONS=0",
+                "PICO_NO_FLASH=0",
+                "PICO_NO_HARDWARE=0",
+                "PICO_ON_DEVICE=1",
+                "PICO_TARGET_NAME=\"UI_PICO_PORT\"",
+                "PICO_USE_BLOCKED_RAM=0"
+            ],
+            "compilerPath": "${userHome}/.pico-sdk/toolchain/14_2_Rel1/bin/arm-none-eabi-gcc",
+            "compileCommands": "${workspaceFolder}/build/compile_commands.json",
+            "cStandard": "c17",
+            "cppStandard": "c++14",
+            "intelliSenseMode": "linux-gcc-arm"
+        }
+    ],
+    "version": 4
+}

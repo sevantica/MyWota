@@ -1,0 +1,112 @@
+# GDB initialization file for Pico debugging
+# This file is automatically loaded by GDB when debugging
+
+# Pretty printing settings
+set print pretty on
+set print array on
+set print array-indexes on
+set print symbol-filename on
+set print address on
+set print union on
+set print demangle on
+set pagination off
+set confirm off
+
+# Default to hexadecimal output for addresses and pointers
+set output-radix 16
+
+# Enable history
+set history save on
+set history size 1000
+set history filename ~/.gdb_history
+
+# Custom commands for FreeRTOS debugging
+define show_tasks
+    printf "=== FreeRTOS Task List ===\n"
+    info threads
+    printf "==========================\n"
+end
+
+define show_heap
+    printf "=== Heap Information ===\n"
+    printf "Free heap: %u bytes\n", (unsigned int)xPortGetFreeHeapSize()
+    printf "Min free heap: %u bytes\n", (unsigned int)xPortGetMinimumEverFreeHeapSize()
+    printf "Total heap: %u bytes\n", configTOTAL_HEAP_SIZE
+    printf "Used heap: %u bytes\n", configTOTAL_HEAP_SIZE - (unsigned int)xPortGetFreeHeapSize()
+    printf "========================\n"
+end
+
+define show_task_stacks
+    printf "=== Task Stack Usage ===\n"
+    # Note: This requires FreeRTOS debug symbols
+    printf "Use 'info threads' and switch to each thread to check stack\n"
+    printf "========================\n"
+end
+
+define reset_and_run
+    monitor reset
+    monitor halt
+    continue
+end
+
+define print_registers
+    printf "=== CPU Registers ===\n"
+    info registers all
+    printf "=====================\n"
+end
+
+define show_test_mode
+    printf "=== Test Mode Status ===\n"
+    # Call the test mode status function if available
+    printf "Use: p MIFARE_Dispenser_GetTestModeStatus()\n"
+    printf "========================\n"
+end
+
+define help_custom
+    printf "=== Custom GDB Commands ===\n"
+    printf "show_tasks       - Display FreeRTOS task list\n"
+    printf "show_heap        - Display heap usage information\n"
+    printf "show_task_stacks - Display task stack usage\n"
+    printf "reset_and_run    - Reset MCU and continue execution\n"
+    printf "print_registers  - Display all CPU registers\n"
+    printf "show_test_mode   - Display test mode status\n"
+    printf "help_custom      - Show this help\n"
+    printf "===============================\n"
+end
+
+# Convenient breakpoint aliases
+define bp_main
+    break main
+end
+
+define bp_hardfault
+    break HardFault_Handler_C
+end
+
+define bp_malloc_fail
+    break vApplicationMallocFailedHook
+end
+
+define bp_stack_overflow
+    break vApplicationStackOverflowHook
+end
+
+# Set up common breakpoints
+define setup_common_breakpoints
+    bp_main
+    bp_hardfault
+    bp_malloc_fail
+    bp_stack_overflow
+    printf "Common breakpoints set up\n"
+end
+
+# Welcome message
+define show_welcome
+    printf "\n=== Pico Debug Session Started ===\n"
+    printf "Type 'help_custom' for custom commands\n"
+    printf "Type 'setup_common_breakpoints' to set common breakpoints\n"
+    printf "===================================\n\n"
+end
+
+# Auto-run welcome message
+show_welcome
