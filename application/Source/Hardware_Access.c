@@ -441,6 +441,14 @@ void i2c_driver_transact(I2C_MSG_DEF *i2c_msg)
 		return;
 	}
 	
+	TickType_t entry_time = xTaskGetTickCount();
+	const char* task_name = pcTaskGetName(NULL);
+	
+	USB_Log_Printf("[%lu ms] I2C_TRANSACT: task=%s, addr=0x%02X, rw=%s, len=%lu\r\n",
+	               entry_time, task_name, i2c_msg->device_address, 
+	               i2c_msg->rw ? "READ" : "WRITE",
+	               i2c_msg->rw ? i2c_msg->rx_msg_length : i2c_msg->tx_msg_length);
+	
 	SemaphoreHandle_t bus_lock = NULL;
 	switch (i2c_msg->i2c_id) {
 	case I2C_PN532:
@@ -456,11 +464,16 @@ void i2c_driver_transact(I2C_MSG_DEF *i2c_msg)
 	
 	// Add timeout protection for I2C semaphore
 	TickType_t xTimeout = pdMS_TO_TICKS(150); // 150ms timeout for I2C operations
+	USB_Log_Printf("[%lu ms] I2C_TRANSACT: Waiting for semaphore...\r\n", xTaskGetTickCount());
+	
 	if (bus_lock && xSemaphoreTake(bus_lock, xTimeout) != pdTRUE) {
-		USB_Log_Printf("I2C: Timeout acquiring semaphore for I2C_%d\r\n", i2c_msg->i2c_id);
+		USB_Log_Printf("[%lu ms] I2C_TRANSACT: Timeout acquiring semaphore for I2C_%d\r\n", 
+		               xTaskGetTickCount(), i2c_msg->i2c_id);
 		i2c_msg->status = 1; // Set error status
 		return;
 	}
+	
+	USB_Log_Printf("[%lu ms] I2C_TRANSACT: Semaphore acquired\r\n", xTaskGetTickCount());
 	
 	/* Critical section: single transaction on bus */
 	switch (i2c_msg->i2c_id) {
@@ -518,14 +531,22 @@ void i2c_driver_transact(I2C_MSG_DEF *i2c_msg)
 		}
 		// Set status: success if bytes transferred equal expected
 		// PICO_ERROR_TIMEOUT (-1) indicates timeout occurred
+		USB_Log_Printf("[%lu ms] I2C_TRANSACT: Pico result=%d (expected=%lu)\r\n", 
+		               xTaskGetTickCount(), result, 
+		               i2c_msg->rw ? i2c_msg->rx_msg_length : i2c_msg->tx_msg_length);
+		
 		if (result == PICO_ERROR_TIMEOUT) {
 			i2c_msg->status = 2; // Timeout error
+			USB_Log_Printf("[%lu ms] I2C_TRANSACT: TIMEOUT ERROR\r\n", xTaskGetTickCount());
 		} else if (result == PICO_ERROR_GENERIC) {
 			i2c_msg->status = 3; // Generic error (NACK, etc.)
+			USB_Log_Printf("[%lu ms] I2C_TRANSACT: GENERIC ERROR (NACK)\r\n", xTaskGetTickCount());
 		} else if (result == (int)i2c_msg->tx_msg_length || result == (int)i2c_msg->rx_msg_length) {
 			i2c_msg->status = 0; // Success
+			USB_Log_Printf("[%lu ms] I2C_TRANSACT: SUCCESS\r\n", xTaskGetTickCount());
 		} else {
 			i2c_msg->status = 1; // Other error
+			USB_Log_Printf("[%lu ms] I2C_TRANSACT: OTHER ERROR\r\n", xTaskGetTickCount());
 		}
 #endif
 		break;
@@ -542,6 +563,10 @@ void i2c_driver_transact(I2C_MSG_DEF *i2c_msg)
 		break;
 		
 	}
+	
+	TickType_t total_time = xTaskGetTickCount() - entry_time;
+	USB_Log_Printf("[%lu ms] I2C_TRANSACT: Complete - status=%u, duration=%lu ms\r\n",
+	               xTaskGetTickCount(), i2c_msg->status, total_time);
 	
 	if (bus_lock) { xSemaphoreGive(bus_lock); bus_lock = NULL; }
 }
@@ -992,7 +1017,10 @@ void task_transact_spi_msg(SPI_MSG_DEF *spi_msg)
  */
 void task_transact_i2c_msg(I2C_MSG_DEF *i2c_msg)
 {
-    if (!i2c_msg) return;
+    if (!i2c_msg) {
+        return;
+    }
+    
     i2c_driver_transact(i2c_msg);
 }
 
@@ -1016,8 +1044,14 @@ uint8_t Hardware_I2C_Write(I2C_ACCESS_IDS_ENUM i2c_id, uint8_t device_address,
 {
     // Validate parameters
     if (tx_data == NULL || tx_length == 0) {
+        USB_Log_Printf("HW_I2C: [%lu ms] Write failed - invalid params\r\n", xTaskGetTickCount());
         return 1; // Error: Invalid parameters
     }
+    
+    TickType_t start = xTaskGetTickCount();
+    const char* task_name = pcTaskGetName(NULL);
+    USB_Log_Printf("HW_I2C: [%lu ms] Write START: task=%s, addr=0x%02X, len=%lu, data[0]=0x%02X\r\n",
+                   start, task_name, device_address, tx_length, tx_data[0]);
     
     // Create and initialize I2C message structure
     I2C_MSG_DEF i2c_msg = {0};
@@ -1030,8 +1064,14 @@ uint8_t Hardware_I2C_Write(I2C_ACCESS_IDS_ENUM i2c_id, uint8_t device_address,
     i2c_msg.RequestingTask = xTaskGetCurrentTaskHandle();
     i2c_msg.status = 1; // Initialize as error
     
+    USB_Log_Printf("HW_I2C: [%lu ms] Calling task_transact_i2c_msg...\r\n", xTaskGetTickCount());
+    
     // Perform I2C transaction
     task_transact_i2c_msg(&i2c_msg);
+    
+    TickType_t duration = xTaskGetTickCount() - start;
+    USB_Log_Printf("HW_I2C: [%lu ms] Write DONE: status=%u, duration=%lu ms\r\n",
+                   xTaskGetTickCount(), i2c_msg.status, duration);
     
     // Return status (0 = success, non-zero = error)
     return i2c_msg.status;
@@ -1048,13 +1088,19 @@ uint8_t Hardware_I2C_Write(I2C_ACCESS_IDS_ENUM i2c_id, uint8_t device_address,
  * This function wraps the I2C_MSG_DEF structure, providing a cleaner API
  * for drivers that don't need to access the low-level message structure.
  */
-uint8_t Hardware_I2C_Read(I2C_ACCESS_IDS_ENUM i2c_id, uint8_t device_address,
+uint8_t Hardware_I2C_Read(I2C_ACCESS_IDS_ENUM i2c_id, uint8_t device_address, 
                           uint8_t *rx_data, uint32_t rx_length)
 {
     // Validate parameters
     if (rx_data == NULL || rx_length == 0) {
+        USB_Log_Printf("HW_I2C: [%lu ms] Read failed - invalid params\r\n", xTaskGetTickCount());
         return 1; // Error: Invalid parameters
     }
+    
+    TickType_t start = xTaskGetTickCount();
+    const char* task_name = pcTaskGetName(NULL);
+    USB_Log_Printf("HW_I2C: [%lu ms] Read START: task=%s, addr=0x%02X, len=%lu\r\n",
+                   start, task_name, device_address, rx_length);
     
     // Create and initialize I2C message structure
     I2C_MSG_DEF i2c_msg = {0};
@@ -1067,14 +1113,23 @@ uint8_t Hardware_I2C_Read(I2C_ACCESS_IDS_ENUM i2c_id, uint8_t device_address,
     i2c_msg.RequestingTask = xTaskGetCurrentTaskHandle();
     i2c_msg.status = 1; // Initialize as error
     
+    USB_Log_Printf("HW_I2C: [%lu ms] Calling task_transact_i2c_msg...\r\n", xTaskGetTickCount());
+    
     // Perform I2C transaction
     task_transact_i2c_msg(&i2c_msg);
     
+    TickType_t duration = xTaskGetTickCount() - start;
+    if (i2c_msg.status == 0 && rx_length > 0) {
+        USB_Log_Printf("HW_I2C: [%lu ms] Read DONE: status=%u, data[0]=0x%02X, duration=%lu ms\r\n",
+                       xTaskGetTickCount(), i2c_msg.status, rx_data[0], duration);
+    } else {
+        USB_Log_Printf("HW_I2C: [%lu ms] Read DONE: status=%u, duration=%lu ms\r\n",
+                       xTaskGetTickCount(), i2c_msg.status, duration);
+    }
+    
     // Return status (0 = success, non-zero = error)
     return i2c_msg.status;
-}
-
-/* ========================================================================== */
+}/* ========================================================================== */
 /*                    PLATFORM-ABSTRACTED GPIO FUNCTIONS                    */
 /* ========================================================================== */
 
@@ -1320,16 +1375,20 @@ void Hardware_GPIO_Init(uint32_t pin, uint8_t direction)
  */
 void Hardware_PN532_Reset(void)
 {
+    USB_Log_Printf("HW: [%lu ms] Hardware_PN532_Reset: Starting reset sequence\r\n", xTaskGetTickCount());
+    
 #if defined(STM32F411xE)
     // STM32 implementation using platform-abstracted GPIO functions
     // Initialize reset pin as output (though it should already be configured by MX_GPIO_Init)
     //Hardware_GPIO_Init(PN532_RST_PIN_ID, HW_GPIO_DIR_OUTPUT);
     
     // Pull reset pin to active state (considering inverting hardware logic)
+    USB_Log_Printf("HW: [%lu ms] Asserting reset (ACTIVE)\r\n", xTaskGetTickCount());
     Hardware_GPIO_Write(PN532_RST_PIN_ID, PCD_RESET_ACTIVE);
     Hardware_PN532_Delay_MS(PN532_RESET_DELAY_MS);  // Hold reset for 10ms
     
     // Release reset pin to inactive state (considering inverting hardware logic)
+    USB_Log_Printf("HW: [%lu ms] Releasing reset (INACTIVE)\r\n", xTaskGetTickCount());
     Hardware_GPIO_Write(PN532_RST_PIN_ID, PCD_RESET_INACTIVE);
     Hardware_PN532_Delay_MS(PN532_RESET_DELAY_MS);  // Wait 10ms for PN532 to initialize
 
@@ -1341,15 +1400,20 @@ void Hardware_PN532_Reset(void)
 #elif defined(PICO_BUILD)
     // Pico implementation using platform-abstracted GPIO functions
     // Initialize reset pin as output
+    USB_Log_Printf("HW: [%lu ms] Initializing reset pin GPIO %d\r\n", xTaskGetTickCount(), PN532_RST_PIN);
     Hardware_GPIO_Init(PN532_RST_PIN_ID, HW_GPIO_DIR_OUTPUT);
     
     // Pull reset pin to active state (considering inverting hardware logic)
+    USB_Log_Printf("HW: [%lu ms] Asserting reset (ACTIVE), holding for 200ms\r\n", xTaskGetTickCount());
     Hardware_GPIO_Write(PN532_RST_PIN_ID, PCD_RESET_ACTIVE);
     Hardware_PN532_Delay_MS(200);
+    USB_Log_Printf("HW: [%lu ms] Reset hold complete\r\n", xTaskGetTickCount());
     
     // Release reset pin to inactive state (considering inverting hardware logic)
+    USB_Log_Printf("HW: [%lu ms] Releasing reset (INACTIVE), waiting 700ms\r\n", xTaskGetTickCount());
     Hardware_GPIO_Write(PN532_RST_PIN_ID, PCD_RESET_INACTIVE);
     Hardware_PN532_Delay_MS(700);
+    USB_Log_Printf("HW: [%lu ms] Reset recovery complete\r\n", xTaskGetTickCount());
 #else
     // Generic fallback implementation
     // Initialize reset pin as output
@@ -1371,7 +1435,11 @@ void Hardware_PN532_Reset(void)
  */
 void Hardware_PN532_Delay_MS(uint32_t milliseconds)
 {
+	TickType_t start = xTaskGetTickCount();
+	USB_Log_Printf("HW: [%lu ms] Delay %lu ms starting...\\r\\n", start, milliseconds);
 	vTaskDelay(pdMS_TO_TICKS(milliseconds));
+	USB_Log_Printf("HW: [%lu ms] Delay complete (actual=%lu ms)\\r\\n", 
+	               xTaskGetTickCount(), xTaskGetTickCount() - start);
 }
 
 /**

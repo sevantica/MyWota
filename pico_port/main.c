@@ -38,6 +38,12 @@ void print_memory_stats(void)
 // Entry point
 int main()
 {
+    // Initialize stdio (USB and UART) FIRST before anything else
+    stdio_init_all();
+    
+    // Small delay to allow USB to enumerate
+    sleep_ms(1000);
+    
     // Initialize all hardware peripherals (this will initialize USB stdio)
     Hardware_Init();
     
@@ -62,6 +68,18 @@ int main()
 }
 
 // FreeRTOS hook functions
+void vApplicationIdleHook( void )
+{
+    static uint32_t idle_count = 0;
+    idle_count++;
+    if (idle_count % 500000 == 0) {
+        // Quick LED blink in idle to show system is running
+        gpio_put(PICO_DEFAULT_LED_PIN, 1);
+        busy_wait_us(50000);
+        gpio_put(PICO_DEFAULT_LED_PIN, 0);
+    }
+}
+
 void vApplicationMallocFailedHook( void )
 {
 

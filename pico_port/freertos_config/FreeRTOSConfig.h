@@ -1,10 +1,6 @@
 /*
  * FreeRTOS V202111.00
- * Copyright (C) 2020 Amazon.com, Inc. or its aff#ifndef#define configTOTAL_HEAP_SIZE                   (128*1024)configSUPPORT_DYNAMIC_ALLOCATION
-#define configSUPPORT_DYNAMIC_ALLOCATION        1
-#endif
-#define configTOTAL_HEAP_SIZE                   (48*1024)
-#define configAPPLICATION_ALLOCATED_HEAP        0es.  All Rights Reserved.
+ * Copyright (C) 2020 Amazon.com, Inc. or its affiliates.  All Rights Reserved.
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy of
  * this software and associated documentation files (the "Software"), to deal in
@@ -48,7 +44,7 @@
 /* Scheduler Related */
 #define configUSE_PREEMPTION                    1
 #define configUSE_TICKLESS_IDLE                 0
-#define configUSE_IDLE_HOOK                     0
+#define configUSE_IDLE_HOOK                     1
 #define configUSE_TICK_HOOK                     0
 #define configTICK_RATE_HZ                      ( ( TickType_t ) 1000 )
 #define configCPU_CLOCK_HZ                      125000000

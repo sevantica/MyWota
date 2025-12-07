@@ -33,22 +33,34 @@ message(STATUS "Build type is ${CMAKE_BUILD_TYPE}")
 # Initialize the Pico SDK
 pico_sdk_init()
 
-# Set up FreeRTOS
-set(FREERTOS_KERNEL_PATH ${CMAKE_CURRENT_SOURCE_DIR}/../../sevantica_drivers/FreeRTOS-Kernel)
+# Set up FreeRTOS configuration (must be done BEFORE adding drivers library)
 set(FREERTOS_PORT "GCC_RP2040" CACHE STRING "" FORCE)
 set(FREERTOS_HEAP "4" CACHE STRING "" FORCE)
 
-# Create freertos_config target
+# Create freertos_config target BEFORE adding drivers (required by FreeRTOS)
 add_library(freertos_config INTERFACE)
 target_include_directories(freertos_config INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}/freertos_config
 )
-target_compile_definitions(freertos_config INTERFACE
-    PICO_CONFIG_RTOS_ADAPTER_HEADER=${FREERTOS_KERNEL_PATH}/portable/ThirdParty/GCC/RP2040/include/freertos_sdk_config.h
+
+# Set the path to lv_conf.h for LVGL (must be set BEFORE adding LVGL)
+set(LV_CONF_PATH ${CMAKE_CURRENT_SOURCE_DIR}/../application/User_Interface/miWota/lv_conf.h)
+
+# Disable building LVGL examples and demos to save memory and build time
+set(LV_CONF_BUILD_DISABLE_EXAMPLES 1)
+set(LV_CONF_BUILD_DISABLE_DEMOS 1)
+
+# Add the application LVGL library BEFORE drivers (drivers needs to link against it)
+add_subdirectory(../application/User_Interface/miWota/lvgl ${CMAKE_CURRENT_BINARY_DIR}/app_lvgl)
+
+# Set additional include directories for drivers library (needed for Hardware_Access.h, lv_conf.h, etc.)
+set(PARENT_INCLUDE_DIRS 
+    ${CMAKE_CURRENT_SOURCE_DIR}/../application/Include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../application/User_Interface/miWota
 )
 
-# Add FreeRTOS subdirectory
-add_subdirectory(../../sevantica_drivers/FreeRTOS-Kernel ${CMAKE_CURRENT_BINARY_DIR}/FreeRTOS-Kernel)
+# Add the custom drivers library (includes FreeRTOS via FetchContent)
+add_subdirectory(../../../Common/sevantica_drivers ${CMAKE_CURRENT_BINARY_DIR}/drivers)
 
 # Set C/C++ standards
 set(CMAKE_C_STANDARD 11)
@@ -97,7 +109,7 @@ include_directories(
     ../application/User_Interface/miWota/lvgl/src
     ../application/User_Interface/miWota/lvgl/src/drivers
     ../application/Include
-    ../../sevantica_drivers/Include
+    ../../../Common/sevantica_drivers/Include
     ../application/User_Interface/miWota/ui
     ../application/User_Interface/miWota/ui/screens
     ../application/User_Interface/miWota/ui/images
@@ -106,20 +118,8 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/screens
 )
 
-# Set the path to lv_conf.h for LVGL
-set(LV_CONF_PATH ${CMAKE_CURRENT_SOURCE_DIR}/../application/User_Interface/miWota/lv_conf.h)
-
-# Disable building LVGL examples and demos to save memory and build time
-set(LV_CONF_BUILD_DISABLE_EXAMPLES 1)
-set(LV_CONF_BUILD_DISABLE_DEMOS 1)
-
-# Add the application LVGL library
-add_subdirectory(../application/User_Interface/miWota/lvgl ${CMAKE_CURRENT_BINARY_DIR}/app_lvgl)
-
+# Add UI library after LVGL
 add_subdirectory(../application/User_Interface/miWota/ui ${CMAKE_CURRENT_BINARY_DIR}/app_ui)
-
-# Add the custom drivers library
-add_subdirectory(../../sevantica_drivers ${CMAKE_CURRENT_BINARY_DIR}/drivers)
 
 # Collect source files carefully to avoid duplicates
 file(GLOB MAIN_SOURCES
@@ -130,15 +130,6 @@ file(GLOB MAIN_SOURCES
 file(GLOB APP_SOURCES
     "../application/Source/*.c"
 )
-
-# Driver sources are now handled by the Drivers library subdirectory
-# No need to manually include driver source files
-
-# Add UI sources - handled by GUI library, no need for GLOB_RECURSE
-# file(GLOB_RECURSE UI_SOURCES
-#     #"../application/User_Interface/miWota/ui/*.c"
-#     "../application/UI/*.c"
-# )
 
 # Add local screen sources (if any)
 file(GLOB LOCAL_SCREEN_SOURCES  

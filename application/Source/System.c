@@ -80,6 +80,9 @@ static CAT9555_Handle_t cat9555_handle;
 /* CAT9555 interrupt tracking */
 static volatile uint32_t cat9555_interrupt_count = 0;
 
+/* PN532 initialization status tracking */
+static bool pn532_initialized = false;
+
 /* NOTE: YS_S201_Handle_t flow_sensor removed - now managed by Dispenser_Control task */
 /* Declaring a second handle here caused data mismatch issues */
 
@@ -221,7 +224,6 @@ static void System_Task(void* argument)
 
 static void systemInitialisations()
 {
-	
 	/* Create semaphores first - BEFORE any I2C operations */
 	gpio_semaphore = xSemaphoreCreateMutex();
 	i2c_semaphore = xSemaphoreCreateMutex();
@@ -247,6 +249,10 @@ static void systemInitialisations()
 	/* Initialize PN532 Driver */
 	if (PN532_Init() != PN532_STATUS_OK) {
 		USB_Log_Printf("WARNING: PN532 Init failed, continuing without NFC\r\n");
+		pn532_initialized = false;
+	} else {
+		USB_Log_Printf("PN532: Initialized successfully\r\n");
+		pn532_initialized = true;
 	}
 
 	/* Initialize MIFARE Transaction Manager */
@@ -277,7 +283,6 @@ static void systemInitialisations()
 	}
 	
 	//picc_comm_start_task();
-	
 }
 
 /* ========================================================================== */
@@ -332,6 +337,11 @@ static void state_initializing(void)
  */
 static void process_mifare_polling(void)
 {
+	// Skip PN532 polling if hardware was not successfully initialized
+	if (!pn532_initialized) {
+		return;
+	}
+	
 	// Poll for MIFARE cards (every cycle = 10ms)
 	static uint32_t card_poll_counter = 0;
 	static MIFARE_CardState_t last_card_state = MIFARE_CARD_STATE_ABSENT;

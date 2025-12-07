@@ -9,7 +9,7 @@
             "name": "application (Source Library)"
         },
         {
-            "path": "../../sevantica_drivers"
+            "path": "../../../Common/sevantica_drivers"
         }
     ],
     "settings": {
