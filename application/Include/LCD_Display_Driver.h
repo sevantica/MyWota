@@ -17,6 +17,7 @@
 
 #include "FreeRTOS.h"
 #include "task.h"
+#include "lvgl.h"
 
 /*Typedefs -----------------------------------------------------------*/
 
@@ -56,12 +57,10 @@ void lcd_rotate_display(uint8_t rotation);
 void lcd_hardware_test(void);
 void lcd_basic_init(void);
 
-/* UI Update Functions */
-void ui_update_card_remaining_balance(uint32_t balance_ml);
-void ui_update_total_remaining_bar(uint32_t current_balance_ml, uint32_t last_topup_amount_ml);
-void ui_update_dispensed_session(uint32_t dispensed_ml);
-void ui_update_button_state(uint8_t button_state);
-void ui_update_customer_id(const char* phone_str);
-void ui_update_flow_rate_label(float flow_rate_lpm);
+/* UI Update Functions - Generic */
+bool ui_set_visibility(lv_obj_t * obj, bool visible);
+bool ui_set_label_text(lv_obj_t * label, const char * text);
+bool ui_set_bar_value(lv_obj_t * bar, int32_t value, lv_anim_enable_t anim);
+bool ui_set_obj_style_bg_color(lv_obj_t * obj, lv_color_t color, lv_style_selector_t selector);
 
 #endif /* APPLICATION_INCLUDE_LCD_DISPLAY_DRIVER_H_ */

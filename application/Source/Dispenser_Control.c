@@ -35,6 +35,9 @@
 #include "Buzzer_Driver.h"
 #include "CAT9555_Driver.h"
 #include <string.h>
+#include <stdio.h>
+#include "ui.h"
+#include "ui_Screen1.h"
 
 /* Private includes ----------------------------------------------------------*/
 
@@ -62,6 +65,7 @@ typedef struct {
     TickType_t card_ready_since;
     bool ui_clear_pending;              /* Flag to indicate UI clear is scheduled */
     TickType_t ui_clear_request_time;   /* Time when UI clear was requested */
+    TickType_t dispense_finish_time;    /* Time when dispensing finished */
 } DispenserHandle_t;
 
 /* Private defines ------------------------------------------------------------*/
@@ -84,6 +88,7 @@ static DispenserHandle_t dispenser_handle;
 static uint8_t card_removal_debounce_counter = 0;
 static CAT9555_Handle_t cat9555_handle;
 static Buzzer_Handle_t buzzer_handle;
+static bool initial_hide_done = false;
 
 /*Extern variables ---------------------------------------------------------*/
 
@@ -143,12 +148,23 @@ static void Dispenser_Control_Task(void* argument)
         }
     }
     
-    // Initialize flow sensor (monitoring starts automatically)
+    // Initialize flow sensor
     YS_S201_Status_t flow_status = YS_S201_Init(&dispenser_handle.flow_sensor, FLOW_SENSOR_PIN);
     if (flow_status != YS_S201_OK) {
         USB_Log_Printf("DISPENSER: Failed to initialize flow sensor: %s\r\n", 
                        YS_S201_GetStatusString(flow_status));
         // Continue anyway - sensor errors will be detected during operation
+    } else {
+        USB_Log_Printf("YS_S201: YS-S201 sensor initialized on GPIO %d\r\n", FLOW_SENSOR_PIN);
+        
+        // Start flow measurement (enables interrupts)
+        flow_status = YS_S201_Start(&dispenser_handle.flow_sensor);
+        if (flow_status != YS_S201_OK) {
+            USB_Log_Printf("DISPENSER: Failed to start flow sensor: %s\r\n", 
+                           YS_S201_GetStatusString(flow_status));
+        } else {
+            USB_Log_Printf("YS_S201: Flow measurement started\r\n");
+        }
     }
     
     // Safety timer disabled - relying on card presence monitoring for safety
@@ -166,13 +182,42 @@ static void Dispenser_Control_Task(void* argument)
     
     USB_Log_Printf("DISPENSER: Task started - Card presence based dispensing (no safety timer)\r\n");
     
+    // Reset UI to default state at boot
+    ui_set_visibility(ui_dispensedSession, false);
+    ui_set_label_text(ui_cardRemaining, "0mL");
+    ui_set_bar_value(ui_totalRemainingBar, 0, LV_ANIM_OFF);
+    ui_set_visibility(ui_customerID, false);
+    
     for (;;)
     {
         TASK_HEARTBEAT_EVERY_SECOND("Dispenser");
+        
+        // Early crash detection - log before ANY processing
+        static uint32_t loop_counter = 0;
+        loop_counter++;
+        if (loop_counter % 10 == 0) {
+            USB_Log_Printf("DISPENSER: Loop alive - iteration %lu\r\n", loop_counter);
+        }
+        
         vTaskDelayUntil(&lastWake, periodTicks); /* Deterministic 100ms cycle */
+        
+        // Ensure label is initially hidden (retry until UI is ready)
+        if (!initial_hide_done) {
+            if (ui_set_visibility(ui_dispensedSession, false)) {
+                initial_hide_done = true;
+            }
+        }
         
         // Process card detection and MIFARE state
         ProcessCardDetection();
+        
+        // Check if we need to hide the dispensed session label
+        if (dispenser_handle.dispense_finish_time > 0) {
+            if ((xTaskGetTickCount() - dispenser_handle.dispense_finish_time) > pdMS_TO_TICKS(5000)) {
+                ui_set_visibility(ui_dispensedSession, false);
+                dispenser_handle.dispense_finish_time = 0;
+            }
+        }
         
         // Process dispenser state machine
         ProcessDispenserState();
@@ -185,21 +230,29 @@ static void Dispenser_Control_Task(void* argument)
  */
 static void ProcessCardDetection(void)
 {
-    // Check if card is present (treat initializing/pending states as physically present)
-    MIFARE_CardState_t card_state = MIFARE_GetCardState();
-    bool card_present = (card_state == MIFARE_CARD_STATE_PRESENT) ||
-                        (card_state == MIFARE_CARD_STATE_NEEDS_POLLING_CYCLE) ||
-                        (card_state == MIFARE_CARD_STATE_INITIALIZING);
+    // Check if card is present using the correct API
+    bool card_present = MIFARE_IsCardPresent();
+    
+    static int log_counter = 0;
+    log_counter++;
+    if (log_counter % 10 == 0) { // Every 1 second
+         USB_Log_Printf("DISPENSER DETECT DBG: CardPresent=%d, HandlePresent=%d\r\n", card_present, dispenser_handle.card_present);
+    }
+    
+    // Only log state changes, not every cycle
     
     // Debounce card removal
     if (!card_present) {
         if (dispenser_handle.card_present) {
             card_removal_debounce_counter++;
+            if (card_removal_debounce_counter == 1) {
+                USB_Log_Printf("[DISPENSER DETECT] Card absence detected, starting debounce...\r\n");
+            }
             if (card_removal_debounce_counter >= CARD_REMOVAL_DEBOUNCE_COUNT) {
                 dispenser_handle.card_present = false;
                 card_removal_debounce_counter = 0;
                 
-                USB_Log_Printf("DISPENSER: Card removed\r\n");
+                USB_Log_Printf("[DISPENSER DETECT] Card REMOVED (debounced)\r\n");
                 
                 // If dispensing, emergency stop
                 if (dispenser_handle.state == DISPENSER_DISPENSING) {
@@ -219,7 +272,7 @@ static void ProcessCardDetection(void)
         
         if (!dispenser_handle.card_present) {
             dispenser_handle.card_present = true;
-            USB_Log_Printf("DISPENSER: Card detected\r\n");
+            USB_Log_Printf("[DISPENSER DETECT] Card DETECTED\r\n");
             
             // Cancel any pending UI clear if card returns quickly
             if (dispenser_handle.ui_clear_pending) {
@@ -245,34 +298,30 @@ static void ProcessCardDetection(void)
 static void ProcessDispenserState(void)
 {
     MIFARE_DispenseState_t mifare_state = MIFARE_GetDispenseState();
-    MIFARE_CardState_t card_state = MIFARE_GetCardState();
+    bool card_physically_present = MIFARE_IsCardPresent();
     
-    // Card is ready if MIFARE says ready AND card is physically present (not just PRESENT state, but also polling/initializing)
-    bool card_physically_present = (card_state == MIFARE_CARD_STATE_PRESENT) ||
-                                    (card_state == MIFARE_CARD_STATE_NEEDS_POLLING_CYCLE) ||
-                                    (card_state == MIFARE_CARD_STATE_INITIALIZING);
+    // Card is ready if MIFARE says ready AND card is physically present
     bool card_ready = (mifare_state == DISPENSE_STATE_READY_TO_DISPENSE) && card_physically_present;
     
-    // Debug logging every 10 task loops when in CARD_READY state
+    // Removed repetitive state logging - only log significant transitions
+    
+    // Debug logging every 200ms (2 cycles)
     static uint32_t debug_counter = 0;
-    if (dispenser_handle.state == DISPENSER_CARD_READY) {
-        debug_counter++;
-        if (debug_counter % 10 == 0) {
-            USB_Log_Printf("DISPENSER: State=CARD_READY, card_ready=%d, mifare_state=%d, card_state=%d\r\n",
-                           card_ready, mifare_state, card_state);
-        }
-    } else {
-        debug_counter = 0;
+    debug_counter++;
+    if (debug_counter % 2 == 0) {
+        USB_Log_Printf("DISPENSER DBG: State=%d, CardPresent=%d, CardReady=%d, MifareState=%d, PhysPresent=%d, AutoStart=%d\r\n",
+                       dispenser_handle.state, dispenser_handle.card_present, card_ready, mifare_state, card_physically_present, dispenser_handle.auto_start_attempted);
     }
     
     switch (dispenser_handle.state) {
         case DISPENSER_IDLE:
             if (dispenser_handle.card_present) {
                 dispenser_handle.state = DISPENSER_CARD_DETECTED;
+                USB_Log_Printf("DISPENSER: Transitioning from IDLE to CARD_DETECTED\r\n");
             }
-            // Intentional fall-through to handle READY check
-            // no break here
-    case DISPENSER_CARD_DETECTED:
+            break;
+            
+        case DISPENSER_CARD_DETECTED:
             if (card_ready) {
                 dispenser_handle.state = DISPENSER_CARD_READY;
                 USB_Log_Printf("DISPENSER: Card ready for dispensing\r\n");
@@ -324,21 +373,25 @@ static void ProcessDispenserState(void)
                 
                 // Check if card presence is confirmed (stable for 1s) to prevent dispensing on transient RF
                 bool card_confirmed = MIFARE_IsCardPresenceConfirmed();
+                USB_Log_Printf("DISPENSER: Card confirmed status: %d\r\n", card_confirmed);
                 
                 if (card_confirmed) {
                     // Card confirmed stable - start dispensing full balance
                     USB_Log_Printf("DISPENSER: Card CONFIRMED stable - balance=%lu mL\r\n", balance_ml);
                     
                     dispenser_handle.requested_amount_ml = balance_ml;
+                    USB_Log_Printf("DISPENSER: Setting state to USER_REQUESTED\r\n");
                     dispenser_handle.state = DISPENSER_USER_REQUESTED;
                     dispenser_handle.auto_start_attempted = true;
-                    USB_Log_Printf("DISPENSER: Auto-start dispensing %lu mL (full balance)\r\n", balance_ml);
+                    USB_Log_Printf("DISPENSER: State set to USER_REQUESTED, auto_start flag set\r\n");
                 }
                 // else: Card not yet confirmed stable - continue waiting (no logging spam)
             }
             break;
             
         case DISPENSER_USER_REQUESTED:
+            USB_Log_Printf("DISPENSER: USER_REQUESTED state - calling StartDispensing(%lu mL)\r\n", 
+                           dispenser_handle.requested_amount_ml);
             StartDispensing(dispenser_handle.requested_amount_ml);
             break;
             
@@ -348,7 +401,7 @@ static void ProcessDispenserState(void)
             // Check for card removal
             if (!dispenser_handle.card_present || 
                 mifare_state == DISPENSE_STATE_CARD_REMOVED) {
-                USB_Log_Printf("DISPENSER: EMERGENCY VALVE CLOSE - Card removed\r\n");
+                USB_Log_Printf("[DISPENSER DISPENSING] EMERGENCY VALVE CLOSE - Card removed\r\n");
                 StopDispensing(false); // Non-silent stop - beep to alert user
                 dispenser_handle.state = DISPENSER_ERROR;
             }
@@ -370,7 +423,12 @@ static void ProcessDispenserState(void)
             
             // Update final dispensed session amount
             uint32_t total_dispensed_ml = MIFARE_GetTotalDispensedThisSession();
-            ui_update_dispensed_session(total_dispensed_ml);
+            
+            static char dispensed_str[16];
+            uint32_t liters = total_dispensed_ml / 1000;
+            uint32_t decimal = (total_dispensed_ml % 1000) / 100;
+            snprintf(dispensed_str, sizeof(dispensed_str), "%lu.%luL", liters, decimal);
+            ui_set_label_text(ui_dispensedSession, dispensed_str);
             break;
             
         case DISPENSER_ERROR:
@@ -380,6 +438,11 @@ static void ProcessDispenserState(void)
             } else {
                 dispenser_handle.state = DISPENSER_IDLE;
             }
+            break;
+            
+        default:
+            USB_Log_Printf("DISPENSER ERROR: Invalid state %d - resetting to IDLE\r\n", dispenser_handle.state);
+            dispenser_handle.state = DISPENSER_IDLE;
             break;
     }
 }
@@ -428,9 +491,14 @@ static void StartDispensing(uint32_t amount_ml)
     dispenser_handle.dispensed_amount_ml = 0;
     dispenser_handle.dispense_start_time = (uint32_t)xTaskGetTickCount();
     dispenser_handle.state = DISPENSER_DISPENSING;
+    dispenser_handle.dispense_finish_time = 0;
     
     // Initialize UI - show 0 dispensed at start
-    ui_update_dispensed_session(0);
+    ui_set_visibility(ui_dispensedSession, true);
+    
+    static char dispensed_str[16];
+    snprintf(dispensed_str, sizeof(dispensed_str), "0.0L");
+    ui_set_label_text(ui_dispensedSession, dispensed_str);
     
     USB_Log_Printf("DISPENSER: Dispensing started - Target: %lu mL\r\n", amount_ml);
 }
@@ -451,12 +519,17 @@ static void UpdateDispensingProgress(void)
         return;
     }
     
-    // Log flow data for debugging
-    USB_Log_Printf("DISPENSER: Flow data - total_ml=%.1f, rate=%.2f L/min, pulses=%lu\r\n",
-                   flow_data.total_volume_ml, flow_data.flow_rate_lpm, flow_data.pulse_count);
+    // Log flow data every 2 seconds to debug sensor
+    static uint32_t flow_debug_counter = 0;
+    if (++flow_debug_counter % 20 == 0) {  // Every 20 cycles = 2 seconds
+        USB_Log_Printf("FLOW SENSOR: pulses=%lu, total_ml=%.1f, rate=%.2f L/min\r\n",
+                       flow_data.pulse_count, flow_data.total_volume_ml, flow_data.flow_rate_lpm);
+    }
     
-    // Update flow rate on UI
-    ui_update_flow_rate_label(flow_data.flow_rate_lpm);
+    // Update flow rate on UI (removed repetitive flow data logging)
+    static char flow_str[16];
+    snprintf(flow_str, sizeof(flow_str), "%.1f L/min", flow_data.flow_rate_lpm);
+    ui_set_label_text(ui_flowRateSensor, flow_str);
 
     // Calculate dispensed amount
     uint32_t current_dispensed_ml = (uint32_t)(flow_data.total_volume_ml);
@@ -474,11 +547,8 @@ static void UpdateDispensingProgress(void)
     }
     
     // Always call UpdateTransactionProgress to maintain card presence and write at appropriate intervals
-    USB_Log_Printf("DISPENSER: Calling MIFARE_UpdateTransactionProgress(additional=%lu mL, rate=%.2f)\r\n",
-                   additional_ml, flow_data.flow_rate_lpm);
     MIFARE_Result_t mifare_result = MIFARE_UpdateTransactionProgress(additional_ml, flow_data.flow_rate_lpm);
-    USB_Log_Printf("DISPENSER: MIFARE_UpdateTransactionProgress returned: %s\r\n",
-                   MIFARE_GetResultString(mifare_result));
+    // Only log errors, not successful updates
     
     if (mifare_result != MIFARE_RESULT_OK) {
         USB_Log_Printf("DISPENSER: MIFARE update failed: %s\r\n", 
@@ -500,7 +570,12 @@ static void UpdateDispensingProgress(void)
         
         // Update dispensed session UI with total dispensed amount
         uint32_t total_dispensed_ml = MIFARE_GetTotalDispensedThisSession();
-        ui_update_dispensed_session(total_dispensed_ml);
+        
+        static char dispensed_str[16];
+        uint32_t liters = total_dispensed_ml / 1000;
+        uint32_t decimal = (total_dispensed_ml % 1000) / 100;
+        snprintf(dispensed_str, sizeof(dispensed_str), "%lu.%luL", liters, decimal);
+        ui_set_label_text(ui_dispensedSession, dispensed_str);
         
         // Stop dispensing if balance reaches zero
         if (current_balance_ml == 0) {
@@ -533,7 +608,10 @@ static void StopDispensing(bool silent)
     SetValveState(false, silent);
     
     // Update flow rate to 0 on UI
-    ui_update_flow_rate_label(0.0f);
+    ui_set_label_text(ui_flowRateSensor, "0.0 L/min");
+    
+    // Record finish time for UI visibility timeout
+    dispenser_handle.dispense_finish_time = xTaskGetTickCount();
     
     // Safety timer disabled
     // if (dispenser_safety_timer != NULL) {
@@ -625,21 +703,72 @@ static const char* GetDispenserStateString(DispenserState_t state)
 static void UpdateCardUI(uint32_t current_balance_ml, uint32_t last_topup_amount_ml)
 {
     USB_Log_Printf("DISPENSER: UpdateCardUI called with balance=%lu, topup=%lu\r\n", current_balance_ml, last_topup_amount_ml);
-    ui_update_card_remaining_balance(current_balance_ml);
-    ui_update_total_remaining_bar(current_balance_ml, last_topup_amount_ml);
+    
+    // Verify UI objects exist before accessing
+    if (ui_cardRemaining == NULL) {
+        USB_Log_Printf("DISPENSER: UpdateCardUI skipped - UI not initialized\r\n");
+        return;
+    }
+    
+    // Update card remaining balance
+    static char balance_str[16];
+    if (current_balance_ml > 9000) {
+        uint32_t liters = current_balance_ml / 1000;
+        snprintf(balance_str, sizeof(balance_str), "%luL", liters);
+    } else {
+        snprintf(balance_str, sizeof(balance_str), "%luml", current_balance_ml);
+    }
+    
+    USB_Log_Printf("DISPENSER: Setting balance text to '%s'\r\n", balance_str);
+    ui_set_label_text(ui_cardRemaining, balance_str);
+    USB_Log_Printf("DISPENSER: Balance text set successfully\r\n");
+    
+    // Update total remaining bar
+    uint8_t percentage = 0;
+    if (last_topup_amount_ml > 0) {
+        if (current_balance_ml >= last_topup_amount_ml) {
+            percentage = 100;
+        } else {
+            percentage = (uint8_t)((current_balance_ml * 100) / last_topup_amount_ml);
+        }
+    }
+    
+    USB_Log_Printf("DISPENSER: Setting bar to %d%%\r\n", percentage);
+    if (ui_totalRemainingBar != NULL) {
+        ui_set_bar_value(ui_totalRemainingBar, percentage, LV_ANIM_ON);
+        USB_Log_Printf("DISPENSER: Bar set successfully\r\n");
+    }
+    
+    // Update level color indicator
+    if (ui_levelColourIndicator != NULL) {
+        USB_Log_Printf("DISPENSER: Updating color indicator\r\n");
+        if (percentage > 25) {
+            ui_set_obj_style_bg_color(ui_levelColourIndicator, lv_color_hex(0x05820A), LV_PART_MAIN | LV_STATE_DEFAULT);
+        } else if (percentage > 10) {
+            ui_set_obj_style_bg_color(ui_levelColourIndicator, lv_color_hex(0xFFA500), LV_PART_MAIN | LV_STATE_DEFAULT);
+        } else {
+            ui_set_obj_style_bg_color(ui_levelColourIndicator, lv_color_hex(0xFF0000), LV_PART_MAIN | LV_STATE_DEFAULT);
+        }
+    }
     
     // Update customer ID from card account data
+    USB_Log_Printf("DISPENSER: Updating customer ID\r\n");
     extern MIFARE_TransactionManager_t g_transaction_manager;
-    if (current_balance_ml > 0) {
+    if (current_balance_ml > 0 && ui_customerID != NULL) {
         // Card is present, display phone number (extract from raw_data)
         static char phone_str[12];  // 11 digits + null terminator
         memcpy(phone_str, &g_transaction_manager.current_card.account_data.raw_data[ACCOUNT_DATA_PHONE_OFFSET], ACCOUNT_DATA_PHONE_SIZE);
         phone_str[ACCOUNT_DATA_PHONE_SIZE] = '\0';  // Null terminate
-        ui_update_customer_id(phone_str);
-    } else {
+        
+        ui_set_label_text(ui_customerID, phone_str);
+        ui_set_visibility(ui_customerID, true);
+        USB_Log_Printf("DISPENSER: Customer ID updated\r\n");
+    } else if (ui_customerID != NULL) {
         // Card removed, clear display
-        ui_update_customer_id(NULL);
+        ui_set_visibility(ui_customerID, false);
+        USB_Log_Printf("DISPENSER: Customer ID hidden\r\n");
     }
+    USB_Log_Printf("DISPENSER: UpdateCardUI completed\r\n");
 }
 
 /*Public Functions ----------------------------------------------------------*/

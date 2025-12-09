@@ -26,6 +26,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <stddef.h>
+#include "ui.h"
+#include "ui_Screen1.h"
 
 /*Private defines ---------------------------------------------------*/
 #define MIFARE_DEBUG_ENABLED            1
@@ -62,7 +64,6 @@ static bool mifare_is_valid_block(uint8_t block_number, bool is_write);
 static MIFARE_Result_t mifare_authenticate_block(uint8_t block_number);
 static MIFARE_Result_t mifare_read_block_safe(uint8_t block_number, uint8_t *data);
 static MIFARE_Result_t mifare_write_block_safe(uint8_t block_number, uint8_t *data);
-static MIFARE_Result_t mifare_verify_card_presence(void);
 static void mifare_transition_state(MIFARE_DispenseState_t new_state);
 static uint32_t mifare_get_timestamp(void);
 static MIFARE_Result_t safe_memcpy_from_block(void *dest, size_t dest_size, const uint8_t *block_data, size_t copy_size);
@@ -358,10 +359,10 @@ MIFARE_Result_t MIFARE_ProcessCardDetected(PN532_CardInfo_t *card_info)
             MIFARE_LOG("Card detected and validated - Ready for dispensing");
             mifare_transition_state(DISPENSE_STATE_READY_TO_DISPENSE);
             
-            // Only set to PRESENT if not already set to NEEDS_POLLING_CYCLE by initialization
-            if (MIFARE_GetCardState() != MIFARE_CARD_STATE_NEEDS_POLLING_CYCLE) {
-                 MIFARE_SetCardState(MIFARE_CARD_STATE_PRESENT);
-            }
+            // Set card state to PRESENT after successful initialization
+            MIFARE_CardState_t current_state = MIFARE_GetCardState();
+            MIFARE_LOG("Setting card state to PRESENT (was %d)", current_state);
+            MIFARE_SetCardState(MIFARE_CARD_STATE_PRESENT);
         } else if (result == MIFARE_RESULT_PN532_CORRUPTED) {
             mifare_transition_state(DISPENSE_STATE_ERROR);
             MIFARE_SetCardState(MIFARE_CARD_STATE_ERROR);
@@ -454,10 +455,10 @@ MIFARE_Result_t MIFARE_ProcessCardRemoved(void)
 
     // Update UI - card is confirmed removed
     if (g_transaction_manager.ui_state_card_present) {
-        ui_update_card_remaining_balance(0);
-        ui_update_total_remaining_bar(0, 0);
+        ui_set_label_text(ui_cardRemaining, "0mL");
+        ui_set_bar_value(ui_totalRemainingBar, 0, LV_ANIM_ON);
         // Clear customer ID display
-        ui_update_customer_id(NULL);
+        ui_set_visibility(ui_customerID, false);
         g_transaction_manager.ui_state_card_present = false;
     }
     
@@ -495,10 +496,13 @@ MIFARE_Result_t MIFARE_ReadCardData(MIFARE_CardData_t *card_data)
     uint8_t block_data[16];
     
     // Verify card is still present
-    result = mifare_verify_card_presence();
+    MIFARE_LOG("[READ CARD DATA] Verifying card presence before read...");
+    result = MIFARE_VerifyCardPresence();
     if (result != MIFARE_RESULT_OK) {
+        MIFARE_LOG("[READ CARD DATA] Card presence check FAILED: %s", MIFARE_GetResultString(result));
         return result;
     }
+    MIFARE_LOG("[READ CARD DATA] Card presence verified OK");
     
     // Read header block (authentication is handled internally by mifare_read_block_safe)
     result = mifare_read_block_safe(MIFARE_BLOCK_HEADER, block_data);
@@ -755,10 +759,14 @@ MIFARE_Result_t MIFARE_UpdateTransactionProgress(uint32_t dispensed_ml, float fl
         return MIFARE_RESULT_ERROR;
     }
     
-    // The card's presence is implicitly verified by the write operations below.
-    // If a write fails, the error handling logic will correctly detect the card's removal.
-    // Removing the explicit check here prevents a race condition where a presence check
-    // command could interfere with an in-progress write command.
+    // Check if System.c polling detected card removal
+    // This catches removals even when PN532 writes succeed due to caching
+    if (g_transaction_manager.card_state != MIFARE_CARD_STATE_PRESENT) {
+        MIFARE_LOG("[UPDATE PROGRESS] Card removed (state=%d) - aborting", 
+                   g_transaction_manager.card_state);
+        return MIFARE_HandleCardRemovalDuringDispense();
+    }
+    
     MIFARE_Result_t result = MIFARE_RESULT_OK;
     
     // Update dispensed amounts with underflow protection
@@ -798,20 +806,15 @@ MIFARE_Result_t MIFARE_UpdateTransactionProgress(uint32_t dispensed_ml, float fl
         if (fast_result == MIFARE_RESULT_OK) {
             g_transaction_manager.last_fast_balance_update_time = current_time;
             fast_balance_updated = true;
+        } else if (fast_result == MIFARE_RESULT_CARD_REMOVED) {
+            // Card removed during write - detected by mifare_write_block_safe()
+            MIFARE_LOG("Fast balance write failed - card removed during write");
+            return MIFARE_HandleCardRemovalDuringDispense();
         } else if (fast_result == MIFARE_RESULT_WRITE_FAILED) {
-            // Write failed - check if this is due to card removal (tracked by 500ms threshold)
-            TickType_t now = xTaskGetTickCount();
-            uint32_t failure_duration_ms = pdTICKS_TO_MS(now - g_transaction_manager.write_failure_first_tick);
-            
-            if (g_transaction_manager.write_failure_first_tick != 0 && failure_duration_ms > 500) {
-                // Card removal detected (write failures persisted >500ms)
-                MIFARE_LOG("Fast balance write failed due to card removal - triggering emergency abort");
-                return MIFARE_HandleCardRemovalDuringDispense();
-            } else {
-                // Transient write failure - log but continue (non-critical)
-                MIFARE_LOG("Fast balance write failed (transient, non-critical), result: %s", MIFARE_GetResultString(fast_result));
-                g_transaction_manager.last_fast_balance_update_time = current_time; 
-            }
+            // Write failed but card is still present (I2C/PN532 issue)
+            // This is non-critical for fast balance updates - continue dispensing
+            MIFARE_LOG("Fast balance write failed (I2C issue, card present, non-critical)");
+            g_transaction_manager.last_fast_balance_update_time = current_time; 
         } else {
             // Other error types - log but continue
             MIFARE_LOG("Fast balance write failed (non-critical), result: %s", MIFARE_GetResultString(fast_result));
@@ -837,16 +840,21 @@ MIFARE_Result_t MIFARE_UpdateTransactionProgress(uint32_t dispensed_ml, float fl
                            g_transaction_manager.total_dispensed_this_session);
                 no_change_log_reported = true;
             }
+        } else if (result == MIFARE_RESULT_CARD_REMOVED) {
+            // Card removed during write - detected immediately
+            MIFARE_LOG("Main data write failed - card removed");
+            return MIFARE_HandleCardRemovalDuringDispense();
         } else {
+            // Other errors (WRITE_FAILED, etc) - card still present but I2C issues
             g_transaction_manager.consecutive_errors++;
             MIFARE_LOG("Failed to update main data (error %u/%u): %s", 
                        g_transaction_manager.consecutive_errors,
                        MIFARE_CARD_REMOVAL_FAIL_COUNT,
                        MIFARE_GetResultString(result));
             
-            // If multiple consecutive write failures, infer card removal
+            // If multiple consecutive I2C errors, something is seriously wrong
             if (g_transaction_manager.consecutive_errors >= MIFARE_CARD_REMOVAL_FAIL_COUNT) {
-                MIFARE_LOG("Card removal inferred from write failures");
+                MIFARE_LOG("Excessive write failures despite card present - critical I2C error");
                 return MIFARE_HandleCardRemovalDuringDispense();
             }
         }
@@ -1047,8 +1055,8 @@ MIFARE_Result_t MIFARE_HandleCardRemovalDuringDispense(void)
     
     // Update UI - card removed during dispensing
     if (g_transaction_manager.ui_state_card_present) {
-        ui_update_card_remaining_balance(0);
-        ui_update_total_remaining_bar(0, 0);
+        ui_set_label_text(ui_cardRemaining, "0mL");
+        ui_set_bar_value(ui_totalRemainingBar, 0, LV_ANIM_ON);
         g_transaction_manager.ui_state_card_present = false;
         MIFARE_LOG("UI updated - card absent");
     }
@@ -1110,15 +1118,30 @@ static bool mifare_is_valid_block(uint8_t block_number, bool is_write)
 }
 
 /**
- * @brief Verify card is still present and responsive
- * @return MIFARE_Result_t Operation result
+ * @brief Unified card presence verification - SINGLE SOURCE OF TRUTH for all presence checks
+ * 
+ * @details This is the ONLY function that should be used to verify card presence via hardware.
+ *          It performs both PN532 hardware detection and UID matching in a single call.
+ * 
+ *          ARCHITECTURE:
+ *          - All transaction operations call this function before critical operations
+ *          - Replaces all previous individual mifare_verify_card_presence() calls
+ *          - Used by: authentication retry, write operations, read operations, monitoring
+ * 
+ *          DO NOT USE MIFARE_IsCardPresent() for hardware verification - that's state-based only.
+ *          Use this function for actual PN532 hardware card detection.
+ * 
+ * @return MIFARE_Result_t 
+ *         - MIFARE_RESULT_OK: Same card is physically present and responsive
+ *         - MIFARE_RESULT_CARD_REMOVED: Card not detected or different card detected
  */
-static MIFARE_Result_t mifare_verify_card_presence(void)
+MIFARE_Result_t MIFARE_VerifyCardPresence(void)
 {
     PN532_CardInfo_t current_card;
     PN532_Status_t status = PN532_DetectCard(&current_card);
     
     if (status != PN532_STATUS_CARD_DETECTED) {
+        MIFARE_LOG("[PRESENCE CHECK] Card not detected (status=%d)", status);
         return MIFARE_RESULT_CARD_REMOVED;
     }
     
@@ -1127,10 +1150,11 @@ static MIFARE_Result_t mifare_verify_card_presence(void)
         current_card.uid_length > sizeof(current_card.uid) ||
         g_transaction_manager.card_info.uid_length > sizeof(g_transaction_manager.card_info.uid) ||
         memcmp(current_card.uid, g_transaction_manager.card_info.uid, current_card.uid_length) != 0) {
-        MIFARE_LOG("Different card detected during transaction");
+        MIFARE_LOG("[PRESENCE CHECK] Different card detected (UID mismatch)");
         return MIFARE_RESULT_CARD_REMOVED;
     }
     
+    // Only log success during critical operations (removed routine OK logging)
     return MIFARE_RESULT_OK;
 }
 
@@ -1149,7 +1173,7 @@ static MIFARE_Result_t mifare_authenticate_block(uint8_t block_number)
     
     // Skip authentication if we're already authenticated to this sector
     if (last_authenticated_sector == (int8_t)sector) {
-        MIFARE_LOG("Using cached authentication for sector %d", sector);
+        // Using cached auth - no logging to reduce spam
         return MIFARE_RESULT_OK;
     }
     
@@ -1163,9 +1187,19 @@ static MIFARE_Result_t mifare_authenticate_block(uint8_t block_number)
     
     for (uint8_t retry = 0; retry < max_retries; retry++) {
         if (retry > 0) {
+            // Check if card is still present before retrying - fail fast if removed
+            MIFARE_LOG("[AUTH RETRY] Checking card presence before retry %d/%d...", retry, max_retries);
+            MIFARE_Result_t presence = MIFARE_VerifyCardPresence();
+            if (presence != MIFARE_RESULT_OK) {
+                MIFARE_LOG("[AUTH RETRY] Card removed during authentication retry - aborting");
+                last_authenticated_sector = -1;
+                return MIFARE_RESULT_CARD_REMOVED;
+            }
+            MIFARE_LOG("[AUTH RETRY] Card still present, proceeding with retry");
+            
             USB_Log_Printf("MIFARE: Authentication retry %d/%d for block %d\r\n", 
                           retry, max_retries - 1, block_number);
-            vTaskDelay(pdMS_TO_TICKS(50));  // Original: Allow full I2C/RF recovery
+            vTaskDelay(pdMS_TO_TICKS(50));  // Allow I2C/RF recovery
         }
         
 
@@ -1275,7 +1309,10 @@ static MIFARE_Result_t mifare_write_block_safe(uint8_t block_number, uint8_t *da
         return MIFARE_RESULT_ERROR;
     }
     
-    MIFARE_LOG("Writing to block %d (sector %d)", block_number, MIFARE_GET_SECTOR(block_number));
+    // Only log full writes, not fast balance updates (block 13/14)
+    if (block_number != MIFARE_BLOCK_FAST_BALANCE_PRIMARY && block_number != MIFARE_BLOCK_FAST_BALANCE_BACKUP) {
+        MIFARE_LOG("Writing to block %d (sector %d)", block_number, MIFARE_GET_SECTOR(block_number));
+    }
     
     // Authenticate the block before writing
     // The mifare_authenticate_block function handles caching properly:
@@ -1297,14 +1334,20 @@ static MIFARE_Result_t mifare_write_block_safe(uint8_t block_number, uint8_t *da
         
         // Check if we're in an existing failure period or starting a new one
         if (g_transaction_manager.write_failure_first_tick == 0) {
-            // First failure - start tracking
+            // First failure - check immediately if card removed
+            MIFARE_LOG("[WRITE FAILURE #1] Checking if card present...");
+            if (MIFARE_VerifyCardPresence() != MIFARE_RESULT_OK) {
+                MIFARE_LOG("[WRITE FAILURE #1] Card NOT present - returning CARD_REMOVED");
+                return MIFARE_RESULT_CARD_REMOVED;
+            }
+            // Card present - start tracking
             g_transaction_manager.write_failure_first_tick = now;
             g_transaction_manager.consecutive_write_failures = 1;
-            MIFARE_LOG("Write failure tracking started");
+            MIFARE_LOG("[WRITE FAILURE #1] Card still present - starting failure tracking");
         } else {
-            // Check if this failure is part of the same failure period (within last 2 seconds)
+            // Check if this failure is part of the same failure period (within last 1 second)
             uint32_t time_since_first_failure = pdTICKS_TO_MS(now - g_transaction_manager.write_failure_first_tick);
-            if (time_since_first_failure < 2000) {
+            if (time_since_first_failure < 1000) {
                 // Still within the same failure period - increment counter
                 g_transaction_manager.consecutive_write_failures++;
             } else {
@@ -1315,20 +1358,19 @@ static MIFARE_Result_t mifare_write_block_safe(uint8_t block_number, uint8_t *da
             }
         }
         
-        // Only check if card is still present if failures have persisted for >500ms
+        // Check card presence more aggressively - every failure after the first
         uint32_t failure_duration_ms = pdTICKS_TO_MS(now - g_transaction_manager.write_failure_first_tick);
-        if (failure_duration_ms > 500) {
-            // Failures persisting for >500ms - check if card actually removed
-            if (!MIFARE_IsCardPresent()) {
-                MIFARE_LOG("Card not present after %lu ms of consecutive write failures (count: %d). Aborting.", 
-                           failure_duration_ms, g_transaction_manager.consecutive_write_failures);
-                // Don't reset tracking here - let it persist until card returns or timeout
-                return MIFARE_RESULT_WRITE_FAILED;
+        if (g_transaction_manager.consecutive_write_failures > 1) {
+            // Multiple failures - check if card actually removed
+            MIFARE_LOG("[WRITE FAILURE #%d] Checking card presence after %lu ms...", 
+                       g_transaction_manager.consecutive_write_failures, failure_duration_ms);
+            if (MIFARE_VerifyCardPresence() != MIFARE_RESULT_OK) {
+                MIFARE_LOG("[WRITE FAILURE #%d] Card REMOVED after %lu ms (count: %d)", 
+                           g_transaction_manager.consecutive_write_failures, failure_duration_ms, 
+                           g_transaction_manager.consecutive_write_failures);
+                return MIFARE_RESULT_CARD_REMOVED;
             }
-            MIFARE_LOG("Card still present despite %lu ms of write failures (count: %d) - I2C issue", 
-                       failure_duration_ms, g_transaction_manager.consecutive_write_failures);
-        } else {
-            MIFARE_LOG("Write failure #%d in %lu ms (need 500ms total before declaring card absent)", 
+            MIFARE_LOG("[WRITE FAILURE #%d] Card still PRESENT at %lu ms - I2C issue", 
                        g_transaction_manager.consecutive_write_failures, failure_duration_ms);
         }
 
@@ -1344,10 +1386,14 @@ static MIFARE_Result_t mifare_write_block_safe(uint8_t block_number, uint8_t *da
             status = PN532_MifareWriteBlock(block_number, data);
             if (status == PN532_STATUS_OK) {
                 MIFARE_LOG("Write to block %d succeeded after re-authentication", block_number);
+                // Reset write failure tracking on success
+                g_transaction_manager.write_failure_first_tick = 0;
+                g_transaction_manager.consecutive_write_failures = 0;
                 return MIFARE_RESULT_OK;
             }
-
-            // MIFARE_LOG("Write retry failed for block %d, PN532 status: %d", block_number, status);
+        } else if (retry_auth == MIFARE_RESULT_CARD_REMOVED) {
+            MIFARE_LOG("Card removed during write retry authentication");
+            return MIFARE_RESULT_CARD_REMOVED;
         } else {
             MIFARE_LOG("Re-authentication failed for block %d during write retry", block_number);
         }
@@ -1364,11 +1410,24 @@ static MIFARE_Result_t mifare_write_block_safe(uint8_t block_number, uint8_t *da
                 MIFARE_LOG("Write failed with status %d", status);
             }
             
+            // When write fails after authentication succeeds, actively verify card presence
+            // Don't rely on state flags - check PN532 directly for immediate detection
+            MIFARE_LOG("[WRITE RETRY] Performing active card presence check via PN532...");
+            MIFARE_Result_t presence_check = MIFARE_VerifyCardPresence();
+            if (presence_check != MIFARE_RESULT_OK) {
+                MIFARE_LOG("[WRITE RETRY] Active presence check FAILED - card removed");
+                return MIFARE_RESULT_CARD_REMOVED;
+            }
+            MIFARE_LOG("[WRITE RETRY] Active presence check OK - card still present");
+            
             return MIFARE_RESULT_WRITE_FAILED;
         }
     }
     
-    MIFARE_LOG("Successfully wrote to block %d", block_number);
+    // Only log full data writes, not fast balance updates
+    if (block_number != MIFARE_BLOCK_FAST_BALANCE_PRIMARY && block_number != MIFARE_BLOCK_FAST_BALANCE_BACKUP) {
+        MIFARE_LOG("Successfully wrote to block %d", block_number);
+    }
     
     // Reset write failure tracking on success
     g_transaction_manager.write_failure_first_tick = 0;
@@ -1699,11 +1758,15 @@ MIFARE_Result_t MIFARE_WriteCardData(MIFARE_CardData_t *card_data)
 
         result = mifare_write_block_safe(target_block, block_data);
         if (result == MIFARE_RESULT_OK) break;
+        if (result == MIFARE_RESULT_CARD_REMOVED) {
+            MIFARE_LOG("Card removed during %s data write", target_name);
+            break;
+        }
         
         // Check local timeout (robust against other tasks resetting global flags)
         // Increased from 1000ms to 2000ms to allow more retries in noisy environments
         if (pdTICKS_TO_MS(xTaskGetTickCount() - loop_start_tick) > 2000) {
-             MIFARE_LOG("Write timeout exceeded (2000ms)");
+             MIFARE_LOG("Write timeout exceeded (2000ms) - persistent I2C errors");
              result = MIFARE_RESULT_TIMEOUT; // Explicitly set result to timeout
              break;
         }
@@ -1739,11 +1802,15 @@ MIFARE_Result_t MIFARE_WriteCardData(MIFARE_CardData_t *card_data)
 
         result = mifare_write_block_safe(MIFARE_BLOCK_RECOVERY_INFO, block_data);
         if (result == MIFARE_RESULT_OK) break;
+        if (result == MIFARE_RESULT_CARD_REMOVED) {
+            MIFARE_LOG("Card removed during recovery info write");
+            break;
+        }
         
         // Check local timeout
         // Increased from 1000ms to 2000ms
         if (pdTICKS_TO_MS(xTaskGetTickCount() - loop_start_tick) > 2000) {
-             MIFARE_LOG("Write timeout exceeded (2000ms)");
+             MIFARE_LOG("Write timeout exceeded (2000ms) - persistent I2C errors");
              result = MIFARE_RESULT_TIMEOUT; // Explicitly set result to timeout
              break;
         }
@@ -1791,13 +1858,24 @@ void MIFARE_SetCardState(MIFARE_CardState_t new_state)
 }
 
 /**
- * @brief Check if card is present
- * @return true if card is present, false otherwise
+ * @brief Check if card is present based on STATE only (no hardware check)
+ * @details This is a lightweight state-based check. For actual hardware verification
+ *          of card presence via PN532, use MIFARE_VerifyCardPresence() instead.
+ * @return true if card state indicates present, false otherwise
  */
 bool MIFARE_IsCardPresent(void)
 {
-    return (g_transaction_manager.card_state == MIFARE_CARD_STATE_PRESENT || 
-            g_transaction_manager.card_state == MIFARE_CARD_STATE_NEEDS_POLLING_CYCLE);
+    bool is_present = (g_transaction_manager.card_state == MIFARE_CARD_STATE_PRESENT || 
+                       g_transaction_manager.card_state == MIFARE_CARD_STATE_NEEDS_POLLING_CYCLE);
+    
+    // Debug: Log state periodically
+    static uint32_t log_counter = 0;
+    log_counter++;
+    if (log_counter % 50 == 0) {  // Every ~5 seconds
+        MIFARE_LOG("IsCardPresent check: card_state=%d, is_present=%d", g_transaction_manager.card_state, is_present);
+    }
+    
+    return is_present;
 }
 
 /**
@@ -2459,11 +2537,109 @@ void MIFARE_LogTransaction(uint8_t type, uint16_t amount_ml, uint8_t dispenser_i
 
 MIFARE_Result_t MIFARE_MonitorCardPresence(void)
 {
-    return mifare_verify_card_presence();
+    MIFARE_LOG("[MONITOR] Actively monitoring card presence via PN532...");
+    MIFARE_Result_t result = MIFARE_VerifyCardPresence();
+    MIFARE_LOG("[MONITOR] Card presence check result: %s", MIFARE_GetResultString(result));
+    return result;
 }
 
 MIFARE_Result_t MIFARE_PerformPeriodicUpdate(void)
 {
     return MIFARE_RESULT_OK;
+}
+
+/*Card Polling Task ----------------------------------------------*/
+static TaskHandle_t mifare_polling_task_handle = NULL;
+
+/**
+ * @brief MIFARE card polling task
+ * @details Continuously polls for card presence/removal
+ */
+static void MIFARE_Polling_Task(void* argument)
+{
+    (void)argument;
+    
+    TickType_t lastWake = xTaskGetTickCount();
+    const TickType_t periodTicks = pdMS_TO_TICKS(100);  // Poll every 100ms
+    
+    MIFARE_LOG("MIFARE polling task started");
+    
+    for (;;)
+    {
+        vTaskDelayUntil(&lastWake, periodTicks);
+        
+        // Get current states
+        MIFARE_CardState_t current_card_state = MIFARE_GetCardState();
+        MIFARE_DispenseState_t current_dispense_state = MIFARE_GetDispenseState();
+        
+        // Skip polling during active transaction (performance optimization)
+        if (g_transaction_manager.transaction_active) {
+            continue;
+        }
+        
+        // Poll for card
+        PN532_CardInfo_t card_info;
+        PN532_Status_t status = PN532_DetectCard(&card_info);
+        
+        if (status == PN532_STATUS_CARD_DETECTED) {
+            // Card detected
+            if (current_card_state == MIFARE_CARD_STATE_NEEDS_POLLING_CYCLE) {
+                USB_Log_Printf("[SYSTEM POLL] Card confirmed after polling cycle, setting to PRESENT\r\n");
+                MIFARE_ConfirmReadyAfterPolling();
+            } else if (current_card_state == MIFARE_CARD_STATE_PRESENT) {
+                USB_Log_Printf("[SYSTEM POLL] Card still PRESENT (idle polling)\r\n");
+            } else {
+                // New card detected
+                if (current_dispense_state == DISPENSE_STATE_ERROR) {
+                    USB_Log_Printf("SYSTEM: Card detected in error state, attempting recovery\r\n");
+                } else {
+                    USB_Log_Printf("SYSTEM: New card detected, notifying MIFARE manager\r\n");
+                }
+                MIFARE_ProcessCardDetected(&card_info);
+            }
+        } else {
+            // No card detected
+            if (current_card_state == MIFARE_CARD_STATE_PRESENT) {
+                USB_Log_Printf("[SYSTEM POLL] Card REMOVED (detected by polling)\r\n");
+                MIFARE_ProcessCardRemoved();
+            } else if (current_card_state == MIFARE_CARD_STATE_NEEDS_POLLING_CYCLE) {
+                USB_Log_Printf("MIFARE POLL: Card in NEEDS_POLLING_CYCLE but not detected - resetting to ABSENT\r\n");
+                MIFARE_SetCardState(MIFARE_CARD_STATE_ABSENT);
+            } else if (current_card_state == MIFARE_CARD_STATE_ERROR && status != PN532_STATUS_CARD_DETECTED) {
+                // Error state but no card - reset after delay
+                static uint32_t error_no_card_counter = 0;
+                error_no_card_counter++;
+                if (error_no_card_counter >= 10) {
+                    USB_Log_Printf("MIFARE POLL: No card in error state, resetting to ABSENT\r\n");
+                    MIFARE_SetCardState(MIFARE_CARD_STATE_ABSENT);
+                    error_no_card_counter = 0;
+                }
+            }
+        }
+        
+        // Update stability checks
+        MIFARE_UpdateStabilityCheck();
+    }
+}
+
+/**
+ * @brief Start the MIFARE card polling task
+ */
+void MIFARE_StartPollingTask(void)
+{
+    BaseType_t result = xTaskCreate(
+        MIFARE_Polling_Task,
+        "MIFARE_Poll",
+        2048,  // Stack size in words
+        NULL,
+        (tskIDLE_PRIORITY + 2),  // Same priority as System and Dispenser
+        &mifare_polling_task_handle
+    );
+    
+    if (result == pdPASS) {
+        MIFARE_LOG("MIFARE polling task created successfully");
+    } else {
+        MIFARE_LOG("ERROR: Failed to create MIFARE polling task");
+    }
 }
 

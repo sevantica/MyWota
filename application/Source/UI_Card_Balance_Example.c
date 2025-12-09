@@ -24,6 +24,9 @@
 #include "USB_Logging.h"
 #include "FreeRTOS.h"
 #include "task.h"
+#include "ui.h"
+#include "ui_Screen1.h"
+#include <stdio.h>
 
 /*Function Implementations ------------------------------------------*/
 
@@ -73,7 +76,15 @@ void UI_CardBalance_Example(void)
 void UI_CardBalance_ManualTest(uint32_t balance_ml)
 {
     USB_Log_Printf("Manual UI Update Test: Setting balance to %u mL\r\n", balance_ml);
-    ui_update_card_remaining_balance(balance_ml);
+    
+    static char balance_str[16];
+    if (balance_ml > 9000) {
+        uint32_t liters = balance_ml / 1000;
+        snprintf(balance_str, sizeof(balance_str), "%luL", liters);
+    } else {
+        snprintf(balance_str, sizeof(balance_str), "%luml", balance_ml);
+    }
+    ui_set_label_text(ui_cardRemaining, balance_str);
 }
 
 /**
@@ -112,7 +123,14 @@ void UI_CardBalance_FormatDemo(void)
         USB_Log_Printf("Testing %u mL → Expected display: %s\r\n", 
                        test_balances[i], expected_displays[i]);
         
-        ui_update_card_remaining_balance(test_balances[i]);
+        static char balance_str[16];
+        if (test_balances[i] > 9000) {
+            uint32_t liters = test_balances[i] / 1000;
+            snprintf(balance_str, sizeof(balance_str), "%luL", liters);
+        } else {
+            snprintf(balance_str, sizeof(balance_str), "%luml", test_balances[i]);
+        }
+        ui_set_label_text(ui_cardRemaining, balance_str);
         
         // Wait 2 seconds between updates for visual verification
         vTaskDelay(pdMS_TO_TICKS(2000));

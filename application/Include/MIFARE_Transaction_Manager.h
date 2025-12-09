@@ -351,8 +351,8 @@ MIFARE_Result_t MIFARE_StartDispensing(uint16_t requested_amount_ml);
 MIFARE_Result_t MIFARE_UpdateDispensing(uint16_t dispensed_ml);
 MIFARE_Result_t MIFARE_StopDispensing(void);
 MIFARE_DispenseState_t MIFARE_GetDispenseState(void);
-bool MIFARE_IsCardPresent(void);
-bool MIFARE_IsCardPresenceConfirmed(void);  // Returns true only if card stable for 1s
+bool MIFARE_IsCardPresent(void);            /* STATE-BASED CHECK ONLY - use MIFARE_VerifyCardPresence() for hardware check */
+bool MIFARE_IsCardPresenceConfirmed(void);  /* Returns true only if card stable for 1s */
 void MIFARE_UpdateStabilityCheck(void);      // Update stability timer (call periodically)
 MIFARE_CardState_t MIFARE_GetCardState(void);
 void MIFARE_SetCardState(MIFARE_CardState_t new_state);
@@ -360,6 +360,7 @@ void MIFARE_ConfirmReadyAfterPolling(void);
 
 
 /* Card Monitoring and Safety */
+MIFARE_Result_t MIFARE_VerifyCardPresence(void);  /* UNIFIED FUNCTION - Use this for ALL card presence checks */
 MIFARE_Result_t MIFARE_MonitorCardPresence(void);
 MIFARE_Result_t MIFARE_PerformPeriodicUpdate(void);
 MIFARE_Result_t MIFARE_HandleCardRemovalDuringDispense(void);
@@ -381,5 +382,8 @@ uint32_t MIFARE_GetTotalDispensedThisSession(void);
 void MIFARE_PrintCardData(MIFARE_CardData_t *card_data);
 void MIFARE_PrintTransactionLog(MIFARE_TransactionLog_t *log);
 void MIFARE_LogTransaction(uint8_t type, uint16_t amount_ml, uint8_t dispenser_id);
+
+/* Card Polling Task */
+void MIFARE_StartPollingTask(void);
 
 #endif /* APPLICATION_INCLUDE_MIFARE_TRANSACTION_MANAGER_H_ */

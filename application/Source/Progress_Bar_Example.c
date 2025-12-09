@@ -23,6 +23,8 @@
 #include "USB_Logging.h"
 #include "FreeRTOS.h"
 #include "task.h"
+#include "ui.h"
+#include "ui_Screen1.h"
 
 /*Function Implementations ------------------------------------------*/
 
@@ -108,7 +110,26 @@ void ProgressBar_PercentageDemo(void)
         USB_Log_Printf("  Expected: %u%%, Testing...\r\n", test_cases[i].expected_percentage);
         
         // Manually test the UI update
-        ui_update_total_remaining_bar(test_cases[i].current_balance, test_cases[i].last_topup);
+        uint8_t percentage = 0;
+        if (test_cases[i].last_topup > 0) {
+            if (test_cases[i].current_balance >= test_cases[i].last_topup) {
+                percentage = 100;
+            } else {
+                percentage = (uint8_t)((test_cases[i].current_balance * 100) / test_cases[i].last_topup);
+            }
+        }
+        ui_set_bar_value(ui_totalRemainingBar, percentage, LV_ANIM_ON);
+        
+        // Update level color indicator
+        if (ui_levelColourIndicator != NULL) {
+            if (percentage > 25) {
+                ui_set_obj_style_bg_color(ui_levelColourIndicator, lv_color_hex(0x05820A), LV_PART_MAIN | LV_STATE_DEFAULT);
+            } else if (percentage > 10) {
+                ui_set_obj_style_bg_color(ui_levelColourIndicator, lv_color_hex(0xFFA500), LV_PART_MAIN | LV_STATE_DEFAULT);
+            } else {
+                ui_set_obj_style_bg_color(ui_levelColourIndicator, lv_color_hex(0xFF0000), LV_PART_MAIN | LV_STATE_DEFAULT);
+            }
+        }
         
         // Wait 1.5 seconds for visual verification
         vTaskDelay(pdMS_TO_TICKS(1500));
@@ -130,20 +151,52 @@ void ProgressBar_SimulateDispensing(void)
     uint32_t topup_amount = 3000;
     
     USB_Log_Printf("Starting simulation: Card with %u mL (100%% full)\r\n", balance);
-    ui_update_total_remaining_bar(balance, topup_amount);
+    
+    uint8_t percentage = 0;
+    if (topup_amount > 0) {
+        if (balance >= topup_amount) {
+            percentage = 100;
+        } else {
+            percentage = (uint8_t)((balance * 100) / topup_amount);
+        }
+    }
+    ui_set_bar_value(ui_totalRemainingBar, percentage, LV_ANIM_ON);
+    
+    // Update level color indicator
+    if (ui_levelColourIndicator != NULL) {
+        if (percentage > 25) {
+            ui_set_obj_style_bg_color(ui_levelColourIndicator, lv_color_hex(0x05820A), LV_PART_MAIN | LV_STATE_DEFAULT);
+        } else if (percentage > 10) {
+            ui_set_obj_style_bg_color(ui_levelColourIndicator, lv_color_hex(0xFFA500), LV_PART_MAIN | LV_STATE_DEFAULT);
+        } else {
+            ui_set_obj_style_bg_color(ui_levelColourIndicator, lv_color_hex(0xFF0000), LV_PART_MAIN | LV_STATE_DEFAULT);
+        }
+    }
+    
     vTaskDelay(pdMS_TO_TICKS(2000));
     
     // Simulate dispensing 100mL at a time
     for (uint8_t step = 1; step <= 20; step++) {
         balance -= 100; // Dispense 100mL
         
-        uint8_t percentage = (balance * 100) / topup_amount;
+        percentage = (balance * 100) / topup_amount;
         
         USB_Log_Printf("Step %02d: Dispensed 100mL → Balance: %u mL (%u%%)\r\n", 
                        step, balance, percentage);
         
         // Update progress bar in real-time
-        ui_update_total_remaining_bar(balance, topup_amount);
+        ui_set_bar_value(ui_totalRemainingBar, percentage, LV_ANIM_ON);
+        
+        // Update level color indicator
+        if (ui_levelColourIndicator != NULL) {
+            if (percentage > 25) {
+                ui_set_obj_style_bg_color(ui_levelColourIndicator, lv_color_hex(0x05820A), LV_PART_MAIN | LV_STATE_DEFAULT);
+            } else if (percentage > 10) {
+                ui_set_obj_style_bg_color(ui_levelColourIndicator, lv_color_hex(0xFFA500), LV_PART_MAIN | LV_STATE_DEFAULT);
+            } else {
+                ui_set_obj_style_bg_color(ui_levelColourIndicator, lv_color_hex(0xFF0000), LV_PART_MAIN | LV_STATE_DEFAULT);
+            }
+        }
         
         // Brief delay to simulate real dispensing time
         vTaskDelay(pdMS_TO_TICKS(500));

@@ -19,6 +19,7 @@
 
 /*Includes ----------------------------------------------------------*/
 #include <string.h>
+#include <stdio.h>
 #include "MIFARE_Transaction_Manager.h"
 #include "MIFARE_Dispenser_Integration.h"
 #include "YS_S201_Driver.h"
@@ -28,6 +29,8 @@
 #include "FreeRTOS.h"
 #include "task.h"
 #include "timers.h"
+#include "ui.h"
+#include "ui_Screen1.h"
 
 /*Private defines ---------------------------------------------------*/
 #define DISPENSER_TASK_STACK_SIZE       (configMINIMAL_STACK_SIZE * 6)
@@ -614,8 +617,37 @@ DispenserResult_t MIFARE_Dispenser_InitializeNewCustomer(uint32_t initial_balanc
  */
 static void UpdateCardUI(uint32_t current_balance_ml, uint32_t last_topup_amount_ml)
 {
-    ui_update_card_remaining_balance(current_balance_ml);
-    ui_update_total_remaining_bar(current_balance_ml, last_topup_amount_ml);
+    // Update card remaining balance
+    static char balance_str[16];
+    if (current_balance_ml > 9000) {
+        uint32_t liters = current_balance_ml / 1000;
+        snprintf(balance_str, sizeof(balance_str), "%luL", liters);
+    } else {
+        snprintf(balance_str, sizeof(balance_str), "%luml", current_balance_ml);
+    }
+    ui_set_label_text(ui_cardRemaining, balance_str);
+    
+    // Update total remaining bar
+    uint8_t percentage = 0;
+    if (last_topup_amount_ml > 0) {
+        if (current_balance_ml >= last_topup_amount_ml) {
+            percentage = 100;
+        } else {
+            percentage = (uint8_t)((current_balance_ml * 100) / last_topup_amount_ml);
+        }
+    }
+    ui_set_bar_value(ui_totalRemainingBar, percentage, LV_ANIM_ON);
+    
+    // Update level color indicator
+    if (ui_levelColourIndicator != NULL) {
+        if (percentage > 25) {
+            ui_set_obj_style_bg_color(ui_levelColourIndicator, lv_color_hex(0x05820A), LV_PART_MAIN | LV_STATE_DEFAULT);
+        } else if (percentage > 10) {
+            ui_set_obj_style_bg_color(ui_levelColourIndicator, lv_color_hex(0xFFA500), LV_PART_MAIN | LV_STATE_DEFAULT);
+        } else {
+            ui_set_obj_style_bg_color(ui_levelColourIndicator, lv_color_hex(0xFF0000), LV_PART_MAIN | LV_STATE_DEFAULT);
+        }
+    }
 }
 
 /**

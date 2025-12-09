@@ -500,7 +500,7 @@
                 "flags": 17,
                 "strtype": "OBJECT/Size",
                 "intarray": [
-                  289,
+                  253,
                   55
                 ],
                 "InheritedType": 7
@@ -695,6 +695,12 @@
                 "flags": 1048576,
                 "strtype": "OBJECT/Flags",
                 "InheritedType": 1
+              },
+              {
+                "nid": 100,
+                "strtype": "OBJECT/Hidden",
+                "strval": "True",
+                "InheritedType": 2
               },
               {
                 "nid": 110,
@@ -1094,9 +1100,9 @@
                         "nid": 10520,
                         "strtype": "_style/Bg_Color",
                         "intarray": [
-                          41,
-                          60,
-                          148,
+                          255,
+                          0,
+                          0,
                           255
                         ],
                         "InheritedType": 7
@@ -1547,8 +1553,8 @@
                 "flags": 17,
                 "strtype": "OBJECT/Position",
                 "intarray": [
-                  -91,
-                  -138
+                  -90,
+                  133
                 ],
                 "InheritedType": 7
               },
@@ -1573,12 +1579,6 @@
                 "flags": 1048576,
                 "strtype": "OBJECT/Flags",
                 "InheritedType": 1
-              },
-              {
-                "nid": 100,
-                "strtype": "OBJECT/Hidden",
-                "strval": "True",
-                "InheritedType": 2
               },
               {
                 "nid": 110,
@@ -2214,7 +2214,7 @@
     "description": "",
     "board": "Shared UI",
     "board_version": "v2.0.0",
-    "editor_version": "1.5.3",
+    "editor_version": "1.5.4",
     "image": "",
     "export_temp_image": false,
     "force_export_images": false,
@@ -2225,24 +2225,14 @@
     "theme_dark": false,
     "theme_color1": 5,
     "theme_color2": 0,
-    "uiExportFolderPath": "C:/Projects/Projects/Project-miWota/Projects/miWota/EE-Firmware/miWota/application/User_Interface/miWota/./ui",
-    "projectExportFolderPath": "C:/Projects/Projects/Project-miWota/Projects/miWota/EE-Firmware/miWota/application/User_Interface/miWota",
     "custom_variable_prefix": "uic",
-    "backup_cnt": 1859,
+    "backup_cnt": 1887,
     "autosave_cnt": 0,
     "group_color_cnt": 0,
     "lvgl_version": "9.2.2",
     "callfuncsexport": "C_FILE",
     "imageexport": "SOURCE",
     "lvgl_include_path": null,
-    "drive_stdio": null,
-    "drive_stdio_path": null,
-    "drive_posix": null,
-    "drive_posix_path": null,
-    "drive_win32": null,
-    "drive_win32_path": null,
-    "drive_fatfs": null,
-    "drive_fatfs_path": null,
     "naming": "Name",
     "naming_force_lowercase": false,
     "naming_add_subcomponent": false,

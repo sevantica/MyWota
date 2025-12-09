@@ -416,300 +416,90 @@ TaskHandle_t task_get_handle_LCD_Display_Driver_Task() { return LCD_Display_Driv
 /* ========================================================================== */
 
 /**
- * @brief Update the total remaining bar with percentage of last top-up
- * @param current_balance_ml Current balance in milliliters
- * @param last_topup_amount_ml Last top-up amount for percentage calculation
- * 
- * @details Updates the ui_totalRemainingBar with the percentage of remaining balance
- *          versus the last top-up amount. The bar shows 0-100% where 100% represents
- *          the full top-up amount and 0% represents empty.
+ * @brief Set visibility of a UI object
+ * @param obj Pointer to the UI object
+ * @param visible true to show, false to hide
+ * @return true if successful, false otherwise
  */
-void ui_update_total_remaining_bar(uint32_t current_balance_ml, uint32_t last_topup_amount_ml)
+bool ui_set_visibility(lv_obj_t * obj, bool visible)
 {
-    // Check if LVGL semaphore is available
-    if (lvgl_sem == NULL) {
-
-        return;
+    if (lvgl_sem == NULL || obj == NULL) {
+        return false;
     }
     
-    // Check if the UI element exists
-    extern lv_obj_t * ui_totalRemainingBar;
-    if (ui_totalRemainingBar == NULL) {
-     
-        return;
-    }
-    
-    // Calculate percentage (0-100)
-    uint8_t percentage = 0;
-    if (last_topup_amount_ml > 0) {
-        // Ensure we don't exceed 100% even if balance somehow exceeds topup amount
-        if (current_balance_ml >= last_topup_amount_ml) {
-            percentage = 100;
+    if (xSemaphoreTake(lvgl_sem, pdMS_TO_TICKS(100)) == pdPASS) {
+        if (visible) {
+            lv_obj_clear_flag(obj, LV_OBJ_FLAG_HIDDEN);
         } else {
-            percentage = (uint8_t)((current_balance_ml * 100) / last_topup_amount_ml);
+            lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
         }
-    }
-    
-    // Acquire LVGL protection semaphore
-    if (xSemaphoreTake(lvgl_sem, pdMS_TO_TICKS(100)) == pdPASS) {
-        
-        // Update the progress bar (LVGL bars typically use 0-100 range)
-        lv_bar_set_value(ui_totalRemainingBar, percentage, LV_ANIM_ON);
-        
-        // Update level color indicator based on percentage
-        extern lv_obj_t * ui_levelColourIndicator;
-        if (ui_levelColourIndicator != NULL) {
-            if (percentage > 25) {
-                // Green for above 25%
-                lv_obj_set_style_bg_color(ui_levelColourIndicator, lv_color_hex(0x05820A), LV_PART_MAIN | LV_STATE_DEFAULT);
-            } else if (percentage > 10) {
-                // Amber/Orange for above 10% but 25% or less
-                lv_obj_set_style_bg_color(ui_levelColourIndicator, lv_color_hex(0xFFA500), LV_PART_MAIN | LV_STATE_DEFAULT);
-            } else {
-                // Red for 10% or less
-                lv_obj_set_style_bg_color(ui_levelColourIndicator, lv_color_hex(0xFF0000), LV_PART_MAIN | LV_STATE_DEFAULT);
-            }
-        }
-        
-        // Release the semaphore
         xSemaphoreGive(lvgl_sem);
-        
-        USB_Log_Printf("UI: Updated remaining bar to %u%% (%u/%u mL)\r\n", 
-                       percentage, current_balance_ml, last_topup_amount_ml);
-    } else {
-        USB_Log_Printf("UI: Failed to acquire LVGL semaphore for bar update\r\n");
+        return true;
     }
+    return false;
 }
 
 /**
- * @brief Update the card remaining balance display on the UI
- * @param balance_ml Current card balance in milliliters
- * 
- * @details This function safely updates the ui_cardRemaining label with the current
- *          card balance. It handles LVGL thread safety using the lvgl_sem semaphore.
- *          The balance is displayed in liters (L) with 1 decimal place for values > 9L,
- *          or in milliliters (ml) for values <= 9L.
+ * @brief Set text of a label object
+ * @param label Pointer to the label object
+ * @param text Text string to set
+ * @return true if successful, false otherwise
  */
-void ui_update_card_remaining_balance(uint32_t balance_ml)
+bool ui_set_label_text(lv_obj_t * label, const char * text)
 {
-
-    // Check if LVGL semaphore is available
-    if (lvgl_sem == NULL) {
-        USB_Log_Printf("UI: LVGL semaphore not initialized\r\n");
-        return;
+    if (lvgl_sem == NULL || label == NULL || text == NULL) {
+        return false;
     }
     
-    // Check if the UI element exists
-    extern lv_obj_t * ui_cardRemaining;
-    if (ui_cardRemaining == NULL) {
-        USB_Log_Printf("UI: cardRemaining label not initialized\r\n");
-        return;
-    }
-    
-    // Acquire LVGL protection semaphore
     if (xSemaphoreTake(lvgl_sem, pdMS_TO_TICKS(100)) == pdPASS) {
-        
-        static char balance_str[16];
-
-        // Display in liters (L) for values > 9000 ml (9L), otherwise in milliliters (ml)
-        if (balance_ml > 9000) {
-            uint32_t liters = balance_ml / 1000;
-            snprintf(balance_str, sizeof(balance_str), "%luL", liters);
-        } else {
-            snprintf(balance_str, sizeof(balance_str), "%luml", balance_ml);
-        }
-        
-        
-        // Update the UI label
-        lv_label_set_text(ui_cardRemaining, balance_str);
-        
-        // Force label to recalculate size and refresh
-        lv_obj_invalidate(ui_cardRemaining);
-        
-        // Release the semaphore
+        lv_label_set_text(label, text);
+        lv_obj_invalidate(label); // Force refresh
         xSemaphoreGive(lvgl_sem);
-        
-        USB_Log_Printf("UI: Updated card balance display to: %s\r\n", balance_str);
-    } else {
-        USB_Log_Printf("UI: Failed to acquire LVGL semaphore for balance update\r\n");
+        return true;
     }
+    return false;
 }
 
 /**
- * @brief Update the dispensed session display on the UI
- * @param dispensed_ml Amount dispensed in current session in milliliters
- * 
- * @details This function safely updates the ui_dispensedSession label with the 
- *          cumulative amount dispensed in the current session. It handles LVGL 
- *          thread safety using the lvgl_sem semaphore.
+ * @brief Set value of a bar object
+ * @param bar Pointer to the bar object
+ * @param value Value to set
+ * @param anim Animation enable/disable
+ * @return true if successful, false otherwise
  */
-void ui_update_dispensed_session(uint32_t dispensed_ml)
+bool ui_set_bar_value(lv_obj_t * bar, int32_t value, lv_anim_enable_t anim)
 {
-    // Check if LVGL semaphore is available
-    if (lvgl_sem == NULL) {
-        USB_Log_Printf("UI: LVGL semaphore not initialized\r\n");
-        return;
+    if (lvgl_sem == NULL || bar == NULL) {
+        return false;
     }
     
-    // Check if the UI element exists
-    extern lv_obj_t * ui_dispensedSession;
-    if (ui_dispensedSession == NULL) {
-        USB_Log_Printf("UI: dispensedSession label not initialized\r\n");
-        return;
-    }
-    
-    // Acquire LVGL protection semaphore
     if (xSemaphoreTake(lvgl_sem, pdMS_TO_TICKS(100)) == pdPASS) {
-        
-        static char dispensed_str[16];
-        // Convert ml to liters with one decimal place
-        uint32_t liters = dispensed_ml / 1000;
-        uint32_t decimal = (dispensed_ml % 1000) / 100;
-        snprintf(dispensed_str, sizeof(dispensed_str), "%lu.%luL", liters, decimal);
-        // Update the UI label
-        lv_label_set_text(ui_dispensedSession, dispensed_str);
-        
-        // Release the semaphore
+        lv_bar_set_value(bar, value, anim);
         xSemaphoreGive(lvgl_sem);
-        
-        USB_Log_Printf("UI: Updated dispensed session display to: %s\r\n", dispensed_str);
-    } else {
-        USB_Log_Printf("UI: Failed to acquire LVGL semaphore for dispensed session update\r\n");
+        return true;
     }
+    return false;
 }
 
 /**
- * @brief Update the customer ID display on the UI
- * @param phone_number 64-bit phone number from card account data
- * 
- * @details This function safely updates the ui_customerID label with the phone number
- *          read from the MIFARE card's account data. It handles LVGL thread safety
- *          using the lvgl_sem semaphore. Phone number is displayed as an 11-digit string.
- *          The element is made visible when displaying a phone number and hidden when
- *          phone_str is NULL (card removed).
+ * @brief Set background color style of an object
+ * @param obj Pointer to the object
+ * @param color Color to set
+ * @param selector Style selector (e.g., LV_PART_MAIN | LV_STATE_DEFAULT)
+ * @return true if successful, false otherwise
  */
-void ui_update_customer_id(const char* phone_str)
+bool ui_set_obj_style_bg_color(lv_obj_t * obj, lv_color_t color, lv_style_selector_t selector)
 {
-    // Check if LVGL semaphore is available
-    if (lvgl_sem == NULL) {
-        USB_Log_Printf("UI: LVGL semaphore not initialized\r\n");
-        return;
+    if (lvgl_sem == NULL || obj == NULL) {
+        return false;
     }
     
-    // Check if the UI element exists
-    extern lv_obj_t * ui_customerID;
-    if (ui_customerID == NULL) {
-        USB_Log_Printf("UI: customerID label not initialized\r\n");
-        return;
-    }
-    
-    // Acquire LVGL protection semaphore
     if (xSemaphoreTake(lvgl_sem, pdMS_TO_TICKS(100)) == pdPASS) {
-        
-        // Check if phone string is NULL or empty (card removed)
-        if (phone_str == NULL || phone_str[0] == '\0') {
-            // Hide the label when card is removed
-            lv_obj_add_flag(ui_customerID, LV_OBJ_FLAG_HIDDEN);
-            USB_Log_Printf("UI: Customer ID hidden (card removed)\r\n");
-        } else {
-            // Update the UI label with phone string
-            lv_label_set_text(ui_customerID, phone_str);
-            
-            // Make the label visible
-            lv_obj_clear_flag(ui_customerID, LV_OBJ_FLAG_HIDDEN);
-            
-            USB_Log_Printf("UI: Customer ID visible with number: %s\r\n", phone_str);
-            
-            // Force label to recalculate size and refresh
-            lv_obj_invalidate(ui_customerID);
-        }
-        
-        // Release the semaphore
+        lv_obj_set_style_bg_color(obj, color, selector);
         xSemaphoreGive(lvgl_sem);
-    } else {
-        USB_Log_Printf("UI: Failed to acquire LVGL semaphore for customer ID update\r\n");
+        return true;
     }
-}
-
-/**
- * @brief Update the button state display on the UI
- * @param button_state Current button state (0=LOW/Released, 1=HIGH/Pressed)
- * 
- * @details This function safely updates the ui_buttonState label with the 
- *          current button state. It handles LVGL thread safety using the 
- *          lvgl_sem semaphore.
- */
-void ui_update_button_state(uint8_t button_state)
-{
-    // Check if LVGL semaphore is available
-    if (lvgl_sem == NULL) {
-        USB_Log_Printf("UI: LVGL semaphore not initialized\r\n");
-        return;
-    }
-    
-    // Check if the UI element exists
-    extern lv_obj_t * ui_buttonState;
-    if (ui_buttonState == NULL) {
-        USB_Log_Printf("UI: buttonState label not initialized\r\n");
-        return;
-    }
-    
-    // Acquire LVGL protection semaphore
-    if (xSemaphoreTake(lvgl_sem, pdMS_TO_TICKS(100)) == pdPASS) {
-        
-        // Update the UI label with button state text
-        if (button_state == 1) {
-            lv_label_set_text(ui_buttonState, "HIGH");
-        } else {
-            lv_label_set_text(ui_buttonState, "LOW");
-        }
-        
-        // Release the semaphore
-        xSemaphoreGive(lvgl_sem);
-        
-        USB_Log_Printf("UI: Updated button state display to: %s\r\n", button_state ? "HIGH" : "LOW");
-    } else {
-        USB_Log_Printf("UI: Failed to acquire LVGL semaphore for button state update\r\n");
-    }
-}
-
-/**
- * @brief Update the flow rate label on the UI
- * @param flow_rate_lpm Flow rate in liters per minute
- * 
- * @details This function safely updates the ui_flowRate label with the current
- *          flow rate. It handles LVGL thread safety using the lvgl_sem semaphore.
- */
-void ui_update_flow_rate_label(float flow_rate_lpm)
-{
-    // Check if LVGL semaphore is available
-    if (lvgl_sem == NULL) {
-        return;
-    }
-    
-    // Check if the UI element exists
-    extern lv_obj_t * ui_flowRateSensor;
-    // Note: ui_flowRateSensor might not be defined in ui.h if not created in SquareLine Studio
-    // We should check if it exists, but for now we assume it's declared extern
-    // If it's not in ui.h/c, this will cause linker error.
-    // But the user code calls this function, so presumably the UI element exists or is intended.
-    
-    if (ui_flowRateSensor == NULL) {
-        return;
-    }
-    
-    // Acquire LVGL protection semaphore
-    if (xSemaphoreTake(lvgl_sem, pdMS_TO_TICKS(100)) == pdPASS) {
-        
-        static char flow_str[16];
-        snprintf(flow_str, sizeof(flow_str), "%.1f L/min", flow_rate_lpm);
-        
-        // Update the UI label
-        lv_label_set_text(ui_flowRateSensor, flow_str);
-        
-        // Release the semaphore
-        xSemaphoreGive(lvgl_sem);
-    }
+    return false;
 }
 
 /* ========================================================================== */
@@ -808,7 +598,14 @@ static void process_ui_update_event(DISPLAY_MSG_Def* msg) {
         case UI_ELEMENT_CARD_REMAINING_LABEL:
             if (ui_cardRemaining != NULL && action == UI_ACTION_SET_VALUE) {
                 /* Update card balance display */
-                ui_update_card_remaining_balance(value);
+                static char balance_str[16];
+                if (value > 9000) {
+                    uint32_t liters = value / 1000;
+                    snprintf(balance_str, sizeof(balance_str), "%luL", liters);
+                } else {
+                    snprintf(balance_str, sizeof(balance_str), "%luml", value);
+                }
+                ui_set_label_text(ui_cardRemaining, balance_str);
             }
             break;
             

@@ -21,6 +21,9 @@
 #include "USB_CDC_Task.h"
 #include "USB_Logging.h"
 #include "lvgl.h" 
+#include "ui.h"
+#include "ui_Screen1.h"
+#include "LCD_Display_Driver.h"
 
 /* Private includes ----------------------------------------------------------*/
 #include "System.h"
@@ -29,6 +32,7 @@
 #include "Hardware_Access.h"
 #include "YS_S201_Driver.h"
 #include "CAT9555_Driver.h"
+#include <stdio.h>
 
 /* Platform-specific hardware includes */
 #if defined(PICO_BUILD) || defined(PICO_BOARD)
@@ -258,6 +262,9 @@ static void systemInitialisations()
 	/* Initialize MIFARE Transaction Manager */
 	MIFARE_TransactionManager_Init();
 	
+	/* Start MIFARE card polling task */
+	MIFARE_StartPollingTask();
+	
 	/* Start tasks */
 	Task_Start_LCD_Display_Driver_Task();
 	
@@ -357,6 +364,8 @@ static void process_mifare_polling(void)
 	MIFARE_CardState_t current_card_state = MIFARE_GetCardState();
 	MIFARE_DispenseState_t current_dispense_state = MIFARE_GetDispenseState();
 	
+	// Only log significant state changes, not every poll cycle
+	
 	// Detect transition to PRESENT state for auto-dispensing
 	if (current_card_state == MIFARE_CARD_STATE_PRESENT && last_card_state != MIFARE_CARD_STATE_PRESENT) {
 		#ifndef DISPENSE_ON_BUTTON_PRESS
@@ -377,6 +386,7 @@ static void process_mifare_polling(void)
 			system_context.card_detection_first_failed_tick = 0;
 			return;
 		}
+		// Card present but idle - continue polling for removal (no log spam)
 	}
 	
 	// If in ERROR state, check if we're still in cooldown before retrying
@@ -389,16 +399,18 @@ static void process_mifare_polling(void)
 	// Card is absent, needs polling cycle, or in error - poll to detect/confirm card
 	PN532_CardInfo_t card_info;
 	PN532_Status_t status = PN532_DetectCard(&card_info);
+	// Only log when card state changes (removed repetitive poll logging)
 	
 	if (status == PN532_STATUS_CARD_DETECTED) {
-		// Card detected!
+		// Card detected - only log significant events
 		if (current_card_state == MIFARE_CARD_STATE_NEEDS_POLLING_CYCLE) {
 			// Card was waiting for polling confirmation - now transition to PRESENT
-			USB_Log_Printf("SYSTEM: Card confirmed after polling cycle, setting to PRESENT\r\n");
+			USB_Log_Printf("[SYSTEM POLL] Card confirmed after polling cycle, setting to PRESENT\r\n");
 			// MIFARE_SetCardState(MIFARE_CARD_STATE_PRESENT); // Handled by ConfirmReadyAfterPolling
 			MIFARE_ConfirmReadyAfterPolling();
 		} else if (current_card_state == MIFARE_CARD_STATE_PRESENT) {
 			// Card still present (polling in idle mode) - do nothing
+			USB_Log_Printf("[SYSTEM POLL] Card still PRESENT (idle polling)\r\n");
 		} else {
 			// New card detected or retry after error!
 			if (current_dispense_state == DISPENSE_STATE_ERROR) {
@@ -409,9 +421,9 @@ static void process_mifare_polling(void)
 			MIFARE_ProcessCardDetected(&card_info);
 		}
 	} else {
-		// No card detected
+		// No card detected - only log when card was previously present
 		if (current_card_state == MIFARE_CARD_STATE_PRESENT) {
-			USB_Log_Printf("SYSTEM: Card removed (detected by polling)\r\n");
+			USB_Log_Printf("[SYSTEM POLL] Card REMOVED (detected by polling)\r\n");
 			MIFARE_ProcessCardRemoved();
 		} else if (current_card_state == MIFARE_CARD_STATE_NEEDS_POLLING_CYCLE) {
 			// Card was waiting for polling confirmation but not detected - may have been removed
@@ -443,11 +455,8 @@ static void state_idle(void)
 		return;
 	}
 	
-	// Update MIFARE stability checks and error recovery (every cycle = 10ms)
-	MIFARE_UpdateStabilityCheck();
-	
-	// Handle MIFARE card polling
-	process_mifare_polling();
+	// MIFARE card polling now handled by dedicated MIFARE_Polling_Task
+	// (Moved out of System task to avoid priority/starvation issues)
 	
 	// Increment diagnostic counter
 	system_context.diagnostic_counter++;
@@ -590,13 +599,44 @@ static void process_dispensing_logic(void)
 			USB_Log_Printf("Dispense successful. New Balance: %u mL\r\n", current_balance);
 			
 			/* Update the remaining bar (Scale to 1000L / 1,000,000 mL max capacity) */
-			ui_update_total_remaining_bar(current_balance, 1000000);
+            uint8_t percentage = 0;
+            uint32_t max_capacity = 1000000;
+            if (max_capacity > 0) {
+                if (current_balance >= max_capacity) {
+                    percentage = 100;
+                } else {
+                    percentage = (uint8_t)((current_balance * 100) / max_capacity);
+                }
+            }
+            ui_set_bar_value(ui_totalRemainingBar, percentage, LV_ANIM_ON);
+            
+            // Update level color indicator
+            if (ui_levelColourIndicator != NULL) {
+                if (percentage > 25) {
+                    ui_set_obj_style_bg_color(ui_levelColourIndicator, lv_color_hex(0x05820A), LV_PART_MAIN | LV_STATE_DEFAULT);
+                } else if (percentage > 10) {
+                    ui_set_obj_style_bg_color(ui_levelColourIndicator, lv_color_hex(0xFFA500), LV_PART_MAIN | LV_STATE_DEFAULT);
+                } else {
+                    ui_set_obj_style_bg_color(ui_levelColourIndicator, lv_color_hex(0xFF0000), LV_PART_MAIN | LV_STATE_DEFAULT);
+                }
+            }
 			
 			/* Update the text box with actual remaining value */
-			ui_update_card_remaining_balance(current_balance);
+            static char balance_str[16];
+            if (current_balance > 9000) {
+                uint32_t liters = current_balance / 1000;
+                snprintf(balance_str, sizeof(balance_str), "%luL", liters);
+            } else {
+                snprintf(balance_str, sizeof(balance_str), "%luml", current_balance);
+            }
+            ui_set_label_text(ui_cardRemaining, balance_str);
 			
 			/* Update the dispensed session display */
-			ui_update_dispensed_session(amount_to_dispense);
+            static char dispensed_str[16];
+            uint32_t liters = amount_to_dispense / 1000;
+            uint32_t decimal = (amount_to_dispense % 1000) / 100;
+            snprintf(dispensed_str, sizeof(dispensed_str), "%lu.%luL", liters, decimal);
+            ui_set_label_text(ui_dispensedSession, dispensed_str);
 		} else {
 			USB_Log_Printf("Transaction commit failed!\r\n");
 		}
@@ -659,7 +699,11 @@ static void poll_CAT9555_UserButton(void)
 					send_gpio_event(IO_PIN_USER_BUTTON, current_raw_state, 1, EVENT_SOURCE_CAT9555_PIN);
 					
 					/* Update button state display */
-					ui_update_button_state(current_raw_state);
+					if (current_raw_state == 1) {
+                        ui_set_label_text(ui_buttonState, "HIGH");
+                    } else {
+                        ui_set_label_text(ui_buttonState, "LOW");
+                    }
 					
 					/* Detect LOW to HIGH transition (button press) */
 					if (last_stable_state == 0 && current_raw_state == 1) {
