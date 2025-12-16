@@ -21,7 +21,7 @@
 #include "Hardware_Access.h"
 #include "Dispenser_Control.h"
 #include "RFID_RC522_Driver.h"
-#include "LCD_Display_Driver.h"
+#include "mywota_ui_driver.h"
 
 
 
@@ -58,12 +58,11 @@ SPI_LCD_RESET_POS,
 
 }GPIO_PIN_POSTIONS;
 
-/*Event message types for generalized event system*/
+/*Event message types for generalized event system - DEPRECATED (UI now polls data) */
 typedef enum {
     EVENT_TYPE_RFID_PICC = 0,      // RFID/PICC card events
     EVENT_TYPE_GPIO_PIN = 1,       // GPIO pin state changes
     EVENT_TYPE_SENSOR = 2,         // Sensor readings and states
-    EVENT_TYPE_UI_UPDATE = 3,      // Direct UI element updates
     EVENT_TYPE_SYSTEM_STATE = 4,   // System status changes
     EVENT_TYPE_USER_INPUT = 5,     // Button presses, touch events
     EVENT_TYPE_FLOW_SENSOR = 6,    // Water flow sensor events
@@ -107,14 +106,6 @@ typedef union {
         uint32_t sensor_value;     // Sensor reading value
         uint8_t sensor_status;     // Sensor status flags
     } sensor_data;
-    
-    /*UI update event data*/
-    struct {
-        uint8_t ui_element_id;     // UI element identifier
-        uint8_t ui_action;         // UI action (update color, value, text, etc.)
-        uint32_t ui_value;         // New value for the UI element
-        uint32_t ui_color;         // Color value (RGB)
-    } ui_data;
     
     /*System state event data*/
     struct {
@@ -224,7 +215,6 @@ typedef DISPLAY_MSG_Def EVENT_MSG_Def;
 } while(0)
 
 /*Extern Variables ---------------------------------------------------*/
-extern IO_Def system_io_collection[30];
 extern SemaphoreHandle_t gpio_semaphore;
 extern SemaphoreHandle_t i2c_semaphore;
 extern SemaphoreHandle_t i2c_1_Semaphore;
@@ -237,25 +227,12 @@ void* getUIComponent(uint8_t type);
 QueueHandle_t get_msg_queue_io();
 QueueHandle_t get_msg_queue_spi_tx();
 QueueHandle_t get_msg_queue_picc();
-QueueHandle_t get_msg_queue_display();
-
-IO_Def* get_control_handle(uint64_t ID);
-
-void task_transact_spi_msg(SPI_MSG_DEF *msg);
+// Removed undefined get_msg_queue_display declaration
 
 /* ========================================================================== */
-/*                         EVENT UTILITY FUNCTIONS                           */
+/*                         EVENT UTILITY FUNCTIONS - DEPRECATED             */
 /* ========================================================================== */
-
-/**
- * @brief Send a GPIO pin state change event
- * @param pin_id GPIO pin identifier
- * @param pin_state Pin state (0=LOW, 1=HIGH)
- * @param bank_id Bank ID for I2C expanders (0 for direct GPIO)
- * @param source Event source identifier
- * @return pdTRUE if event sent successfully, pdFALSE otherwise
- */
-BaseType_t send_event_gpio_pin(uint8_t pin_id, uint8_t pin_state, uint8_t bank_id, EVENT_SOURCE_Enum source);
+/* NOTE: UI now uses getter functions to poll data instead of events */
 
 /**
  * @brief Send a sensor reading event
@@ -267,17 +244,6 @@ BaseType_t send_event_gpio_pin(uint8_t pin_id, uint8_t pin_state, uint8_t bank_i
  * @return pdTRUE if event sent successfully, pdFALSE otherwise
  */
 BaseType_t send_event_sensor(uint8_t sensor_id, uint8_t sensor_type, uint32_t sensor_value, uint8_t sensor_status, EVENT_SOURCE_Enum source);
-
-/**
- * @brief Send a UI update event
- * @param element_id UI element identifier
- * @param action UI action to perform
- * @param value New value for the UI element
- * @param color Color value (RGB) if applicable
- * @param source Event source identifier
- * @return pdTRUE if event sent successfully, pdFALSE otherwise
- */
-BaseType_t send_event_ui_update(uint8_t element_id, uint8_t action, uint32_t value, uint32_t color, EVENT_SOURCE_Enum source);
 
 /**
  * @brief Send a system state change event
@@ -300,16 +266,6 @@ BaseType_t send_event_system_state(uint8_t component, uint8_t state, uint16_t er
  * @return pdTRUE if event sent successfully, pdFALSE otherwise
  */
 BaseType_t send_event_user_input(uint8_t input_id, uint8_t input_type, uint8_t input_action, uint32_t input_duration, EVENT_SOURCE_Enum source);
-
-/**
- * @brief Send an RFID/PICC event (backwards compatibility)
- * @param picc_position PICC reader position (0-7)
- * @param picc_state PICC state (INACTIVE/AUTH/ACTIVE)
- * @param card_uid Card UID (first 4 bytes)
- * @param source Event source identifier
- * @return pdTRUE if event sent successfully, pdFALSE otherwise
- */
-BaseType_t send_event_rfid_picc(uint8_t picc_position, uint8_t picc_state, uint32_t card_uid, EVENT_SOURCE_Enum source);
 
 
 #endif /* APPLICATION_INCLUDE_SYSTEM_H_ */

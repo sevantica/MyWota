@@ -361,8 +361,6 @@ void MIFARE_ConfirmReadyAfterPolling(void);
 
 /* Card Monitoring and Safety */
 MIFARE_Result_t MIFARE_VerifyCardPresence(void);  /* UNIFIED FUNCTION - Use this for ALL card presence checks */
-MIFARE_Result_t MIFARE_MonitorCardPresence(void);
-MIFARE_Result_t MIFARE_PerformPeriodicUpdate(void);
 MIFARE_Result_t MIFARE_HandleCardRemovalDuringDispense(void);
 
 /* Data Integrity Functions */
@@ -374,9 +372,15 @@ MIFARE_Result_t mifare_restore_from_backup(MIFARE_CardData_t *card_data);
 /* Utility Functions */
 const char* MIFARE_GetResultString(MIFARE_Result_t result);
 const char* MIFARE_GetStateString(MIFARE_DispenseState_t state);
+
+/* UI Getter Functions - UI polls these instead of receiving events */
 uint32_t MIFARE_GetBalanceML(void);
 uint32_t MIFARE_GetLastTopupAmountML(void);
 uint32_t MIFARE_GetTotalDispensedThisSession(void);
+bool MIFARE_GetCardStatus(void);             /* Returns true if card is present and ready */
+uint8_t MIFARE_GetCardStatusFlags(void);     /* Returns card status flags byte */
+uint32_t MIFARE_GetTotalPurchasedML(void);   /* Lifetime purchased amount */
+uint32_t MIFARE_GetTotalDispensedML(void);   /* Lifetime dispensed amount */
 
 /* Debug and Logging Functions */
 void MIFARE_PrintCardData(MIFARE_CardData_t *card_data);

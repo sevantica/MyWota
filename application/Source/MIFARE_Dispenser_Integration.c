@@ -24,7 +24,7 @@
 #include "MIFARE_Dispenser_Integration.h"
 #include "YS_S201_Driver.h"
 #include "USB_Logging.h"
-#include "LCD_Display_Driver.h"
+#include "mywota_ui_driver.h"
 #include "PN532_Driver.h"
 #include "FreeRTOS.h"
 #include "task.h"
@@ -45,6 +45,29 @@
 #define TEST_MODE_INITIAL_BALANCE_ML    (100000) // 100L initial balance for test mode
 #define TEST_MODE_SIMULATED_FLOW_LPM    (20.0f)  // 20L/min simulated flow rate
 #define TEST_MODE_CUSTOMER_ID           (0x1234567890ABCDEFULL) // Test customer ID
+
+/* Logging Configuration -----------------------------------------------------*/
+#define LOG_DEBUG_MIFARE_DISPENSER_INTEGRATION_EN      1
+#define LOG_CRITICAL_MIFARE_DISPENSER_INTEGRATION_EN   1
+#define LOG_ERROR_MIFARE_DISPENSER_INTEGRATION_EN      1
+
+#if LOG_DEBUG_MIFARE_DISPENSER_INTEGRATION_EN
+    #define LOG_DEBUG_MIFARE_DISPENSER_INTEGRATION(...) USB_Log_Printf(__VA_ARGS__)
+#else
+    #define LOG_DEBUG_MIFARE_DISPENSER_INTEGRATION(...)
+#endif
+
+#if LOG_CRITICAL_MIFARE_DISPENSER_INTEGRATION_EN
+    #define LOG_CRITICAL_MIFARE_DISPENSER_INTEGRATION(...) USB_Log_Printf(__VA_ARGS__)
+#else
+    #define LOG_CRITICAL_MIFARE_DISPENSER_INTEGRATION(...)
+#endif
+
+#if LOG_ERROR_MIFARE_DISPENSER_INTEGRATION_EN
+    #define LOG_ERROR_MIFARE_DISPENSER_INTEGRATION(...) USB_Log_Printf(__VA_ARGS__)
+#else
+    #define LOG_ERROR_MIFARE_DISPENSER_INTEGRATION(...)
+#endif
 
 /*Private typedefs --------------------------------------------------*/
 typedef enum {
@@ -115,14 +138,14 @@ DispenserResult_t MIFARE_Dispenser_Init(void)
 #if TEST_MODE_ENABLED
     // Initialize test mode
     InitializeTestMode();
-    USB_Log_Printf("DISPENSER: Test mode enabled - Initial balance: %u mL (%.1f L)\r\n", 
+    LOG_CRITICAL_MIFARE_DISPENSER_INTEGRATION("DISPENSER: Test mode enabled - Initial balance: %u mL (%.1f L)\r\n", 
                    TEST_MODE_INITIAL_BALANCE_ML, TEST_MODE_INITIAL_BALANCE_ML / 1000.0f);
 #endif
     
     // Initialize flow sensor
     YS_S201_Status_t flow_status = YS_S201_Init(&dispenser_handle.flow_sensor, FLOW_SENSOR_PIN);
     if (flow_status != YS_S201_OK) {
-        USB_Log_Printf("DISPENSER: Failed to initialize flow sensor: %s\r\n", 
+        LOG_ERROR_MIFARE_DISPENSER_INTEGRATION("DISPENSER: Failed to initialize flow sensor: %s\r\n", 
                        YS_S201_GetStatusString(flow_status));
         return DISPENSER_RESULT_ERROR;
     }
@@ -130,7 +153,7 @@ DispenserResult_t MIFARE_Dispenser_Init(void)
     // Start flow monitoring
     flow_status = YS_S201_Start(&dispenser_handle.flow_sensor);
     if (flow_status != YS_S201_OK) {
-        USB_Log_Printf("DISPENSER: Failed to start flow monitoring\r\n");
+        LOG_ERROR_MIFARE_DISPENSER_INTEGRATION("DISPENSER: Failed to start flow monitoring\r\n");
         return DISPENSER_RESULT_ERROR;
     }
     
@@ -144,7 +167,7 @@ DispenserResult_t MIFARE_Dispenser_Init(void)
     );
     
     if (dispenser_safety_timer == NULL) {
-        USB_Log_Printf("DISPENSER: Failed to create safety timer\r\n");
+        LOG_ERROR_MIFARE_DISPENSER_INTEGRATION("DISPENSER: Failed to create safety timer\r\n");
         return DISPENSER_RESULT_ERROR;
     }
     
@@ -159,11 +182,11 @@ DispenserResult_t MIFARE_Dispenser_Init(void)
     );
     
     if (result != pdPASS) {
-        USB_Log_Printf("DISPENSER: Failed to create dispenser task\r\n");
+        LOG_ERROR_MIFARE_DISPENSER_INTEGRATION("DISPENSER: Failed to create dispenser task\r\n");
         return DISPENSER_RESULT_ERROR;
     }
     
-    USB_Log_Printf("DISPENSER: Initialization successful\r\n");
+    LOG_CRITICAL_MIFARE_DISPENSER_INTEGRATION("DISPENSER: Initialization successful\r\n");
     return DISPENSER_RESULT_OK;
 }
 
@@ -176,19 +199,19 @@ DispenserResult_t MIFARE_Dispenser_RequestWater(uint16_t amount_ml)
 {
     // Validate amount
     if (amount_ml < DISPENSER_MIN_DISPENSE_ML || amount_ml > DISPENSER_MAX_DISPENSE_ML) {
-        USB_Log_Printf("DISPENSER: Invalid amount requested: %u mL\r\n", amount_ml);
+        LOG_ERROR_MIFARE_DISPENSER_INTEGRATION("DISPENSER: Invalid amount requested: %u mL\r\n", amount_ml);
         return DISPENSER_RESULT_INVALID_AMOUNT;
     }
     
     // Check if card is present and ready
     if (!MIFARE_IsCardPresent()) {
-        USB_Log_Printf("DISPENSER: No card present\r\n");
+        LOG_ERROR_MIFARE_DISPENSER_INTEGRATION("DISPENSER: No card present\r\n");
         return DISPENSER_RESULT_NO_CARD;
     }
     
     MIFARE_DispenseState_t mifare_state = MIFARE_GetDispenseState();
     if (mifare_state != DISPENSE_STATE_READY_TO_DISPENSE) {
-        USB_Log_Printf("DISPENSER: Card not ready for dispensing (state: %s)\r\n", 
+        LOG_ERROR_MIFARE_DISPENSER_INTEGRATION("DISPENSER: Card not ready for dispensing (state: %s)\r\n", 
                        MIFARE_GetStateString(mifare_state));
         return DISPENSER_RESULT_CARD_NOT_READY;
     }
@@ -196,14 +219,14 @@ DispenserResult_t MIFARE_Dispenser_RequestWater(uint16_t amount_ml)
     // Check sufficient balance
     uint32_t balance = MIFARE_GetBalanceML();
     if (balance < amount_ml) {
-        USB_Log_Printf("DISPENSER: Insufficient balance: %lu mL available, %u mL requested\r\n", 
+        LOG_ERROR_MIFARE_DISPENSER_INTEGRATION("DISPENSER: Insufficient balance: %lu mL available, %u mL requested\r\n", 
                        balance, amount_ml);
         return DISPENSER_RESULT_INSUFFICIENT_BALANCE;
     }
     
     // Check dispenser state
     if (dispenser_handle.state != DISPENSER_CARD_READY) {
-        USB_Log_Printf("DISPENSER: Dispenser not ready (state: %s)\r\n", 
+        LOG_ERROR_MIFARE_DISPENSER_INTEGRATION("DISPENSER: Dispenser not ready (state: %s)\r\n", 
                        GetDispenserStateString(dispenser_handle.state));
         return DISPENSER_RESULT_BUSY;
     }

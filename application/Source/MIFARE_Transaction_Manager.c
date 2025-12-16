@@ -22,7 +22,7 @@
 #include "PN532_Driver.h"
 #include "USB_Logging.h"
 #include "System.h"
-#include "LCD_Display_Driver.h"
+#include "mywota_ui_driver.h"
 #include <string.h>
 #include <stdio.h>
 #include <stddef.h>
@@ -30,7 +30,6 @@
 #include "ui_Screen1.h"
 
 /*Private defines ---------------------------------------------------*/
-#define MIFARE_DEBUG_ENABLED            1
 #define MIFARE_AUTH_KEY_A               {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}  // Default key for now
 #define PN532_POST_RESET_COOLDOWN_MS    1200
 
@@ -44,11 +43,31 @@
 #define MIFARE_IS_SECTOR_TRAILER(block) (((block) % MIFARE_BLOCKS_PER_SECTOR) == 3)
 #define MIFARE_GET_SECTOR(block)        ((block) / MIFARE_BLOCKS_PER_SECTOR)
 
-#if MIFARE_DEBUG_ENABLED
-#define MIFARE_LOG(fmt, ...) USB_Log_Printf("MIFARE: " fmt "\r\n", ##__VA_ARGS__)
+/* Logging Configuration -----------------------------------------------------*/
+#define LOG_DEBUG_MIFARE_TRANSACTION_MANAGER_EN      1
+#define LOG_CRITICAL_MIFARE_TRANSACTION_MANAGER_EN   1
+#define LOG_ERROR_MIFARE_TRANSACTION_MANAGER_EN      1
+
+#if LOG_DEBUG_MIFARE_TRANSACTION_MANAGER_EN
+    #define LOG_DEBUG_MIFARE_TRANSACTION_MANAGER(...) USB_Log_Printf(__VA_ARGS__)
 #else
-#define MIFARE_LOG(fmt, ...)
+    #define LOG_DEBUG_MIFARE_TRANSACTION_MANAGER(...)
 #endif
+
+#if LOG_CRITICAL_MIFARE_TRANSACTION_MANAGER_EN
+    #define LOG_CRITICAL_MIFARE_TRANSACTION_MANAGER(...) USB_Log_Printf(__VA_ARGS__)
+#else
+    #define LOG_CRITICAL_MIFARE_TRANSACTION_MANAGER(...)
+#endif
+
+#if LOG_ERROR_MIFARE_TRANSACTION_MANAGER_EN
+    #define LOG_ERROR_MIFARE_TRANSACTION_MANAGER(...) USB_Log_Printf(__VA_ARGS__)
+#else
+    #define LOG_ERROR_MIFARE_TRANSACTION_MANAGER(...)
+#endif
+
+/* Legacy macro for compatibility - maps to DEBUG */
+#define MIFARE_LOG(fmt, ...) LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: " fmt "\r\n", ##__VA_ARGS__)
 
 /*Private variables -------------------------------------------------*/
 MIFARE_TransactionManager_t g_transaction_manager;
@@ -66,9 +85,7 @@ static MIFARE_Result_t mifare_read_block_safe(uint8_t block_number, uint8_t *dat
 static MIFARE_Result_t mifare_write_block_safe(uint8_t block_number, uint8_t *data);
 static void mifare_transition_state(MIFARE_DispenseState_t new_state);
 static uint32_t mifare_get_timestamp(void);
-static MIFARE_Result_t safe_memcpy_from_block(void *dest, size_t dest_size, const uint8_t *block_data, size_t copy_size);
-static MIFARE_Result_t safe_memcpy_to_block(uint8_t *block_data, const void *src, size_t src_size, size_t copy_size);
-static MIFARE_Result_t safe_struct_copy(void *dest, size_t dest_size, const void *src, size_t src_size);
+
 static uint32_t mifare_fast_balance_crc32(const uint8_t *data, size_t length);
 static void mifare_fast_balance_update(MIFARE_FastBalance_t *fast_balance, uint32_t balance_ml);
 static bool mifare_fast_balance_validate(const MIFARE_FastBalance_t *fast_balance);
@@ -82,7 +99,6 @@ static void mifare_update_write_snapshot(const MIFARE_CardData_t *card_data);
 static bool mifare_card_data_changed(const MIFARE_CardData_t *card_data);
 static void mifare_encode_account_data(MIFARE_AccountData_t *account_data, const char *phone_str, MIFARE_CardValidity_t validity);
 static bool mifare_is_account_data_empty(const MIFARE_AccountData_t *account_data);
-static bool mifare_verify_stable_reads(MIFARE_CardData_t *card_data);
 
 /*Utility Functions ---------------------------------------------*/
 
@@ -1324,12 +1340,10 @@ static MIFARE_Result_t mifare_write_block_safe(uint8_t block_number, uint8_t *da
         return auth_result;
     }
     
-    // Write the block
+    /* Write the block */
     PN532_Status_t status = PN532_MifareWriteBlock(block_number, data);
     if (status != PN532_STATUS_OK) {
-        // MIFARE_LOG("Write failed for block %d, PN532 status: %d", block_number, status);
-
-        // Track consecutive write failures across ALL write attempts (not just this function call)
+        /* Track consecutive write failures across ALL write attempts (not just this function call) */
         TickType_t now = xTaskGetTickCount();
         
         // Check if we're in an existing failure period or starting a new one
@@ -1398,10 +1412,8 @@ static MIFARE_Result_t mifare_write_block_safe(uint8_t block_number, uint8_t *da
             MIFARE_LOG("Re-authentication failed for block %d during write retry", block_number);
         }
 
-        // If write fails, perform recovery based on error type
+        /* If write fails, perform recovery based on error type */
         if (status != PN532_STATUS_OK) {
-            // USB_Log_Printf("MIFARE: Write retry failed for block %d, PN532 status: %d\r\n", block_number, status);
-            
             if (status == PN532_STATUS_TIMEOUT) {
                 // Card timeout (0x27) - likely card removed
                 MIFARE_LOG("Card timeout detected - card likely removed");
@@ -1477,90 +1489,6 @@ static void mifare_transition_state(MIFARE_DispenseState_t new_state)
 static uint32_t mifare_get_timestamp(void)
 {
     return (uint32_t)xTaskGetTickCount();
-}
-
-/*Safe Memory Copy Helper Functions -----------------------------*/
-
-/**
- * @brief Safely copy data from MIFARE block to destination structure
- * @param dest Destination buffer
- * @param dest_size Size of destination buffer
- * @param block_data Source block data (16 bytes)
- * @param copy_size Number of bytes to copy
- * @return MIFARE_Result_t Operation result
- */
-static MIFARE_Result_t safe_memcpy_from_block(void *dest, size_t dest_size, const uint8_t *block_data, size_t copy_size)
-{
-    if (dest == NULL || block_data == NULL) {
-        MIFARE_LOG("ERROR: NULL pointer in safe_memcpy_from_block");
-        return MIFARE_RESULT_ERROR;
-    }
-    
-    if (copy_size > dest_size) {
-        MIFARE_LOG("ERROR: Copy size (%u) exceeds destination size (%u)", copy_size, dest_size);
-        return MIFARE_RESULT_ERROR;
-    }
-    
-    if (copy_size > 16) {  // MIFARE block size
-        MIFARE_LOG("ERROR: Copy size (%u) exceeds MIFARE block size (16)", copy_size);
-        return MIFARE_RESULT_ERROR;
-    }
-    
-    memcpy(dest, block_data, copy_size);
-    return MIFARE_RESULT_OK;
-}
-
-/**
- * @brief Safely copy data from source structure to MIFARE block
- * @param block_data Destination block buffer (16 bytes)
- * @param src Source data
- * @param src_size Size of source data
- * @param copy_size Number of bytes to copy
- * @return MIFARE_Result_t Operation result
- */
-static MIFARE_Result_t safe_memcpy_to_block(uint8_t *block_data, const void *src, size_t src_size, size_t copy_size)
-{
-    if (block_data == NULL || src == NULL) {
-        MIFARE_LOG("ERROR: NULL pointer in safe_memcpy_to_block");
-        return MIFARE_RESULT_ERROR;
-    }
-    
-    if (copy_size > src_size) {
-        MIFARE_LOG("ERROR: Copy size (%u) exceeds source size (%u)", copy_size, src_size);
-        return MIFARE_RESULT_ERROR;
-    }
-    
-    if (copy_size > 16) {  // MIFARE block size
-        MIFARE_LOG("ERROR: Copy size (%u) exceeds MIFARE block size (16)", copy_size);
-        return MIFARE_RESULT_ERROR;
-    }
-    
-    memcpy(block_data, src, copy_size);
-    return MIFARE_RESULT_OK;
-}
-
-/**
- * @brief Safely copy data between structures with size validation
- * @param dest Destination structure
- * @param dest_size Size of destination structure
- * @param src Source structure
- * @param src_size Size of source structure
- * @return MIFARE_Result_t Operation result
- */
-static MIFARE_Result_t safe_struct_copy(void *dest, size_t dest_size, const void *src, size_t src_size)
-{
-    if (dest == NULL || src == NULL) {
-        MIFARE_LOG("ERROR: NULL pointer in safe_struct_copy");
-        return MIFARE_RESULT_ERROR;
-    }
-    
-    if (src_size > dest_size) {
-        MIFARE_LOG("ERROR: Source size (%u) exceeds destination size (%u)", src_size, dest_size);
-        return MIFARE_RESULT_ERROR;
-    }
-    
-    memcpy(dest, src, src_size);
-    return MIFARE_RESULT_OK;
 }
 
 /*Write Snapshot Helpers ------------------------------------------*/
@@ -1867,13 +1795,6 @@ bool MIFARE_IsCardPresent(void)
 {
     bool is_present = (g_transaction_manager.card_state == MIFARE_CARD_STATE_PRESENT || 
                        g_transaction_manager.card_state == MIFARE_CARD_STATE_NEEDS_POLLING_CYCLE);
-    
-    // Debug: Log state periodically
-    static uint32_t log_counter = 0;
-    log_counter++;
-    if (log_counter % 50 == 0) {  // Every ~5 seconds
-        MIFARE_LOG("IsCardPresent check: card_state=%d, is_present=%d", g_transaction_manager.card_state, is_present);
-    }
     
     return is_present;
 }
@@ -2392,36 +2313,6 @@ uint16_t mifare_calculate_crc16(uint8_t *data, uint16_t length)
     return crc;
 }
 
-static bool mifare_verify_stable_reads(MIFARE_CardData_t *card_data)
-{
-    // Read the card multiple times to ensure data stability
-    // This is critical for avoiding partial reads during card movement
-    MIFARE_CardData_t read1, read2;
-    MIFARE_Result_t result;
-    
-    // First read
-    result = MIFARE_ReadCardData(&read1);
-    if (result != MIFARE_RESULT_OK) return false;
-    
-    vTaskDelay(pdMS_TO_TICKS(10));
-    
-    // Second read
-    result = MIFARE_ReadCardData(&read2);
-    if (result != MIFARE_RESULT_OK) return false;
-    
-    // Compare key fields
-    if (read1.user_primary.balance_ml != read2.user_primary.balance_ml ||
-        read1.user_primary.transaction_counter != read2.user_primary.transaction_counter ||
-        read1.header.card_serial != read2.header.card_serial) {
-        MIFARE_LOG("Unstable reads detected - retrying");
-        return false;
-    }
-    
-    // Copy verified data
-    memcpy(card_data, &read1, sizeof(MIFARE_CardData_t));
-    return true;
-}
-
 MIFARE_Result_t MIFARE_DetectAndAutoInitializeCard(const PN532_CardInfo_t *card_info, uint32_t default_balance_ml)
 {
     PN532_Status_t status;
@@ -2510,6 +2401,43 @@ uint32_t MIFARE_GetTotalDispensedThisSession(void)
     return g_transaction_manager.total_dispensed_this_session;
 }
 
+/**
+ * @brief Get card status for UI (returns true if card present and ready)
+ * @return bool True if card is present and ready to dispense
+ */
+bool MIFARE_GetCardStatus(void)
+{
+    return (g_transaction_manager.dispense_state == DISPENSE_STATE_READY_TO_DISPENSE ||
+            g_transaction_manager.dispense_state == DISPENSE_STATE_DISPENSING);
+}
+
+/**
+ * @brief Get card status flags byte
+ * @return uint8_t Card status flags (see CARD_STATUS_* defines)
+ */
+uint8_t MIFARE_GetCardStatusFlags(void)
+{
+    return g_transaction_manager.current_card.user_primary.status_flags;
+}
+
+/**
+ * @brief Get total purchased amount (lifetime)
+ * @return uint32_t Total purchased in mL
+ */
+uint32_t MIFARE_GetTotalPurchasedML(void)
+{
+    return g_transaction_manager.current_card.usage_data.total_purchased_ml;
+}
+
+/**
+ * @brief Get total dispensed amount (lifetime)
+ * @return uint32_t Total dispensed in mL
+ */
+uint32_t MIFARE_GetTotalDispensedML(void)
+{
+    return g_transaction_manager.current_card.usage_data.total_dispensed_ml;
+}
+
 void MIFARE_LogTransaction(uint8_t type, uint16_t amount_ml, uint8_t dispenser_id)
 {
     MIFARE_CardData_t *card_data = &g_transaction_manager.current_card;
@@ -2534,19 +2462,6 @@ void MIFARE_LogTransaction(uint8_t type, uint16_t amount_ml, uint8_t dispenser_i
     MIFARE_LOG("Transaction logged: Type=%d, Amount=%u mL", type, amount_ml);
 }
 
-
-MIFARE_Result_t MIFARE_MonitorCardPresence(void)
-{
-    MIFARE_LOG("[MONITOR] Actively monitoring card presence via PN532...");
-    MIFARE_Result_t result = MIFARE_VerifyCardPresence();
-    MIFARE_LOG("[MONITOR] Card presence check result: %s", MIFARE_GetResultString(result));
-    return result;
-}
-
-MIFARE_Result_t MIFARE_PerformPeriodicUpdate(void)
-{
-    return MIFARE_RESULT_OK;
-}
 
 /*Card Polling Task ----------------------------------------------*/
 static TaskHandle_t mifare_polling_task_handle = NULL;

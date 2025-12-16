@@ -44,8 +44,11 @@ int main()
     // Small delay to allow USB to enumerate
     sleep_ms(1000);
     
-    // Initialize all hardware peripherals (this will initialize USB stdio)
-    Hardware_Init();
+    // Initialize SD CS pin HIGH (inactive) to prevent SPI bus conflicts
+    // SD card shares SPI0 with LCD, so keep SD CS high until SD is initialized
+    gpio_init(6);  // SD_CS_PIN (GPIO 6 = SPI_0_CS1)
+    gpio_set_dir(6, GPIO_OUT);
+    gpio_put(6, 1);  // CS inactive (high)
     
     printf("Starting UI_PICO_PORT...\n");
     print_memory_stats();

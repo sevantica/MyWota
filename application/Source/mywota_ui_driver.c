@@ -1,5 +1,5 @@
 /*
- * LCD Display Driver - Optimized for STM32F411 with ILI9488
+ * MyWota UI Driver - Optimized for STM32F411 with ILI9488
  * 
  * Features:
  * - LVGL integration with ILI9488 LCD controller
@@ -23,7 +23,7 @@
 #include "task.h"
 #include "queue.h"
 #include "semphr.h"
-#include "LCD_Display_Driver.h"
+#include "mywota_ui_driver.h"
 #include "LCD_Driver.h"
 #include "lvgl.h"
 #include "ui.h"
@@ -31,6 +31,8 @@
 #include "System.h"
 #include "Hardware_Access.h" /* For SPI_MSG_DEF and centralized hardware definitions */
 #include "USB_Logging.h"
+#include "MIFARE_Transaction_Manager.h"  /* For getter functions */
+#include "Dispenser_Control.h"           /* For getter functions */
 #ifdef LV_USE_ILI9341
 #include "display/ili9341/lv_ili9341.h"
 #endif
@@ -51,6 +53,7 @@
 /* Timing Configuration */
 #define DISPLAY_REFRESH_MS              5U
 #define LVGL_TASK_PERIOD_MS             5U
+#define UI_DATA_POLL_INTERVAL_MS        100U   /* Poll data every 100ms */
 
 /* UI Configuration */
 #define SCREEN_SWITCH_DELAY_MS          4000U   /* 4 seconds delay before switching */
@@ -67,6 +70,28 @@
 #define FPS_UPDATE_INTERVAL_MS          ONE_SECOND_MS
 #define LCD_RESET_DELAY_MS              500U
 
+/* Logging Configuration -----------------------------------------------------*/
+#define LOG_DEBUG_LCD_DISPLAY_DRIVER_EN      1
+#define LOG_CRITICAL_LCD_DISPLAY_DRIVER_EN   1
+#define LOG_ERROR_LCD_DISPLAY_DRIVER_EN      1
+
+#if LOG_DEBUG_LCD_DISPLAY_DRIVER_EN
+    #define LOG_DEBUG_LCD_DISPLAY_DRIVER(...) USB_Log_Printf(__VA_ARGS__)
+#else
+    #define LOG_DEBUG_LCD_DISPLAY_DRIVER(...)
+#endif
+
+#if LOG_CRITICAL_LCD_DISPLAY_DRIVER_EN
+    #define LOG_CRITICAL_LCD_DISPLAY_DRIVER(...) USB_Log_Printf(__VA_ARGS__)
+#else
+    #define LOG_CRITICAL_LCD_DISPLAY_DRIVER(...)
+#endif
+
+#if LOG_ERROR_LCD_DISPLAY_DRIVER_EN
+    #define LOG_ERROR_LCD_DISPLAY_DRIVER(...) USB_Log_Printf(__VA_ARGS__)
+#else
+    #define LOG_ERROR_LCD_DISPLAY_DRIVER(...)
+#endif
 
 /* Local event constants for LCD processing */
 enum { LOCAL_PICC_POS_0 = 0 }; /* Position index 0 */
@@ -114,6 +139,7 @@ static unsigned long start_tick_ms = 0;          /* Start tick */
 static unsigned long last_bar_update_tick = 0;   /* Last bar update tick */
 static unsigned long last_timer_update_tick = 0; /* Last timer label tick */
 static unsigned long last_fps_update_tick = 0;   /* Last FPS tick */
+static unsigned long last_data_poll_tick = 0;    /* Last data poll tick */
 
 /* ========================================================================== */
 /*                           EXTERNAL VARIABLES                              */
@@ -136,24 +162,14 @@ static const uint16_t lcd_display_task_stack_size_words = LCD_DISPLAY_TASK_STACK
 /* ========================================================================== */
 static inline unsigned long lcd_next_delay_ms(unsigned long lvgl_next);
 static uint8_t lcd_read_register_proper(uint8_t reg_addr, uint8_t *data, uint8_t length);
+static void update_ui_from_polled_data(void);
 
 /* ========================================================================== */
 /*                         CORE TASK FUNCTION PROTOTYPES                     */
 /* ========================================================================== */
 static void LCD_Display_Driver_Task(void* argument);
 
-/* ========================================================================== */
-/*                         EVENT PROCESSING FUNCTION PROTOTYPES              */
-/* ========================================================================== */
-static void process_rfid_event(DISPLAY_MSG_Def* msg);
-static void process_gpio_event(DISPLAY_MSG_Def* msg);
-static void process_sensor_event(DISPLAY_MSG_Def* msg);
-static void process_ui_update_event(DISPLAY_MSG_Def* msg);
-static void process_system_state_event(DISPLAY_MSG_Def* msg);
-static void process_user_input_event(DISPLAY_MSG_Def* msg);
-static void process_flow_sensor_event(DISPLAY_MSG_Def* msg);
-static void process_i2c_device_event(DISPLAY_MSG_Def* msg);
-static void process_custom_event(DISPLAY_MSG_Def* msg);
+
 
 /* ========================================================================== */
 /*                         PUBLIC API FUNCTION PROTOTYPES                    */
@@ -172,6 +188,8 @@ void lcd_1_read_data(uint8_t *buffer, size_t length);
 /* ========================================================================== */
 
 void lcd_test_init(void);
+void lcd_fill_test(void);
+void lcd_fill_test(void);
 
 
 /* ========================================================================== */
@@ -190,127 +208,103 @@ static void LCD_Display_Driver_Task(void* argument)
     /* Wait for task notification to start */
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
+    LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: Starting LCD Display Driver initialization...\r\n");
+    
     /* Initialize GPIO pins */
     lcd_gpio_init();
+    LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: GPIO initialized\r\n");
     
     /* Initialize synchronization primitives */
     lvgl_sem = xSemaphoreCreateMutex();
-    if (lvgl_sem == NULL) { vTaskDelete(NULL); return; }
+    if (lvgl_sem == NULL) {
+        LOG_ERROR_LCD_DISPLAY_DRIVER("LCD: ERROR - Failed to create LVGL mutex\r\n");
+        vTaskDelete(NULL);
+        return;
+    }
+    LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: Mutex created\r\n");
 
+    LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: Resetting display controller...\r\n");
     Hardware_LCD_Reset();
     vTaskDelay(pdMS_TO_TICKS(105)); /* Match standalone driver timing */
+    LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: Reset complete\r\n");
     
     /* Turn on backlight */
    
     vTaskDelay(pdMS_TO_TICKS(50));
 
     /* Initialize LVGL and the display driver */
+    LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: Initializing LVGL library...\r\n");
     lv_init();
+    LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: LVGL initialized\r\n");
 
     /* Create the display using a generic approach for now
      * Note: ILI9488 specific driver may need LV_USE_ILI9488 to be defined
      * For now, commenting out to focus on HAL replacement */
     
+    LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: Creating ILI9341 display driver (%dx%d)...\r\n", DISPLAY_HORIZONTAL_SIZE, DISPLAY_VERTICAL_SIZE);
     display1 = lv_ili9341_create(DISPLAY_HORIZONTAL_SIZE, DISPLAY_VERTICAL_SIZE,
                                  (lv_lcd_flag_t)0,
                                 lcd_1_send_cmd,
                                 lcd_1_send_color);
 
     if (display1 == NULL) {
+        LOG_ERROR_LCD_DISPLAY_DRIVER("LCD: ERROR - Display creation failed\r\n");
         // Display creation failed - cleanup and exit
         vSemaphoreDelete(lvgl_sem);
         vTaskDelete(NULL);
         return;
     }
+    LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: Display driver created successfully\r\n");
     
 
     /* Use native physical controller orientation (landscape 480x320). */
     
     /* For now, create a basic display buffer setup */
+    LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: Configuring display buffers (%d bytes)...\r\n", DISPLAY_BUFFER_SIZE);
     lv_display_set_buffers(display1, display_buffer, NULL, DISPLAY_BUFFER_SIZE, LV_DISPLAY_RENDER_MODE_PARTIAL);
+    LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: Display buffers configured\r\n");
 
     /* Optional: set panel gap/offsets if the glass has non-zero origin. Start with 0,0. */
    
-    /* One-time visual sanity check: fill screen and toggle inversion before starting LVGL UI */
-
-
+    LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: Initializing UI...\r\n");
     ui_init();
+    LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: UI initialized\r\n");
     
     /* Keep backlight off initially - will fade in after first render */
     lcd_backlight_on(0);
     
     /* Trigger initial LVGL render to draw the UI to screen */
+    LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: Rendering initial UI frame...\r\n");
     lv_timer_handler();
     vTaskDelay(pdMS_TO_TICKS(50)); /* Allow time for display to update */
+    LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: Initial render complete\r\n");
     
     /* Now fade in backlight smoothly after UI is rendered to screen */
+    LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: Fading in backlight...\r\n");
     for (uint8_t brightness = 0; brightness <= 100; brightness += 5) {
         lcd_backlight_on(brightness);
         vTaskDelay(pdMS_TO_TICKS(30)); /* 30ms per step = 600ms total fade time */
     }
     lcd_backlight_on(100); /* Ensure we end at exactly 100% */
+    LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: Backlight at 100%%, initialization complete\r\n");
     
     /* MAIN TASK LOOP */
     TickType_t xLastWakeTime = xTaskGetTickCount();
     start_tick_ms = xTaskGetTickCount();
     last_fps_update_tick = start_tick_ms;
+    last_data_poll_tick = start_tick_ms;
 
-    
-
-    //lcd_rotate_display(3); /* Rotate to portrait */=
     for(;;) {
        TASK_HEARTBEAT_EVERY_SECOND("LCD");
-        /* Process display messages */
-        DISPLAY_MSG_Def display_msg;
-        QueueHandle_t display_queue = get_msg_queue_display();
-        if(display_queue != NULL) {
-            if(xQueueReceive(display_queue, &display_msg, pdMS_TO_TICKS(100)) == pdPASS) {
-                /* Protect LVGL calls with semaphore */
-                xSemaphoreTake(lvgl_sem, portMAX_DELAY);
-                
-                /* Process different event types */
-                switch(display_msg.event_type) {
-                    case EVENT_TYPE_RFID_PICC:
-                        process_rfid_event(&display_msg);
-                        break;
-                        
-                    case EVENT_TYPE_GPIO_PIN:
-                        process_gpio_event(&display_msg);
-                        break;
-                        
-                    case EVENT_TYPE_SENSOR:
-                        process_sensor_event(&display_msg);
-                        break;
-                        
-                    case EVENT_TYPE_UI_UPDATE:
-                        process_ui_update_event(&display_msg);
-                        break;
-                        
-                    case EVENT_TYPE_SYSTEM_STATE:
-                        process_system_state_event(&display_msg);
-                        break;
-                        
-                    case EVENT_TYPE_USER_INPUT:
-                        process_user_input_event(&display_msg);
-                        break;
-                        
-                    case EVENT_TYPE_FLOW_SENSOR:
-                        process_flow_sensor_event(&display_msg);
-                        break;
-                        
-                    case EVENT_TYPE_I2C_DEVICE:
-                        process_i2c_device_event(&display_msg);
-                        break;
-                        
-                    case EVENT_TYPE_CUSTOM:
-                        process_custom_event(&display_msg);
-                        break;
-                        
-                    default:
-                        USB_Log_Printf("LCD: Unknown event type %d received\r\n", display_msg.event_type);
-                        break;
-                }
-                
+       
+        /* Poll data from modules at regular intervals */
+        unsigned long now_tick = xTaskGetTickCount();
+        if ((now_tick - last_data_poll_tick) >= UI_DATA_POLL_INTERVAL_MS) {
+            last_data_poll_tick = now_tick;
+            
+            /* Acquire LVGL protection semaphore */
+            if (xSemaphoreTake(lvgl_sem, pdMS_TO_TICKS(10)) == pdPASS) {
+                update_ui_from_polled_data();
                 xSemaphoreGive(lvgl_sem);
             }
         }
@@ -405,6 +399,37 @@ void Task_Start_LCD_Display_Driver_Task()
  * @return Task handle
  */
 TaskHandle_t task_get_handle_LCD_Display_Driver_Task() { return LCD_Display_Driver_TaskHandle; }
+
+/**
+ * @brief Fill screen with test colors to verify LCD hardware
+ */
+void lcd_fill_test(void)
+{
+    LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: Testing screen fill...\\r\\n");
+    
+    // Create a simple test screen with red color
+    lv_obj_t *scr = lv_screen_active();
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0xFF0000), 0);  // Red
+    lv_obj_invalidate(scr);
+    
+    LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: Screen set to RED, calling lv_timer_handler()...\\r\\n");
+    lv_timer_handler();
+    vTaskDelay(pdMS_TO_TICKS(500));
+    
+    LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: Changing to GREEN...\\r\\n");
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x00FF00), 0);  // Green
+    lv_obj_invalidate(scr);
+    lv_timer_handler();
+    vTaskDelay(pdMS_TO_TICKS(500));
+    
+    LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: Changing to BLUE...\\r\\n");
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x0000FF), 0);  // Blue
+    lv_obj_invalidate(scr);
+    lv_timer_handler();
+    vTaskDelay(pdMS_TO_TICKS(500));
+    
+    LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: Fill test complete\\r\\n");
+}
 
 /* ========================================================================== */
 /*                           LVGL INTERFACE FUNCTIONS                        */
@@ -507,179 +532,58 @@ bool ui_set_obj_style_bg_color(lv_obj_t * obj, lv_color_t color, lv_style_select
 /* ========================================================================== */
 
 /**
- * @brief Process RFID/PICC events (backwards compatibility)
- * @param msg Pointer to the event message
+ * @brief Update UI by polling data from modules (replaces event-based updates)
+ * @note Called periodically by main task loop with LVGL semaphore held
  */
-static void process_rfid_event(DISPLAY_MSG_Def* msg) {
-    if (msg->event_data.rfid_data.picc_position == LOCAL_PICC_POS_0) {
-        if (msg->event_data.rfid_data.picc_state == LOCAL_PICC_STATE_ACTIVE) {
-            card_present = 1;
-            USB_Log_Printf("LCD: RFID card active (UID: 0x%08lX)\r\n", msg->event_data.rfid_data.card_uid);
+static void update_ui_from_polled_data(void)
+{
+    /* Poll data from MIFARE Transaction Manager */
+    uint32_t card_balance_ml = MIFARE_GetBalanceML();
+    bool card_status = MIFARE_GetCardStatus();
+    
+    /* Poll data from Dispenser Control */
+    uint32_t dispensed_ml = Dispenser_GetDispensedSessionML();
+    bool is_dispensing = Dispenser_IsDispensing();
+    
+    /* Update card remaining label */
+    if (ui_cardRemaining != NULL) {
+        static char balance_str[16];
+        if (card_balance_ml > 9000) {
+            uint32_t liters = card_balance_ml / 1000;
+            snprintf(balance_str, sizeof(balance_str), "%luL", liters);
         } else {
-            card_present = 0;
-            bar_value = 0;
-            USB_Log_Printf("LCD: RFID card inactive/auth failed\r\n");
+            snprintf(balance_str, sizeof(balance_str), "%lumL", card_balance_ml);
         }
+        lv_label_set_text(ui_cardRemaining, balance_str);
     }
-}
-
-/**
- * @brief Process GPIO pin state change events
- * @param msg Pointer to the event message
- */
-static void process_gpio_event(DISPLAY_MSG_Def* msg) {
-    uint8_t pin_id = msg->event_data.gpio_data.pin_id;
-    uint8_t pin_state = msg->event_data.gpio_data.pin_state;
     
-    USB_Log_Printf("LCD: GPIO Pin %d changed to %s\r\n", pin_id, pin_state ? "HIGH" : "LOW");
-    
-    /* Handle specific GPIO pins */
-    switch (pin_id) {
-        case 12: /* CAT9555 Pin 12 - Update bar color based on pin state */
-            if (ui_totalRemainingBar != NULL) {
-                if (pin_state == 1) {
-                    /* Pin HIGH - Green bar */
-                    lv_obj_set_style_bg_color(ui_totalRemainingBar, lv_color_hex(0x00FF00), LV_PART_INDICATOR);
-                    lv_bar_set_value(ui_totalRemainingBar, 100, LV_ANIM_ON);
-                } else {
-                    /* Pin LOW - Red bar */
-                    lv_obj_set_style_bg_color(ui_totalRemainingBar, lv_color_hex(0xFF0000), LV_PART_INDICATOR);
-                    lv_bar_set_value(ui_totalRemainingBar, 0, LV_ANIM_ON);
-                }
-            }
-            break;
-            
-        default:
-            USB_Log_Printf("LCD: Unhandled GPIO pin %d event\r\n", pin_id);
-            break;
+    /* Update total remaining bar (assume max 1000L capacity) */
+    if (ui_totalRemainingBar != NULL) {
+        uint32_t max_capacity = 1000000; // 1000L in mL
+        uint8_t percentage = 0;
+        if (card_balance_ml >= max_capacity) {
+            percentage = 100;
+        } else {
+            percentage = (uint8_t)((card_balance_ml * 100) / max_capacity);
+        }
+        lv_bar_set_value(ui_totalRemainingBar, percentage, LV_ANIM_ON);
     }
-}
-
-/**
- * @brief Process sensor events
- * @param msg Pointer to the event message
- */
-static void process_sensor_event(DISPLAY_MSG_Def* msg) {
-    uint8_t sensor_id = msg->event_data.sensor_data.sensor_id;
-    uint32_t sensor_value = msg->event_data.sensor_data.sensor_value;
     
-    USB_Log_Printf("LCD: Sensor %d value: %lu\r\n", sensor_id, sensor_value);
-    
-    /* Handle specific sensors */
-    /* Add sensor-specific UI updates here */
-}
-
-/**
- * @brief Process direct UI update events
- * @param msg Pointer to the event message
- */
-static void process_ui_update_event(DISPLAY_MSG_Def* msg) {
-    uint8_t element_id = msg->event_data.ui_data.ui_element_id;
-    uint8_t action = msg->event_data.ui_data.ui_action;
-    uint32_t value = msg->event_data.ui_data.ui_value;
-    uint32_t color = msg->event_data.ui_data.ui_color;
-    
-    USB_Log_Printf("LCD: UI update - Element: %d, Action: %d, Value: %lu\r\n", element_id, action, value);
-    
-    switch (element_id) {
-        case UI_ELEMENT_TOTAL_REMAINING_BAR:
-            if (ui_totalRemainingBar != NULL) {
-                switch (action) {
-                    case UI_ACTION_SET_VALUE:
-                        lv_bar_set_value(ui_totalRemainingBar, (int32_t)value, LV_ANIM_ON);
-                        break;
-                    case UI_ACTION_SET_COLOR:
-                        lv_obj_set_style_bg_color(ui_totalRemainingBar, lv_color_hex(color), LV_PART_INDICATOR);
-                        break;
-                }
-            }
-            break;
-            
-        case UI_ELEMENT_CARD_REMAINING_LABEL:
-            if (ui_cardRemaining != NULL && action == UI_ACTION_SET_VALUE) {
-                /* Update card balance display */
-                static char balance_str[16];
-                if (value > 9000) {
-                    uint32_t liters = value / 1000;
-                    snprintf(balance_str, sizeof(balance_str), "%luL", liters);
-                } else {
-                    snprintf(balance_str, sizeof(balance_str), "%luml", value);
-                }
-                ui_set_label_text(ui_cardRemaining, balance_str);
-            }
-            break;
-            
-        default:
-            USB_Log_Printf("LCD: Unhandled UI element %d\r\n", element_id);
-            break;
+    /* Update dispensed session label */
+    if (ui_dispensedSession != NULL) {
+        static char dispensed_str[16];
+        if (dispensed_ml > 9000) {
+            uint32_t liters = dispensed_ml / 1000;
+            snprintf(dispensed_str, sizeof(dispensed_str), "%luL", liters);
+        } else {
+            snprintf(dispensed_str, sizeof(dispensed_str), "%lumL", dispensed_ml);
+        }
+        lv_label_set_text(ui_dispensedSession, dispensed_str);
     }
-}
-
-/**
- * @brief Process system state change events
- * @param msg Pointer to the event message
- */
-static void process_system_state_event(DISPLAY_MSG_Def* msg) {
-    uint8_t component = msg->event_data.system_data.system_component;
-    uint8_t state = msg->event_data.system_data.system_state;
-    uint16_t error_code = msg->event_data.system_data.error_code;
     
-    USB_Log_Printf("LCD: System component %d state changed to %d (error: %d)\r\n", component, state, error_code);
+    /* Update card present state */
+    card_present = card_status ? 1 : 0;
     
-    /* Handle system state changes for UI feedback */
-    /* Add system-specific UI updates here */
-}
-
-/**
- * @brief Process user input events
- * @param msg Pointer to the event message
- */
-static void process_user_input_event(DISPLAY_MSG_Def* msg) {
-    uint8_t input_id = msg->event_data.user_input_data.input_id;
-    uint8_t input_type = msg->event_data.user_input_data.input_type;
-    uint8_t input_action = msg->event_data.user_input_data.input_action;
-    
-    USB_Log_Printf("LCD: User input - ID: %d, Type: %d, Action: %d\r\n", input_id, input_type, input_action);
-    
-    /* Handle user input for UI interactions */
-    /* Add input-specific UI updates here */
-}
-
-/**
- * @brief Process flow sensor events
- * @param msg Pointer to the event message
- */
-static void process_flow_sensor_event(DISPLAY_MSG_Def* msg) {
-    uint32_t flow_value = msg->event_data.sensor_data.sensor_value;
-    uint8_t sensor_status = msg->event_data.sensor_data.sensor_status;
-    
-    USB_Log_Printf("LCD: Flow sensor value: %lu, Status: %d\r\n", flow_value, sensor_status);
-    
-    /* Update UI based on flow sensor data */
-    /* Add flow-specific UI updates here */
-}
-
-/**
- * @brief Process I2C device events
- * @param msg Pointer to the event message
- */
-static void process_i2c_device_event(DISPLAY_MSG_Def* msg) {
-    uint8_t device_id = msg->event_data.system_data.system_component;
-    uint8_t device_state = msg->event_data.system_data.system_state;
-    
-    USB_Log_Printf("LCD: I2C device %d state: %d\r\n", device_id, device_state);
-    
-    /* Handle I2C device state changes for UI feedback */
-    /* Add I2C device-specific UI updates here */
-}
-
-/**
- * @brief Process custom application events
- * @param msg Pointer to the event message
- */
-static void process_custom_event(DISPLAY_MSG_Def* msg) {
-    USB_Log_Printf("LCD: Custom event from source %d\r\n", msg->event_source);
-    
-    /* Handle custom application-specific events */
-    /* Add custom event processing here */
+    /* Optional: Add visual feedback for dispensing state */
+    (void)is_dispensing;  // Can be used to show/hide dispensing indicator
 }

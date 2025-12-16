@@ -30,4 +30,11 @@
 void Task_Start_Dispenser_Control_Task();
 TaskHandle_t task_get_handle_Dispenser_Control_Task();
 
+/* UI Getter Functions - UI polls these instead of receiving events */
+uint32_t Dispenser_GetRequestedAmountML(void);     /* Amount requested to dispense */
+uint32_t Dispenser_GetDispensedAmountML(void);     /* Amount dispensed in current session */
+uint32_t Dispenser_GetDispensedSessionML(void);    /* Total dispensed in this card session */
+bool Dispenser_IsValveOpen(void);                  /* Returns true if valve is currently open */
+bool Dispenser_IsDispensing(void);                 /* Returns true if actively dispensing */
+
 #endif /* APPLICATION_INCLUDE_DISPENSER_CONTROL_H_ */

@@ -10,8 +10,8 @@
   ******************************************************************************
 */
 
-#ifndef APPLICATION_INCLUDE_LCD_DISPLAY_DRIVER_H_
-#define APPLICATION_INCLUDE_LCD_DISPLAY_DRIVER_H_
+#ifndef APPLICATION_INCLUDE_MYWOTA_UI_DRIVER_H_
+#define APPLICATION_INCLUDE_MYWOTA_UI_DRIVER_H_
 
 /*Includes ----------------------------------------------------------*/
 
@@ -63,4 +63,4 @@ bool ui_set_label_text(lv_obj_t * label, const char * text);
 bool ui_set_bar_value(lv_obj_t * bar, int32_t value, lv_anim_enable_t anim);
 bool ui_set_obj_style_bg_color(lv_obj_t * obj, lv_color_t color, lv_style_selector_t selector);
 
-#endif /* APPLICATION_INCLUDE_LCD_DISPLAY_DRIVER_H_ */
+#endif /* APPLICATION_INCLUDE_MYWOTA_UI_DRIVER_H_ */
