@@ -18,6 +18,7 @@
 #include "USB_Logging.h"
 #include "SD_Logger_Task.h"
 #include "SD_SPI_Driver.h"
+#include "MIFARE_Transaction_Manager.h"
 #include "ff.h"
 #include <stdio.h>
 #include <string.h>
@@ -382,3 +383,213 @@ void Task_Start_SD_Logger_Task(void)
                 SD_LOGGER_TASK_PRIORITY, 
                 &SD_Logger_Task_TaskHandle);
 }
+
+/**
+ * @brief Check if SD logger is ready for logging operations
+ * @return true if ready, false otherwise
+ */
+bool SD_Logger_IsReady(void)
+{
+    return sd_logger_context.filesystem_ready;
+}
+
+/**
+ * @brief Log MIFARE card scan with all block data to SD card
+ * @param card_uid Card unique identifier
+ * @param uid_length Length of card UID (4 or 7 bytes)
+ * @param card_data Pointer to MIFARE card data structure
+ * @param log_type Type of log entry
+ * @return true if logged successfully, false otherwise
+ */
+bool SD_Logger_LogMIFARECardScan(const uint8_t *card_uid, uint8_t uid_length, 
+                                 const void *card_data, SDLogType_t log_type)
+{
+    if (!sd_logger_context.filesystem_ready || card_uid == NULL || card_data == NULL) {
+        return false;
+    }
+    
+    const MIFARE_CardData_t *mifare_data = (const MIFARE_CardData_t *)card_data;
+    FIL file;
+    FRESULT result;
+    UINT bytes_written;
+    char filename[64];
+    char log_buffer[512];
+    
+    // Create filename based on card UID (e.g., "CARD_42680B06.log")
+    snprintf(filename, sizeof(filename), "0:/CARD_");
+    int offset = strlen(filename);
+    for (uint8_t i = 0; i < uid_length && i < 7; i++) {
+        snprintf(filename + offset, sizeof(filename) - offset, "%02X", card_uid[i]);
+        offset += 2;
+    }
+    snprintf(filename + offset, sizeof(filename) - offset, ".log");
+    
+    // Open/create card log file
+    result = f_open(&file, filename, FA_OPEN_APPEND | FA_WRITE);
+    if (result != FR_OK) {
+        LOG_ERROR_SD_LOGGER("[SD_LOGGER] Failed to open card log file: %d\r\n", result);
+        return false;
+    }
+    
+    // Get current tick count as timestamp
+    uint32_t timestamp = xTaskGetTickCount();
+    
+    // Format log entry header
+    int len = snprintf(log_buffer, sizeof(log_buffer),
+                      "\r\n========================================\r\n"
+                      "[%lu] MIFARE CARD SCAN - Log Type: %d\r\n"
+                      "========================================\r\n",
+                      timestamp, log_type);
+    
+    // Write header
+    result = f_write(&file, log_buffer, len, &bytes_written);
+    if (result != FR_OK) {
+        f_close(&file);
+        return false;
+    }
+    
+    // Log Card Header (Block 4)
+    len = snprintf(log_buffer, sizeof(log_buffer),
+                  "BLOCK %d (HEADER):\r\n"
+                  "  Magic: 0x%08lX\r\n"
+                  "  Format Ver: %u\r\n"
+                  "  Card Type: %u\r\n"
+                  "  Header CRC: 0x%04X\r\n"
+                  "  Serial: 0x%016llX\r\n",
+                  MIFARE_BLOCK_HEADER,
+                  mifare_data->header.magic_bytes,
+                  mifare_data->header.format_version,
+                  mifare_data->header.card_type,
+                  mifare_data->header.header_crc,
+                  (unsigned long long)mifare_data->header.card_serial);
+    f_write(&file, log_buffer, len, &bytes_written);
+    
+    // Log User Primary Data (Block 5)
+    len = snprintf(log_buffer, sizeof(log_buffer),
+                  "BLOCK %d (USER PRIMARY):\r\n"
+                  "  Balance: %lu mL (%.2f L)\r\n"
+                  "  Last Topup: %u mL\r\n"
+                  "  Transaction Counter: %u\r\n"
+                  "  Status Flags: 0x%02X\r\n"
+                  "  Transaction State: 0x%02X\r\n",
+                  MIFARE_BLOCK_USER_PRIMARY,
+                  mifare_data->user_primary.balance_ml,
+                  mifare_data->user_primary.balance_ml / 1000.0f,
+                  mifare_data->user_primary.last_topup_amount_ml,
+                  mifare_data->user_primary.transaction_counter,
+                  mifare_data->user_primary.status_flags,
+                  mifare_data->user_primary.transaction_state);
+    f_write(&file, log_buffer, len, &bytes_written);
+    
+    // Log User Backup Data (Block 6)
+    len = snprintf(log_buffer, sizeof(log_buffer),
+                  "BLOCK %d (USER BACKUP):\r\n"
+                  "  Balance: %lu mL (%.2f L)\r\n"
+                  "  Last Topup: %u mL\r\n"
+                  "  Transaction Counter: %u\r\n"
+                  "  Status Flags: 0x%02X\r\n"
+                  "  Transaction State: 0x%02X\r\n",
+                  MIFARE_BLOCK_USER_BACKUP,
+                  mifare_data->user_backup.balance_ml,
+                  mifare_data->user_backup.balance_ml / 1000.0f,
+                  mifare_data->user_backup.last_topup_amount_ml,
+                  mifare_data->user_backup.transaction_counter,
+                  mifare_data->user_backup.status_flags,
+                  mifare_data->user_backup.transaction_state);
+    f_write(&file, log_buffer, len, &bytes_written);
+    
+    // Log Usage Data (Block 8)
+    len = snprintf(log_buffer, sizeof(log_buffer),
+                  "BLOCK %d (USAGE DATA):\r\n"
+                  "  Total Purchased: %lu mL (%.2f L)\r\n"
+                  "  Total Dispensed: %lu mL (%.2f L)\r\n",
+                  MIFARE_BLOCK_USAGE_DATA,
+                  mifare_data->usage_data.total_purchased_ml,
+                  mifare_data->usage_data.total_purchased_ml / 1000.0f,
+                  mifare_data->usage_data.total_dispensed_ml,
+                  mifare_data->usage_data.total_dispensed_ml / 1000.0f);
+    f_write(&file, log_buffer, len, &bytes_written);
+    
+    // Log Recovery Info (Block 12)
+    len = snprintf(log_buffer, sizeof(log_buffer),
+                  "BLOCK %d (RECOVERY INFO):\r\n"
+                  "  Last Update Time: %lu\r\n"
+                  "  Primary CRC: 0x%04X\r\n"
+                  "  Backup CRC: 0x%04X\r\n"
+                  "  Sequence Number: %u\r\n"
+                  "  Recovery Attempts: %u\r\n"
+                  "  Integrity Flags: 0x%04X\r\n",
+                  MIFARE_BLOCK_RECOVERY_INFO,
+                  mifare_data->recovery_info.last_update_time,
+                  mifare_data->recovery_info.primary_data_crc,
+                  mifare_data->recovery_info.backup_data_crc,
+                  mifare_data->recovery_info.sequence_number,
+                  mifare_data->recovery_info.recovery_attempts,
+                  mifare_data->recovery_info.integrity_flags);
+    f_write(&file, log_buffer, len, &bytes_written);
+    
+    // Log Fast Balance Primary (Block 13)
+    len = snprintf(log_buffer, sizeof(log_buffer),
+                  "BLOCK %d (FAST BALANCE PRIMARY):\r\n"
+                  "  Balance: %lu mL (%.2f L)\r\n"
+                  "  Sequence: %u\r\n"
+                  "  Timestamp: %lu\r\n"
+                  "  CRC32: 0x%08lX\r\n",
+                  MIFARE_BLOCK_FAST_BALANCE_PRIMARY,
+                  mifare_data->fast_balance_primary.balance_ml,
+                  mifare_data->fast_balance_primary.balance_ml / 1000.0f,
+                  mifare_data->fast_balance_primary.sequence_number,
+                  mifare_data->fast_balance_primary.timestamp,
+                  mifare_data->fast_balance_primary.crc32);
+    f_write(&file, log_buffer, len, &bytes_written);
+    
+    // Log Fast Balance Backup (Block 14)
+    len = snprintf(log_buffer, sizeof(log_buffer),
+                  "BLOCK %d (FAST BALANCE BACKUP):\r\n"
+                  "  Balance: %lu mL (%.2f L)\r\n"
+                  "  Sequence: %u\r\n"
+                  "  Timestamp: %lu\r\n"
+                  "  CRC32: 0x%08lX\r\n",
+                  MIFARE_BLOCK_FAST_BALANCE_BACKUP,
+                  mifare_data->fast_balance_backup.balance_ml,
+                  mifare_data->fast_balance_backup.balance_ml / 1000.0f,
+                  mifare_data->fast_balance_backup.sequence_number,
+                  mifare_data->fast_balance_backup.timestamp,
+                  mifare_data->fast_balance_backup.crc32);
+    f_write(&file, log_buffer, len, &bytes_written);
+    
+    // Log Account Data (Block 16)
+    // Extract phone number from raw data
+    char phone_str[12];
+    memcpy(phone_str, &mifare_data->account_data.raw_data[ACCOUNT_DATA_PHONE_OFFSET], 
+           ACCOUNT_DATA_PHONE_SIZE);
+    phone_str[ACCOUNT_DATA_PHONE_SIZE] = '\0';
+    
+    uint8_t validity = mifare_data->account_data.raw_data[ACCOUNT_DATA_VALIDITY_OFFSET];
+    uint16_t account_crc = (mifare_data->account_data.raw_data[ACCOUNT_DATA_CRC_OFFSET] << 8) |
+                           mifare_data->account_data.raw_data[ACCOUNT_DATA_CRC_OFFSET + 1];
+    
+    len = snprintf(log_buffer, sizeof(log_buffer),
+                  "BLOCK %d (ACCOUNT DATA):\r\n"
+                  "  Phone: %s\r\n"
+                  "  Validity: %u\r\n"
+                  "  CRC16: 0x%04X\r\n",
+                  MIFARE_BLOCK_ACCOUNT_DATA,
+                  phone_str,
+                  validity,
+                  account_crc);
+    f_write(&file, log_buffer, len, &bytes_written);
+    
+    // Add footer
+    len = snprintf(log_buffer, sizeof(log_buffer),
+                  "========================================\r\n\r\n");
+    f_write(&file, log_buffer, len, &bytes_written);
+    
+    // Close file
+    f_close(&file);
+    
+    LOG_DEBUG_SD_LOGGER("[SD_LOGGER] MIFARE card scan logged: %s\r\n", filename);
+    
+    return true;
+}
+

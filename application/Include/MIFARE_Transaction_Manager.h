@@ -381,6 +381,7 @@ bool MIFARE_GetCardStatus(void);             /* Returns true if card is present 
 uint8_t MIFARE_GetCardStatusFlags(void);     /* Returns card status flags byte */
 uint32_t MIFARE_GetTotalPurchasedML(void);   /* Lifetime purchased amount */
 uint32_t MIFARE_GetTotalDispensedML(void);   /* Lifetime dispensed amount */
+bool MIFARE_GetCustomerPhoneNumber(char *phone_buffer, size_t buffer_size);  /* Get phone number from card */
 
 /* Debug and Logging Functions */
 void MIFARE_PrintCardData(MIFARE_CardData_t *card_data);

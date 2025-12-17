@@ -25,6 +25,16 @@ extern "C" {
 /* Exported types ------------------------------------------------------------*/
 
 /**
+ * @brief SD Log Entry Types
+ */
+typedef enum {
+    SD_LOG_TYPE_SYSTEM_STARTUP,         // System startup event
+    SD_LOG_TYPE_MIFARE_CARD_SCAN,       // MIFARE card detected and scanned
+    SD_LOG_TYPE_TRANSACTION,            // Transaction event
+    SD_LOG_TYPE_ERROR                   // Error event
+} SDLogType_t;
+
+/**
  * @brief SD Logger Task States
  */
 typedef enum {
@@ -43,6 +53,23 @@ typedef enum {
  * @note Creates FreeRTOS task for SD card initialization and logging
  */
 void Task_Start_SD_Logger_Task(void);
+
+/**
+ * @brief Log MIFARE card scan with all block data to SD card
+ * @param card_uid Card unique identifier
+ * @param uid_length Length of card UID (4 or 7 bytes)
+ * @param card_data Pointer to MIFARE card data structure
+ * @param log_type Type of log entry
+ * @return true if logged successfully, false otherwise
+ */
+bool SD_Logger_LogMIFARECardScan(const uint8_t *card_uid, uint8_t uid_length, 
+                                 const void *card_data, SDLogType_t log_type);
+
+/**
+ * @brief Check if SD logger is ready for logging operations
+ * @return true if ready, false otherwise
+ */
+bool SD_Logger_IsReady(void);
 
 #ifdef __cplusplus
 }

@@ -58,6 +58,32 @@
 /* UI Configuration */
 #define SCREEN_SWITCH_DELAY_MS          4000U   /* 4 seconds delay before switching */
 #define SCREEN_SWITCH_DELAY_SECONDS     (SCREEN_SWITCH_DELAY_MS/1000U)
+#define UI_HIDE_DELAY_MS                5000U   /* 5 seconds delay before hiding UI after dispense */
+#define LED_FLASH_INTERVAL_MS           500U    /* LED flash interval: 500ms (0.5 seconds) */
+
+/* UI Visibility State Machine */
+typedef enum {
+    UI_STATE_INIT = 0,                       /* System initializing - UI elements hidden */
+    UI_STATE_IDLE,                           /* No card - showing default screen */
+    UI_STATE_READING_CARD,                   /* Card detected - reading/validating */
+    UI_STATE_DISPENSING,                     /* Dispensing in progress - full UI visible */
+    UI_STATE_CARD_REMOVED                    /* Card removed - keeping info visible for timeout */
+} UI_Visibility_State_t;
+
+/* UI Visibility State Machine Context */
+typedef struct {
+    UI_Visibility_State_t current_state;
+    UI_Visibility_State_t previous_state;
+    uint32_t state_entry_time;
+    uint32_t time_in_state;
+    bool card_present;
+    bool is_dispensing;
+    bool was_dispensing;  /* Previous dispensing state for edge detection */
+    uint32_t last_led_toggle_time;  /* Time of last LED toggle */
+    bool led_is_on;  /* Current LED state for flashing */
+    char last_phone_number[12];  /* Last valid phone number from card */
+    uint32_t last_card_balance_ml;  /* Last valid card balance */
+} UI_Visibility_Context_t;
 
 /* Progress Bar Configuration */
 #define BAR_MAX_VALUE                   100U
@@ -141,6 +167,21 @@ static unsigned long last_timer_update_tick = 0; /* Last timer label tick */
 static unsigned long last_fps_update_tick = 0;   /* Last FPS tick */
 static unsigned long last_data_poll_tick = 0;    /* Last data poll tick */
 
+/* UI Visibility State Machine Context */
+static UI_Visibility_Context_t ui_visibility_context = {
+    .current_state = UI_STATE_INIT,
+    .previous_state = UI_STATE_INIT,
+    .state_entry_time = 0,
+    .time_in_state = 0,
+    .card_present = false,
+    .is_dispensing = false,
+    .was_dispensing = false,
+    .last_led_toggle_time = 0,
+    .led_is_on = false,
+    .last_phone_number = "MyWota",
+    .last_card_balance_ml = 0
+};
+
 /* ========================================================================== */
 /*                           EXTERNAL VARIABLES                              */
 /* ========================================================================== */
@@ -163,6 +204,35 @@ static const uint16_t lcd_display_task_stack_size_words = LCD_DISPLAY_TASK_STACK
 static inline unsigned long lcd_next_delay_ms(unsigned long lvgl_next);
 static uint8_t lcd_read_register_proper(uint8_t reg_addr, uint8_t *data, uint8_t length);
 static void update_ui_from_polled_data(void);
+
+/* UI Visibility State Machine Function Prototypes */
+static void ui_visibility_state_machine(void);
+static void ui_change_visibility_state(UI_Visibility_State_t new_state);
+
+/* State entry functions */
+static void ui_state_init_entry(void);
+static void ui_state_idle_entry(void);
+static void ui_state_reading_card_entry(void);
+static void ui_state_dispensing_entry(void);
+static void ui_state_card_removed_entry(void);
+
+/* State run functions */
+static void ui_state_init_run(void);
+static void ui_state_idle_run(void);
+static void ui_state_reading_card_run(void);
+static void ui_state_dispensing_run(void);
+static void ui_state_card_removed_run(void);
+
+/* State exit functions */
+static void ui_state_init_exit(void);
+static void ui_state_idle_exit(void);
+static void ui_state_reading_card_exit(void);
+static void ui_state_dispensing_exit(void);
+static void ui_state_card_removed_exit(void);
+
+/* Helper functions */
+static void show_dispense_ui_elements(void);
+static void hide_dispense_ui_elements(void);
 
 /* ========================================================================== */
 /*                         CORE TASK FUNCTION PROTOTYPES                     */
@@ -540,31 +610,89 @@ static void update_ui_from_polled_data(void)
     /* Poll data from MIFARE Transaction Manager */
     uint32_t card_balance_ml = MIFARE_GetBalanceML();
     bool card_status = MIFARE_GetCardStatus();
+    uint32_t last_topup_ml = MIFARE_GetLastTopupAmountML();
+    MIFARE_CardState_t card_state = MIFARE_GetCardState();
     
     /* Poll data from Dispenser Control */
     uint32_t dispensed_ml = Dispenser_GetDispensedSessionML();
     bool is_dispensing = Dispenser_IsDispensing();
     
+    /* Update context with polled state */
+    ui_visibility_context.card_present = card_status;
+    ui_visibility_context.is_dispensing = is_dispensing;
+    
+    /* Control LED indicator based on card state */
+    uint32_t current_time = xTaskGetTickCount();
+    if (ui_ledIndicator != NULL) {
+        if (card_state == MIFARE_CARD_STATE_INITIALIZING) {
+            /* Card validating - flash red every 0.5s */
+            lv_obj_clear_flag(ui_ledIndicator, LV_OBJ_FLAG_HIDDEN);  /* Make visible */
+            
+            if (pdTICKS_TO_MS(current_time - ui_visibility_context.last_led_toggle_time) >= LED_FLASH_INTERVAL_MS) {
+                ui_visibility_context.led_is_on = !ui_visibility_context.led_is_on;
+                ui_visibility_context.last_led_toggle_time = current_time;
+                
+                if (ui_visibility_context.led_is_on) {
+                    lv_obj_set_style_bg_color(ui_ledIndicator, lv_color_hex(0xFF0000), LV_PART_MAIN | LV_STATE_DEFAULT);  /* Red */
+                } else {
+                    lv_obj_set_style_bg_color(ui_ledIndicator, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);  /* Off (black) */
+                }
+            }
+        } else if (card_state == MIFARE_CARD_STATE_PRESENT) {
+            /* Card validated - solid green */
+            lv_obj_clear_flag(ui_ledIndicator, LV_OBJ_FLAG_HIDDEN);  /* Make visible */
+            lv_obj_set_style_bg_color(ui_ledIndicator, lv_color_hex(0x00FF00), LV_PART_MAIN | LV_STATE_DEFAULT);  /* Green */
+            ui_visibility_context.led_is_on = true;
+        } else {
+            /* No card or error - hide LED */
+            lv_obj_add_flag(ui_ledIndicator, LV_OBJ_FLAG_HIDDEN);
+            ui_visibility_context.led_is_on = false;
+        }
+    }
+    
+    /* Update customer ID with phone number when card is present */
+    if (ui_customerID != NULL) {
+        if (card_state == MIFARE_CARD_STATE_PRESENT) {
+            /* Card present - get and store phone number */
+            char phone_str[12];
+            if (MIFARE_GetCustomerPhoneNumber(phone_str, sizeof(phone_str))) {
+                strncpy(ui_visibility_context.last_phone_number, phone_str, sizeof(ui_visibility_context.last_phone_number) - 1);
+                ui_visibility_context.last_phone_number[sizeof(ui_visibility_context.last_phone_number) - 1] = '\0';
+                lv_label_set_text(ui_customerID, ui_visibility_context.last_phone_number);
+            }
+        } else if (ui_visibility_context.current_state == UI_STATE_IDLE) {
+            /* Idle state - show default */
+            lv_label_set_text(ui_customerID, "MyWota");
+        }
+        /* In CARD_REMOVED state, leave text as-is (already showing phone number) */
+    }
+    
+    /* Run UI visibility state machine */
+    ui_visibility_state_machine();
+    
     /* Update card remaining label */
     if (ui_cardRemaining != NULL) {
         static char balance_str[16];
-        if (card_balance_ml > 9000) {
+        /* Store and display balance when card present */
+        if (card_status) {
+            ui_visibility_context.last_card_balance_ml = card_balance_ml;
             uint32_t liters = card_balance_ml / 1000;
             snprintf(balance_str, sizeof(balance_str), "%luL", liters);
-        } else {
-            snprintf(balance_str, sizeof(balance_str), "%lumL", card_balance_ml);
+            lv_label_set_text(ui_cardRemaining, balance_str);
         }
-        lv_label_set_text(ui_cardRemaining, balance_str);
+        /* In CARD_REMOVED state, label keeps showing last value */
+        /* In IDLE state, it's hidden anyway */
     }
     
-    /* Update total remaining bar (assume max 1000L capacity) */
+    /* Update total remaining bar based on last topup amount */
     if (ui_totalRemainingBar != NULL) {
-        uint32_t max_capacity = 1000000; // 1000L in mL
         uint8_t percentage = 0;
-        if (card_balance_ml >= max_capacity) {
-            percentage = 100;
-        } else {
-            percentage = (uint8_t)((card_balance_ml * 100) / max_capacity);
+        if (last_topup_ml > 0) {
+            if (card_balance_ml >= last_topup_ml) {
+                percentage = 100;
+            } else {
+                percentage = (uint8_t)((card_balance_ml * 100) / last_topup_ml);
+            }
         }
         lv_bar_set_value(ui_totalRemainingBar, percentage, LV_ANIM_ON);
     }
@@ -572,18 +700,329 @@ static void update_ui_from_polled_data(void)
     /* Update dispensed session label */
     if (ui_dispensedSession != NULL) {
         static char dispensed_str[16];
+        uint32_t liters = dispensed_ml / 1000;
+        snprintf(dispensed_str, sizeof(dispensed_str), "%luL", liters);
         if (dispensed_ml > 9000) {
-            uint32_t liters = dispensed_ml / 1000;
-            snprintf(dispensed_str, sizeof(dispensed_str), "%luL", liters);
+            
+           // snprintf(dispensed_str, sizeof(dispensed_str), "%luL", liters);
         } else {
-            snprintf(dispensed_str, sizeof(dispensed_str), "%lumL", dispensed_ml);
+            //snprintf(dispensed_str, sizeof(dispensed_str), "%lumL", dispensed_ml);
         }
         lv_label_set_text(ui_dispensedSession, dispensed_str);
     }
     
     /* Update card present state */
     card_present = card_status ? 1 : 0;
+}
+
+/* ========================================================================== */
+/*                   UI VISIBILITY STATE MACHINE FUNCTIONS                   */
+/* ========================================================================== */
+
+/**
+ * @brief UI visibility state machine - main dispatcher
+ * @note Called with LVGL semaphore held
+ */
+static void ui_visibility_state_machine(void)
+{
+    /* Update time in current state */
+    ui_visibility_context.time_in_state = xTaskGetTickCount() - ui_visibility_context.state_entry_time;
     
-    /* Optional: Add visual feedback for dispensing state */
-    (void)is_dispensing;  // Can be used to show/hide dispensing indicator
+    /* Execute current state run function */
+    switch (ui_visibility_context.current_state) {
+        case UI_STATE_INIT:
+            ui_state_init_run();
+            break;
+            
+        case UI_STATE_IDLE:
+            ui_state_idle_run();
+            break;
+            
+        case UI_STATE_READING_CARD:
+            ui_state_reading_card_run();
+            break;
+            
+        case UI_STATE_DISPENSING:
+            ui_state_dispensing_run();
+            break;
+            
+        case UI_STATE_CARD_REMOVED:
+            ui_state_card_removed_run();
+            break;
+            
+        default:
+            ui_change_visibility_state(UI_STATE_IDLE);
+            break;
+    }
+}
+
+/* ========================================================================== */
+/*                         STATE ENTRY FUNCTIONS                             */
+/* ========================================================================== */
+
+/**
+ * @brief INIT state entry
+ */
+static void ui_state_init_entry(void)
+{
+    /* Nothing to do on entry */
+}
+
+/**
+ * @brief IDLE state entry
+ */
+static void ui_state_idle_entry(void)
+{
+    hide_dispense_ui_elements();
+    /* Reset customerID to default */
+    if (ui_customerID != NULL) {
+        lv_label_set_text(ui_customerID, "MyWota");
+    }
+    /* Reset stored phone number and balance */
+    strncpy(ui_visibility_context.last_phone_number, "MyWota", sizeof(ui_visibility_context.last_phone_number) - 1);
+    ui_visibility_context.last_phone_number[sizeof(ui_visibility_context.last_phone_number) - 1] = '\0';
+    ui_visibility_context.last_card_balance_ml = 0;
+}
+
+/**
+ * @brief READING_CARD state entry
+ */
+static void ui_state_reading_card_entry(void)
+{
+    show_dispense_ui_elements();
+}
+
+/**
+ * @brief DISPENSING state entry
+ */
+static void ui_state_dispensing_entry(void)
+{
+    /* UI elements already shown, ensure all are visible */
+}
+
+/**
+ * @brief CARD_REMOVED state entry
+ */
+static void ui_state_card_removed_entry(void)
+{
+    /* Keep UI elements visible during timeout */
+}
+
+/* ========================================================================== */
+/*                         STATE RUN FUNCTIONS                               */
+/* ========================================================================== */
+
+/**
+ * @brief INIT state run - System initializing
+ */
+static void ui_state_init_run(void)
+{
+    /* Immediately transition to idle */
+    ui_change_visibility_state(UI_STATE_IDLE);
+}
+
+/**
+ * @brief IDLE state run - No card present, default screen
+ */
+static void ui_state_idle_run(void)
+{
+    /* Check if card detected */
+    if (ui_visibility_context.card_present) {
+        /* Card detected - transition to reading */
+        ui_change_visibility_state(UI_STATE_READING_CARD);
+    }
+}
+
+/**
+ * @brief READING_CARD state run - Card detected and being validated
+ */
+static void ui_state_reading_card_run(void)
+{
+    /* Check if card removed */
+    if (!ui_visibility_context.card_present) {
+        ui_change_visibility_state(UI_STATE_CARD_REMOVED);
+        return;
+    }
+    
+    /* Check if dispensing started */
+    if (ui_visibility_context.is_dispensing) {
+        ui_change_visibility_state(UI_STATE_DISPENSING);
+    }
+}
+
+/**
+ * @brief DISPENSING state run - Dispensing in progress
+ */
+static void ui_state_dispensing_run(void)
+{
+    /* Check if card removed */
+    if (!ui_visibility_context.card_present) {
+        ui_change_visibility_state(UI_STATE_CARD_REMOVED);
+        return;
+    }
+    
+    /* Update previous dispensing state for edge detection */
+    ui_visibility_context.was_dispensing = ui_visibility_context.is_dispensing;
+}
+
+/* ========================================================================== */
+/*                         STATE EXIT FUNCTIONS                              */
+/* ========================================================================== */
+
+/**
+ * @brief INIT state exit
+ */
+static void ui_state_init_exit(void)
+{
+    /* Nothing to do on exit */
+}
+
+/**
+ * @brief IDLE state exit
+ */
+static void ui_state_idle_exit(void)
+{
+    /* Nothing to do on exit */
+}
+
+/**
+ * @brief READING_CARD state exit
+ */
+static void ui_state_reading_card_exit(void)
+{
+    /* Nothing to do on exit */
+}
+
+/**
+ * @brief DISPENSING state exit
+ */
+static void ui_state_dispensing_exit(void)
+{
+    /* Reset dispensing edge detection */
+    ui_visibility_context.was_dispensing = false;
+}
+
+/**
+ * @brief CARD_REMOVED state run - Wait 5s then return to idle
+ */
+static void ui_state_card_removed_run(void)
+{
+    /* Check if card re-inserted */
+    if (ui_visibility_context.card_present) {
+        /* Card re-inserted - go back to reading card */
+        ui_change_visibility_state(UI_STATE_READING_CARD);
+        return;
+    }
+    
+    /* Wait for timeout then transition to idle */
+    if (ui_visibility_context.time_in_state >= UI_HIDE_DELAY_MS) {
+        ui_change_visibility_state(UI_STATE_IDLE);
+    }
+}
+
+/**
+ * @brief CARD_REMOVED state exit
+ */
+static void ui_state_card_removed_exit(void)
+{
+    /* Nothing to do on exit */
+}
+
+/**
+ * @brief Change UI visibility state
+ * @param new_state New state to transition to
+ */
+static void ui_change_visibility_state(UI_Visibility_State_t new_state)
+{
+    if (ui_visibility_context.current_state != new_state) {
+        /* Call exit function for current state */
+        switch (ui_visibility_context.current_state) {
+            case UI_STATE_INIT:
+                ui_state_init_exit();
+                break;
+            case UI_STATE_IDLE:
+                ui_state_idle_exit();
+                break;
+            case UI_STATE_READING_CARD:
+                ui_state_reading_card_exit();
+                break;
+            case UI_STATE_DISPENSING:
+                ui_state_dispensing_exit();
+                break;
+            case UI_STATE_CARD_REMOVED:
+                ui_state_card_removed_exit();
+                break;
+        }
+        
+        /* Update state tracking */
+        ui_visibility_context.previous_state = ui_visibility_context.current_state;
+        ui_visibility_context.current_state = new_state;
+        ui_visibility_context.state_entry_time = xTaskGetTickCount();
+        ui_visibility_context.time_in_state = 0;
+        
+        /* Call entry function for new state */
+        switch (new_state) {
+            case UI_STATE_INIT:
+                ui_state_init_entry();
+                break;
+            case UI_STATE_IDLE:
+                ui_state_idle_entry();
+                break;
+            case UI_STATE_READING_CARD:
+                ui_state_reading_card_entry();
+                break;
+            case UI_STATE_DISPENSING:
+                ui_state_dispensing_entry();
+                break;
+            case UI_STATE_CARD_REMOVED:
+                ui_state_card_removed_entry();
+                break;
+        }
+    }
+}
+
+/**
+ * @brief Show UI elements for dispensing
+ * @note Called with LVGL semaphore held
+ */
+static void show_dispense_ui_elements(void)
+{
+    if (ui_totalRemainingBar != NULL) {
+        lv_obj_clear_flag(ui_totalRemainingBar, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (ui_levelColourIndicator != NULL) {
+        lv_obj_clear_flag(ui_levelColourIndicator, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (ui_dispensedSession != NULL) {
+        lv_obj_clear_flag(ui_dispensedSession, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (ui_cardRemaining != NULL) {
+        lv_obj_clear_flag(ui_cardRemaining, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (ui_ledIndicator != NULL) {
+        lv_obj_clear_flag(ui_ledIndicator, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+/**
+ * @brief Hide UI elements after dispensing
+ * @note Called with LVGL semaphore held
+ */
+static void hide_dispense_ui_elements(void)
+{
+    if (ui_totalRemainingBar != NULL) {
+        lv_obj_add_flag(ui_totalRemainingBar, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (ui_levelColourIndicator != NULL) {
+        lv_obj_add_flag(ui_levelColourIndicator, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (ui_dispensedSession != NULL) {
+        lv_obj_add_flag(ui_dispensedSession, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (ui_cardRemaining != NULL) {
+        lv_obj_add_flag(ui_cardRemaining, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (ui_ledIndicator != NULL) {
+        lv_obj_add_flag(ui_ledIndicator, LV_OBJ_FLAG_HIDDEN);
+    }
 }

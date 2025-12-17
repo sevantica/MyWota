@@ -67,6 +67,7 @@ void ui_Screen1_screen_init(void)
     //Compensating for LVGL9.1 draw crash with bar/slider max value when top-padding is nonzero and right-padding is 0
     if(lv_obj_get_style_pad_top(ui_totalRemainingBar, LV_PART_MAIN) > 0) lv_obj_set_style_pad_right(ui_totalRemainingBar,
                                                                                                         lv_obj_get_style_pad_right(ui_totalRemainingBar, LV_PART_MAIN) + 1, LV_PART_MAIN);
+    lv_obj_add_flag(ui_totalRemainingBar, LV_OBJ_FLAG_HIDDEN);     /// Flags
     ui_levelColourIndicator = lv_obj_create(ui_Screen1);
     lv_obj_set_width(ui_levelColourIndicator, 245);
     lv_obj_set_height(ui_levelColourIndicator, 50);
@@ -74,6 +75,7 @@ void ui_Screen1_screen_init(void)
     lv_obj_set_y(ui_levelColourIndicator, 23);
     lv_obj_set_align(ui_levelColourIndicator, LV_ALIGN_CENTER);
     lv_obj_remove_flag(ui_levelColourIndicator, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
+    lv_obj_add_flag(ui_levelColourIndicator, LV_OBJ_FLAG_HIDDEN);     /// Flags
     lv_obj_set_style_bg_color(ui_levelColourIndicator, lv_color_hex(0x05820A), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_bg_opa(ui_levelColourIndicator, 180, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_blend_mode(ui_levelColourIndicator, LV_BLEND_MODE_NORMAL, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -100,6 +102,7 @@ void ui_Screen1_screen_init(void)
     lv_obj_set_y(ui_dispensedSession, 132);
     lv_obj_set_align(ui_dispensedSession, LV_ALIGN_CENTER);
     lv_label_set_text(ui_dispensedSession, "67");
+    lv_obj_add_flag(ui_dispensedSession, LV_OBJ_FLAG_HIDDEN);     /// Flags
     lv_obj_set_style_text_color(ui_dispensedSession, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_opa(ui_dispensedSession, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_font(ui_dispensedSession, &lv_font_montserrat_40, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -111,6 +114,7 @@ void ui_Screen1_screen_init(void)
     lv_obj_set_y(ui_cardRemaining, 23);
     lv_obj_set_align(ui_cardRemaining, LV_ALIGN_CENTER);
     lv_label_set_text(ui_cardRemaining, "1000 L");
+    lv_obj_add_flag(ui_cardRemaining, LV_OBJ_FLAG_HIDDEN);     /// Flags
     lv_obj_set_style_text_color(ui_cardRemaining, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_opa(ui_cardRemaining, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_font(ui_cardRemaining, &lv_font_montserrat_40, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -122,6 +126,7 @@ void ui_Screen1_screen_init(void)
     lv_obj_set_y(ui_ledIndicator, -85);
     lv_obj_set_align(ui_ledIndicator, LV_ALIGN_CENTER);
     lv_obj_remove_flag(ui_ledIndicator, LV_OBJ_FLAG_SCROLLABLE);      /// Flags
+    lv_obj_add_flag(ui_ledIndicator, LV_OBJ_FLAG_HIDDEN);     /// Flags
     lv_obj_set_style_bg_color(ui_ledIndicator, lv_color_hex(0x293C94), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_bg_opa(ui_ledIndicator, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
 
@@ -180,7 +185,7 @@ void ui_Screen1_screen_init(void)
     lv_obj_set_x(ui_customerID, 0);
     lv_obj_set_y(ui_customerID, -138);
     lv_obj_set_align(ui_customerID, LV_ALIGN_CENTER);
-    lv_label_set_text(ui_customerID, "07970242024");
+    lv_label_set_text(ui_customerID, "MyWota");
     lv_obj_set_style_text_color(ui_customerID, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_opa(ui_customerID, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
     lv_obj_set_style_text_font(ui_customerID, &lv_font_montserrat_32, LV_PART_MAIN | LV_STATE_DEFAULT);

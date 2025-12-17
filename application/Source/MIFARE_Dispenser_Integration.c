@@ -348,6 +348,7 @@ static void DispenserTask(void *pvParameters)
                     StopDispensing();
                     dispenser_handle.state = DISPENSER_ERROR;
                 }
+                    
                 break;
                 
             case DISPENSER_COMPLETING:

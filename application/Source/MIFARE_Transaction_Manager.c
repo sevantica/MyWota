@@ -17,12 +17,13 @@
  *          capabilities and protection against card removal during transactions
  */
 
-/*Includes ----------------------------------------------------------*/
+/* Includes ------------------------------------------------------------------*/
 #include "MIFARE_Transaction_Manager.h"
 #include "PN532_Driver.h"
 #include "USB_Logging.h"
 #include "System.h"
 #include "mywota_ui_driver.h"
+#include "SD_Logger_Task.h"
 #include <string.h>
 #include <stdio.h>
 #include <stddef.h>
@@ -755,6 +756,21 @@ MIFARE_Result_t MIFARE_ReadCardData(MIFARE_CardData_t *card_data)
                       card_data->account_data.raw_data[6], card_data->account_data.raw_data[7],
                       card_data->account_data.raw_data[8], card_data->account_data.raw_data[9],
                       card_data->account_data.raw_data[10]);
+        }
+        
+        // Log card scan to SD card with all MIFARE block data
+        if (SD_Logger_IsReady()) {
+            // Get card UID from transaction manager
+            uint8_t uid_length = g_transaction_manager.card_info.uid_length;
+            const uint8_t *card_uid = g_transaction_manager.card_info.uid;
+            
+            if (SD_Logger_LogMIFARECardScan(card_uid, uid_length, card_data, SD_LOG_TYPE_MIFARE_CARD_SCAN)) {
+                MIFARE_LOG("Card scan logged to SD card successfully");
+            } else {
+                MIFARE_LOG("Failed to log card scan to SD card");
+            }
+        } else {
+            MIFARE_LOG("SD Logger not ready - skipping card scan logging");
         }
         
         return MIFARE_RESULT_OK;
@@ -2436,6 +2452,41 @@ uint32_t MIFARE_GetTotalPurchasedML(void)
 uint32_t MIFARE_GetTotalDispensedML(void)
 {
     return g_transaction_manager.current_card.usage_data.total_dispensed_ml;
+}
+
+/**
+ * @brief Get customer phone number from card
+ * @param phone_buffer Buffer to store phone number (must be at least 12 bytes)
+ * @param buffer_size Size of the buffer
+ * @return bool True if phone number retrieved, false if no card or buffer too small
+ */
+bool MIFARE_GetCustomerPhoneNumber(char *phone_buffer, size_t buffer_size)
+{
+    if (phone_buffer == NULL || buffer_size < 12) {
+        return false;
+    }
+    
+    // Check if card is present and data is valid
+    if (g_transaction_manager.card_state != MIFARE_CARD_STATE_PRESENT || 
+        !g_transaction_manager.current_card.data_valid) {
+        return false;
+    }
+    
+    // Extract phone number from account data (bytes 0-10)
+    const uint8_t *raw_data = g_transaction_manager.current_card.account_data.raw_data;
+    
+    // Copy phone number bytes and null-terminate
+    memcpy(phone_buffer, raw_data, 11);
+    phone_buffer[11] = '\0';
+    
+    // Validate it contains only digits
+    for (int i = 0; i < 11; i++) {
+        if (phone_buffer[i] < '0' || phone_buffer[i] > '9') {
+            return false;  // Invalid phone number
+        }
+    }
+    
+    return true;
 }
 
 void MIFARE_LogTransaction(uint8_t type, uint16_t amount_ml, uint8_t dispenser_id)
