@@ -1,6 +1,6 @@
 param(
     [switch]$WithBootloader,
-    [string]$BootloaderPath = "C:\Business\Common\bootloader\build\bootloader.bin"
+    [string]$BootloaderPath = "C:\Business\Cross Project\VS Code Common\Pico bootloader\build\bootloader.bin"
 )
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition

@@ -62,8 +62,11 @@ set(PARENT_INCLUDE_DIRS
 # Set path to tusb_config.h for drivers library
 set(TUSB_CONFIG_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
+# Path to the shared VS Code Common cross-project directory
+set(COMMON_PROJECT_DIR "C:/Business/Cross Project/VS Code Common")
+
 # Add the custom drivers library (includes FreeRTOS via FetchContent)
-add_subdirectory(../../../Common/sevantica_drivers ${CMAKE_CURRENT_BINARY_DIR}/drivers)
+add_subdirectory(${COMMON_PROJECT_DIR}/sevantica_drivers ${CMAKE_CURRENT_BINARY_DIR}/drivers)
 
 # Set C/C++ standards
 set(CMAKE_C_STANDARD 11)
@@ -112,7 +115,7 @@ include_directories(
     ../application/User_Interface/MyWota/lvgl/src
     ../application/User_Interface/MyWota/lvgl/src/drivers
     ../application/Include
-    ../../../Common/sevantica_drivers/Include
+    ${COMMON_PROJECT_DIR}/sevantica_drivers/Include
     ../application/User_Interface/MyWota/ui
     ../application/User_Interface/MyWota/ui/screens
     ../application/User_Interface/MyWota/ui/images
@@ -210,8 +213,8 @@ target_include_directories(lvgl PRIVATE
 
 # Add FatFs include path as SYSTEM to LVGL for LV_USE_FS_FATFS support
 target_include_directories(lvgl SYSTEM PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../../Common/sevantica_drivers/FatFs
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../../Common/sevantica_drivers/Include
+    ${COMMON_PROJECT_DIR}/sevantica_drivers/FatFs
+    ${COMMON_PROJECT_DIR}/sevantica_drivers/Include
 )
 
 # Also need to link LVGL with FreeRTOS-Kernel and Pico SDK for headers

@@ -1,0 +1,14 @@
+{
+	"backtraceGraph" : 
+	{
+		"commands" : [],
+		"files" : [],
+		"nodes" : []
+	},
+	"installers" : [],
+	"paths" : 
+	{
+		"build" : "drivers/freertos_kernel/portable",
+		"source" : "C:/Business/Cross Project/VS Code Common/sevantica_drivers/FreeRTOS-Kernel/portable"
+	}
+}
