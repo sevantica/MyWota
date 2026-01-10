@@ -10,6 +10,13 @@
 ******************************************************************************
 */
 
+/**
+ * @file System.c
+ * @brief System initialization module
+ * @details Responsible for initializing all hardware drivers and starting tasks.
+ *          This module follows the driver initialization pattern where System.c
+ *          only calls driver-level Init functions, not low-level hardware init.
+ */
 
 /* Includes ------------------------------------------------------------------*/
 #include "FreeRTOS.h"
@@ -20,39 +27,29 @@
 #include "task_stack_config.h"
 #include "USB_CDC_Task.h"
 #include "USB_Logging.h"
+#include "USB_Command_Handler.h"
 #include "lvgl.h" 
-#include "ui.h"
-#include "ui_Screen1.h"
-#include "mywota_ui_driver.h"
+#include "MyWota_ui_driver.h"
 
 /* Private includes ----------------------------------------------------------*/
 #include "System.h"
+#include "System_Config.h"
 #include "PN532_Driver.h"
 #include "MIFARE_Transaction_Manager.h"
+#include "Dispenser_Controller.h"
 #include "Hardware_Access.h"
-#include "YS_S201_Driver.h"
+#include "IO_Expander_Control.h"
 #include "CAT9555_Driver.h"
+#include "Buzzer_Driver.h"
 #include "SD_Logger_Task.h"
+#include "RTC_Task.h"
+#include "RS485_Task.h"
+#include "Log_Strings.h"
+#include "hardware/watchdog.h"
 #include <stdio.h>
 
-/* Platform-specific hardware includes */
-#if defined(PICO_BUILD) || defined(PICO_BOARD)
-#include "hardware/i2c.h"
-#include "hardware/gpio.h"
-#include "pico/stdlib.h"
-#endif
-
-/* Private defines ------------------------------------------------------------*/
-#define SYSTEM_CARD_REMOVAL_TIMEOUT_MS  500            // Card must be absent for 500ms before removal confirmed
-
-/* 
- * DISPENSE MODE CONFIGURATION
- * Uncomment to require button press for dispensing.
- * Comment out to enable automatic dispensing upon card detection.
- */
-
 /* Logging Configuration -----------------------------------------------------*/
-#define LOG_DEBUG_SYSTEM_EN      1
+#define LOG_DEBUG_SYSTEM_EN      0
 #define LOG_CRITICAL_SYSTEM_EN   1
 #define LOG_ERROR_SYSTEM_EN      1
 
@@ -76,519 +73,831 @@
 
 /* Private typedefs -----------------------------------------------------------*/
 
-static TaskHandle_t System_Task_TaskHandle;
-
-SemaphoreHandle_t gpio_semaphore;
-SemaphoreHandle_t i2c_semaphore;
-SemaphoreHandle_t i2c_1_Semaphore;  /* Platform-specific I2C1 bus semaphore */
-SemaphoreHandle_t mux_semaphore;
-
-SemaphoreHandle_t spi_1_Semaphore;
-SemaphoreHandle_t spi_2_Semaphore; /* New semaphore for SPI2 bus serialization */
-
-/* Private macros -------------------------------------------------------------*/
-
-
-/*Static variables ---------------------------------------------------------*/
-
-/* CAT9555 I/O Expander handle for pin polling */
-static CAT9555_Handle_t cat9555_handle;
-
-/* CAT9555 interrupt tracking */
-static volatile uint32_t cat9555_interrupt_count = 0;
-
-/* PN532 initialization status tracking */
-static bool pn532_initialized = false;
-
-/* NOTE: YS_S201_Handle_t flow_sensor removed - now managed by Dispenser_Control task */
-/* Declaring a second handle here caused data mismatch issues */
-
-/*Extern variables ---------------------------------------------------------*/
-
-/* External task starter functions */
-extern void Task_Start_Dispenser_Control_Task(void);
-extern void Task_Start_SD_Logger_Task(void);
-
-/*Global variables ---------------------------------------------------------*/
-
-/* Function prototypes */
-static void cat9555_interrupt_callback(uint gpio, uint32_t events);
-
-static void System_Task(void* argument);
-
-static void systemInitialisations();
-
-static void poll_CAT9555_UserButton(void);
-
-static void send_gpio_event(uint8_t pin_id, uint8_t pin_state, uint8_t bank_id, EVENT_SOURCE_Enum source);
-
-/* Task notification index for CAT9555 interrupt */
-#define CAT9555_INTERRUPT_NOTIFICATION_INDEX 0
-
-/* System State Machine States */
+/* Watchdog Task Status Tracking */
 typedef enum {
-	SYSTEM_STATE_STARTUP,           // Initial power-on state
-	SYSTEM_STATE_INITIALIZING,      // Performing hardware initialization
-	SYSTEM_STATE_IDLE,              // Normal operation, waiting for events
-	SYSTEM_STATE_PROCESSING_INPUT,  // Processing user input (button press)
-	SYSTEM_STATE_DIAGNOSTICS,       // Running periodic diagnostics
-	SYSTEM_STATE_ERROR,             // Error state
-	SYSTEM_STATE_SHUTDOWN           // Graceful shutdown
-} SystemState_t;
+    TASK_STATUS_UNKNOWN = 0,
+    TASK_STATUS_RUNNING,
+    TASK_STATUS_ERROR
+} Task_Status_t;
 
-/* System State Machine Context */
+typedef enum {
+    TASK_ID_SD_LOGGER = 0,
+    TASK_ID_USB_CDC,
+    TASK_ID_USB_COMMAND_HANDLER,
+    TASK_ID_LCD_DISPLAY,
+    TASK_ID_DISPENSER,
+    TASK_ID_BUZZER_POLLING,
+    TASK_ID_MIFARE_POLLING,
+    TASK_ID_IO_EXPANDER,
+    TASK_ID_RTC,
+    TASK_ID_RS485,
+    TASK_ID_COUNT  /* Must be last */
+} Task_ID_t;
+
 typedef struct {
-	SystemState_t current_state;
-	SystemState_t previous_state;
-	uint32_t state_entry_time;
-	uint32_t time_in_state;
-	uint32_t last_interrupt_count;
-	uint32_t diagnostic_counter;
-	bool interrupt_pending;
-	TickType_t card_detection_first_failed_tick;  // Track when card detection first failed
-} SystemContext_t;
+    const char* name;
+    Task_Status_t status;
+    TickType_t last_report_tick;
+} Task_WDT_Status_t;
 
-static SystemContext_t system_context = {
-	.current_state = SYSTEM_STATE_STARTUP,
-	.previous_state = SYSTEM_STATE_STARTUP,
-	.state_entry_time = 0,
-	.time_in_state = 0,
-	.last_interrupt_count = 0,
-	.diagnostic_counter = 0,
-	.interrupt_pending = false,
-	.card_detection_first_failed_tick = 0
+/* Private variables ----------------------------------------------------------*/
+static TaskHandle_t system_task_handle;
+
+/* Static semaphores - accessed via getter functions */
+static SemaphoreHandle_t gpio_semaphore;
+static SemaphoreHandle_t i2c_semaphore;
+static SemaphoreHandle_t i2c_1_Semaphore;
+static SemaphoreHandle_t mux_semaphore;
+static SemaphoreHandle_t spi_1_Semaphore;
+
+/* CAT9555 I/O Expander handle pointer - points to driver-owned memory */
+static CAT9555_Handle_t *cat9555_handle = NULL;
+
+/* Buzzer handle pointer - points to driver-owned memory */
+static Buzzer_Handle_t *buzzer_handle = NULL;
+
+/**
+ * @brief Get buzzer handle for other modules to use
+ * @return Pointer to buzzer handle, or NULL if not initialized
+ */
+Buzzer_Handle_t* System_GetBuzzerHandle(void)
+{
+    return buzzer_handle;
+}
+
+/* PN532 NFC Driver handle pointer - points to driver-owned memory */
+static PN532_Handle_t *pn532_handle = NULL;
+
+/* Watchdog Status Tracking */
+static Task_WDT_Status_t s_task_wdt_status[TASK_ID_COUNT] = {
+    {"SD_Logger",    TASK_STATUS_UNKNOWN, 0},
+    {"USB_CDC",       TASK_STATUS_UNKNOWN, 0},
+    {"USB_Command",   TASK_STATUS_UNKNOWN, 0},
+    {"LCD_Display",   TASK_STATUS_UNKNOWN, 0},
+    {"Dispenser",     TASK_STATUS_UNKNOWN, 0},
+    {"Buzzer",        TASK_STATUS_UNKNOWN, 0},
+    {"MIFARE",        TASK_STATUS_UNKNOWN, 0},
+    {"IO_Expander",   TASK_STATUS_UNKNOWN, 0},
+    {"RTC",           TASK_STATUS_UNKNOWN, 0},
+    {"RS485",         TASK_STATUS_UNKNOWN, 0}
+};
+static SemaphoreHandle_t s_wdt_status_mutex = NULL;
+static bool s_watchdog_enabled = false;
+static bool s_mifare_polling_enabled = false;
+static bool s_buzzer_polling_enabled = false;
+
+/* Module runtime state tracking */
+static Module_State_t s_module_states[MODULE_COUNT] = {
+    MODULE_STATE_STOPPED,  /* MODULE_LCD_DISPLAY */
+    MODULE_STATE_STOPPED,  /* MODULE_MIFARE_POLLING */
+    MODULE_STATE_STOPPED,  /* MODULE_DISPENSER */
+    MODULE_STATE_STOPPED,  /* MODULE_BUZZER */
+    MODULE_STATE_STOPPED,  /* MODULE_IO_EXPANDER */
+    MODULE_STATE_STOPPED   /* MODULE_RS485 */
 };
 
-/* State machine function prototypes */
-static void state_startup(void);
-static void state_initializing(void);
-static void state_idle(void);
-static void state_processing_input(void);
-static void state_diagnostics(void);
-static void state_error(void);
-static void state_shutdown(void);
-static void change_state(SystemState_t new_state);
-static void process_dispensing_logic(void);
+static const char* s_module_names[MODULE_COUNT] = {
+    "LCD",
+    "MIFARE",
+    "DISPENSER",
+    "BUZZER",
+    "IO_EXP",
+    "RS485"
+};
 
+/* External task starter functions */
+extern void Task_Start_SD_Logger_Task(void);
+
+/* Private function prototypes ------------------------------------------------*/
+static void System_Task(void* argument);
+static void system_init(void);
+
+/* Private functions ----------------------------------------------------------*/
+
+/**
+ * @brief Initialize all system hardware and start tasks
+ * @details Called once during system startup. Initializes drivers in the
+ *          correct order respecting hardware dependencies.
+ */
+static void system_init(void)
+{
+    LOG_CRITICAL_SYSTEM("\r\n=== System Initialization ===\r\n");
+
+    /* Hardware Layer */
+    Init_Hardware_Layer();
+    LOG_CRITICAL_SYSTEM("[✓] Hardware Layer initialized\r\n");
+
+    /* SD Logger Task (uses already-mounted SD card if available) */
+    Task_Start_SD_Logger_Task();
+    LOG_CRITICAL_SYSTEM("[→] SD Logger Task started, waiting for mount result...\r\n");
+    
+    /* Wait for SD Logger to complete mounting (success or failure) */
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(30000));
+    
+    /* Load Configuration */
+    if (SD_Logger_IsReady()) {
+        LOG_CRITICAL_SYSTEM("[✓] SD Logger mounted - config loaded from SD card\r\n");
+        
+        /* Initialize ID-based log strings from SD card */
+        if (Log_Strings_Init()) {
+            LOG_CRITICAL_SYSTEM("[✓] Log strings loaded from SD\r\n");
+        } else {
+            LOG_CRITICAL_SYSTEM("[!] Log strings not available - using ID fallback\r\n");
+        }
+    } else {
+        LOG_CRITICAL_SYSTEM("[!] SD Logger mount failed - loading config from flash...\r\n");
+        Config_Result_t config_result = Config_LoadFromFlash();
+        
+        if (config_result == CONFIG_OK) {
+            LOG_CRITICAL_SYSTEM("[✓] Configuration loaded from flash\r\n");
+        } else {
+            LOG_CRITICAL_SYSTEM("[!] No valid flash config - using defaults\r\n");
+            Config_InitDefaults();
+        }
+    }
+    
+    /* Log active configuration */
+    const SystemConfig_t* cfg = Config_Get();
+    LOG_CRITICAL_SYSTEM("[CONFIG] Device: %s | Site: %s | TestMode: %s\r\n",
+                        cfg->system.device_id, cfg->system.site_id,
+                        cfg->system.test_mode_enabled ? "ON" : "OFF");
+
+    /* RTC Task - Start immediately after SD mount completes (success or failure)
+     * SD is CRITICAL for RTC to load saved time. System task blocks above ensures
+     * SD initialization is complete before RTC task starts. */
+    Task_Start_RTC_Task();
+    LOG_CRITICAL_SYSTEM("[→] RTC Task started (SD init complete)\r\n");
+
+    /* USB CDC */
+    USB_CDC_Task_Start(); 
+    LOG_CRITICAL_SYSTEM("[→] USB CDC Task started\r\n");
+    
+    /* USB Command Handler */
+    Task_Start_USB_Command_Handler();
+    LOG_CRITICAL_SYSTEM("[→] USB Command Handler Task started\r\n");
+    
+    /* GPIO Interrupts */
+    Hardware_Init_GPIO_Interrupts();
+    LOG_CRITICAL_SYSTEM("[✓] GPIO Interrupts initialized\r\n");
+    
+    /* CAT9555 I/O Expander (initializes I2C0 internally) */
+    cat9555_handle = CAT9555_GetHandle(0);
+    CAT9555_Status_t cat_status = CAT9555_ERROR;  /* Assume failure until proven otherwise */
+    
+    if (cat9555_handle != NULL) {
+        cat_status = CAT9555_Init(cat9555_handle, CAT9555_I2C_ADDRESS);
+    } else {
+        LOG_CRITICAL_SYSTEM("[✗] CAT9555 handle is NULL - cannot initialize\r\n");
+    }
+    
+    if (cat_status != CAT9555_OK) {
+        LOG_CRITICAL_SYSTEM("[✗] CAT9555 I/O Expander initialization FAILED: %s\r\n",
+                            CAT9555_GetStatusString(cat_status));
+    } else {
+        LOG_CRITICAL_SYSTEM("[✓] CAT9555 I/O Expander initialized\r\n");
+    }
+    
+    /* I/O Expander Control (high-level abstraction layer) */
+    IO_Expander_Control_Init();
+    
+    /* I/O Expander Control Task (polls all pins) - check hardware and config */
+    if (cat_status == CAT9555_OK && cfg->modules.io_expander_enabled) {
+        Task_Start_IO_Expander_Control_Task();
+        s_module_states[MODULE_IO_EXPANDER] = MODULE_STATE_RUNNING;
+        LOG_CRITICAL_SYSTEM("[→] I/O Expander Control Task started\r\n");
+    } else if (!cfg->modules.io_expander_enabled) {
+        LOG_CRITICAL_SYSTEM("[!] I/O Expander Control Task DISABLED by config\r\n");
+    } else {
+        s_module_states[MODULE_IO_EXPANDER] = MODULE_STATE_ERROR;
+        LOG_CRITICAL_SYSTEM("[✗] I/O Expander Control Task FAILED - CAT9555 initialization error\r\n");
+    }
+    
+    /* Buzzer Driver (requires CAT9555) */
+    buzzer_handle = Buzzer_GetHandle(0);
+    Buzzer_Status_t buzzer_status = BUZZER_ERROR;  /* Assume failure until proven otherwise */
+    
+    if (cat_status == CAT9555_OK && buzzer_handle != NULL) {
+        buzzer_status = Buzzer_Init(buzzer_handle, cat9555_handle);
+    } else if (cat_status != CAT9555_OK) {
+        LOG_CRITICAL_SYSTEM("[✗] Buzzer initialization SKIPPED - CAT9555 failed\r\n");
+    } else {
+        LOG_CRITICAL_SYSTEM("[✗] Buzzer handle is NULL - cannot initialize\r\n");
+    }
+    
+    if (buzzer_status != BUZZER_OK) {
+        LOG_CRITICAL_SYSTEM("[✗] Buzzer initialization FAILED: %s\r\n",
+                            Buzzer_GetStatusString(buzzer_status));
+    } else {
+        LOG_CRITICAL_SYSTEM("[✓] Buzzer initialized\r\n");
+    }
+    
+    /* LCD Display Task - Start early so it runs in parallel
+     * with NFC initialization. LCD should not depend on NFC subsystem. */
+    if (cfg->modules.lcd_display_enabled) {
+        Task_Start_LCD_Display_Driver_Task();
+        s_module_states[MODULE_LCD_DISPLAY] = MODULE_STATE_RUNNING;
+        LOG_CRITICAL_SYSTEM("[→] LCD Display Task started\r\n");
+    } else {
+        LOG_CRITICAL_SYSTEM("[!] LCD Display Task DISABLED by config\r\n");
+    }
+    
+    /* PN532 NFC Driver - Can fail without blocking LCD */
+    pn532_handle = PN532_GetHandle(0);
+    PN532_Status_t pn532_status = PN532_STATUS_ERROR;  /* Assume failure until proven otherwise */
+    
+    if (pn532_handle != NULL) {
+        pn532_status = PN532_Init(pn532_handle);
+    } else {
+        LOG_CRITICAL_SYSTEM("[✗] PN532 Driver handle is NULL - cannot initialize\r\n");
+    }
+    
+    if (pn532_status != PN532_STATUS_OK) {
+        LOG_CRITICAL_SYSTEM("[✗] PN532 Driver initialization FAILED: %d\r\n", pn532_status);
+    } else {
+        LOG_CRITICAL_SYSTEM("[✓] PN532 Driver initialized\r\n");
+    }
+
+    /* MIFARE Transaction Manager */
+    MIFARE_TransactionManager_Init();
+    LOG_CRITICAL_SYSTEM("[✓] MIFARE Manager initialized\r\n");
+    
+    /* Dispenser Integration */
+    MIFARE_Dispenser_Init();
+    
+    /* MIFARE Polling Task - check both hardware and config */
+    if (pn532_status == PN532_STATUS_OK && cfg->modules.mifare_polling_enabled) {
+        MIFARE_StartPollingTask();
+        s_mifare_polling_enabled = true;
+        s_module_states[MODULE_MIFARE_POLLING] = MODULE_STATE_RUNNING;
+        LOG_CRITICAL_SYSTEM("[→] MIFARE Polling Task started\r\n");
+    } else if (!cfg->modules.mifare_polling_enabled) {
+        s_mifare_polling_enabled = false;
+        LOG_CRITICAL_SYSTEM("[!] MIFARE Polling Task DISABLED by config\r\n");
+    } else {
+        s_mifare_polling_enabled = false;
+        s_module_states[MODULE_MIFARE_POLLING] = MODULE_STATE_ERROR;
+        LOG_CRITICAL_SYSTEM("[✗] MIFARE Polling Task FAILED - PN532 initialization error\r\n");
+    }
+    
+    /* Dispenser Integration Task - check config */
+    if (cfg->modules.dispenser_enabled) {
+        Task_Start_Dispenser_Task();
+        s_module_states[MODULE_DISPENSER] = MODULE_STATE_RUNNING;
+        LOG_CRITICAL_SYSTEM("[→] Dispenser Task started\r\n");
+    } else {
+        LOG_CRITICAL_SYSTEM("[!] Dispenser Task DISABLED by config\r\n");
+    }
+
+    /* Buzzer Polling Task - check both hardware and config */
+    if (buzzer_status == BUZZER_OK && cfg->modules.buzzer_enabled) {
+        Buzzer_StartPollingTask(buzzer_handle);
+        s_buzzer_polling_enabled = true;
+        s_module_states[MODULE_BUZZER] = MODULE_STATE_RUNNING;
+        LOG_CRITICAL_SYSTEM("[→] Buzzer Polling Task started\r\n");
+    } else if (!cfg->modules.buzzer_enabled) {
+        s_buzzer_polling_enabled = false;
+        LOG_CRITICAL_SYSTEM("[!] Buzzer Polling Task DISABLED by config\r\n");
+    } else {
+        s_buzzer_polling_enabled = false;
+        s_module_states[MODULE_BUZZER] = MODULE_STATE_ERROR;
+        LOG_CRITICAL_SYSTEM("[✗] Buzzer Polling Task FAILED - Buzzer initialization error\r\n");
+    }
+    
+    /* RS485 Communication Task - check config */
+    if (cfg->modules.rs485_enabled) {
+        Task_Start_RS485_Task();
+        s_module_states[MODULE_RS485] = MODULE_STATE_RUNNING;
+        LOG_CRITICAL_SYSTEM("[→] RS485 Communication Task started\r\n");
+    } else {
+        LOG_CRITICAL_SYSTEM("[!] RS485 Communication Task DISABLED by config\r\n");
+    }
+    
+    /* Initialize Watchdog Status Tracking */
+    s_wdt_status_mutex = xSemaphoreCreateMutex();
+    if (s_wdt_status_mutex == NULL) {
+        LOG_CRITICAL_SYSTEM("[✗] Failed to create WDT status mutex\r\n");
+    } else {
+        LOG_CRITICAL_SYSTEM("[✓] WDT status tracking initialized\r\n");
+    }
+    
+    /* Enable Hardware Watchdog - 1000ms timeout, pause during debug */
+    watchdog_enable(1000, true);
+    s_watchdog_enabled = true;
+    LOG_CRITICAL_SYSTEM("[✓] Hardware Watchdog enabled (1000ms timeout)\r\n");
+    
+    LOG_CRITICAL_SYSTEM("=== Initialization Phase Complete ===\r\n\r\n");
+}
+
+/**
+ * @brief System FreeRTOS task
+ * @param argument Task parameters (unused)
+ * @details Performs system initialization and then monitors task health.
+ *          Clears watchdog if all tasks report OK within 400ms window.
+ *          Logs to SD if any task fails to report.
+ */
 static void System_Task(void* argument)
 {
-	TickType_t xLastWakeTime = xTaskGetTickCount();
-	
-	// Initialize state machine
-	system_context.current_state = SYSTEM_STATE_STARTUP;
-	system_context.state_entry_time = xTaskGetTickCount();
-	
-	for(;;)
-	{
-		TASK_HEARTBEAT_EVERY_SECOND("System");
-		
-		// Update LVGL ticker
-		lv_tick_inc(10);
-		
-		// Update time in current state
-		system_context.time_in_state = xTaskGetTickCount() - system_context.state_entry_time;
-		
-		// Check for CAT9555 interrupt (sets flag for state machine)
-		uint32_t notification_value = 0;
-		if (xTaskNotifyWaitIndexed(CAT9555_INTERRUPT_NOTIFICATION_INDEX, 
-		                            0x00, 0xFFFFFFFF, 
-		                            &notification_value, 
-		                            0) == pdTRUE) {
-			system_context.interrupt_pending = true;
-		}
-		
-		// Execute current state
-		switch (system_context.current_state) {
-			case SYSTEM_STATE_STARTUP:
-				state_startup();
-				break;
-			
-			case SYSTEM_STATE_INITIALIZING:
-				state_initializing();
-				break;
-			
-			case SYSTEM_STATE_IDLE:
-				state_idle();
-				break;
-			
-			case SYSTEM_STATE_PROCESSING_INPUT:
-				state_processing_input();
-				break;
-			
-			case SYSTEM_STATE_DIAGNOSTICS:
-				state_diagnostics();
-				break;
-			
-			case SYSTEM_STATE_ERROR:
-				state_error();
-				break;
-			
-			case SYSTEM_STATE_SHUTDOWN:
-				state_shutdown();
-				break;
-			
-			default:
-				LOG_ERROR_SYSTEM(": Unknown state %d\r\n", system_context.current_state);
-				change_state(SYSTEM_STATE_ERROR);
-				break;
-		}
-		
-		// Run every 10ms
-		vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(10));
-	}
+    (void)argument;
+    
+    /* Perform system initialization */
+    system_init();
+    
+    /* Give tasks time to complete initialization before starting watchdog monitoring
+     * LCD task takes ~2.6s (display init + UI render + backlight fade)
+     * PN532 can take ~2s for I2C communication 
+     * During this period, feed the watchdog to prevent hardware reset */
+    const TickType_t startup_grace_period = pdMS_TO_TICKS(5000);  /* 5 second grace period */
+    const TickType_t grace_period_tick = pdMS_TO_TICKS(100);      /* Check every 100ms */
+    LOG_CRITICAL_SYSTEM("[WDT] Waiting %lu ms for tasks to complete initialization...\r\n", 
+                        (unsigned long)(startup_grace_period * portTICK_PERIOD_MS));
+    
+    TickType_t grace_start = xTaskGetTickCount();
+    while ((xTaskGetTickCount() - grace_start) < startup_grace_period) {
+        watchdog_update();  /* Keep hardware watchdog happy during grace period */
+        vTaskDelay(grace_period_tick);
+    }
+    
+    LOG_CRITICAL_SYSTEM("[WDT] Grace period complete - starting watchdog monitoring\r\n");
+    
+    /* Signal WDT start with double beep */
+    if (buzzer_handle != NULL && Buzzer_IsInitialized(buzzer_handle)) {
+        Buzzer_DoubleBeep(buzzer_handle);
+        LOG_CRITICAL_SYSTEM("[WDT] Startup beep signaled\r\n");
+    }
+    
+    /* Main watchdog monitoring loop */
+    const TickType_t wdt_check_period = pdMS_TO_TICKS(100);  /* Check every 100ms */
+    const TickType_t report_timeout = pdMS_TO_TICKS(800);    /* 800ms task health check window */
+    
+    /* Clear watchdog once before starting monitoring loop */
+    watchdog_update();
+    TickType_t last_task_check = xTaskGetTickCount();
+    
+    for (;;)
+    {
+        vTaskDelay(wdt_check_period);
+        
+        /* ALWAYS feed hardware WDT - proves System_Task is running */
+        /* This is separate from task health monitoring */
+        watchdog_update();
+        
+        if (!s_watchdog_enabled || !s_wdt_status_mutex) {
+            continue;
+        }
+        
+        /* Check task health periodically (separate from hardware WDT) */
+        TickType_t check_time = xTaskGetTickCount();
+        TickType_t elapsed_since_check = check_time - last_task_check;
+        
+        if (elapsed_since_check >= report_timeout) {
+            last_task_check = check_time;
+            
+            bool all_tasks_ok = true;
+            bool any_task_reported = false;
+            TickType_t now;  /* Will be read inside mutex to avoid race condition */
+            
+            /* Local copy of task statuses to avoid holding mutex during logging */
+            typedef struct {
+                Task_Status_t status;
+                TickType_t last_report_tick;
+                const char* name;
+            } Task_Status_Snapshot_t;
+            Task_Status_Snapshot_t status_snapshot[TASK_ID_COUNT];
+            
+            /* Take mutex BRIEFLY to copy all task statuses */
+            if (xSemaphoreTake(s_wdt_status_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                /* Use critical section to make snapshot + timestamp atomic */
+                taskENTER_CRITICAL();
+                
+                /* Read time with interrupts disabled to prevent race */
+                now = xTaskGetTickCount();
+                
+                /* Copy task status data - FAST operation, no logging */
+                for (uint8_t i = 0; i < TASK_ID_COUNT; i++) {
+                    status_snapshot[i].status = s_task_wdt_status[i].status;
+                    status_snapshot[i].last_report_tick = s_task_wdt_status[i].last_report_tick;
+                    status_snapshot[i].name = s_task_wdt_status[i].name;
+                }
+                
+                taskEXIT_CRITICAL();
+                
+                /* Release mutex IMMEDIATELY - total hold time ~1ms */
+                xSemaphoreGive(s_wdt_status_mutex);
+                
+                /* Now analyze the snapshot WITHOUT holding the mutex */
+                const TickType_t max_silence_time = report_timeout * 3;
+                
+                for (uint8_t i = 0; i < TASK_ID_COUNT; i++) {
+                    /* Skip MIFARE task if disabled due to hardware failure */
+                    if (i == TASK_ID_MIFARE_POLLING && !s_mifare_polling_enabled) {
+                        continue;
+                    }
+                    /* Skip Buzzer task if disabled due to hardware failure */
+                    if (i == TASK_ID_BUZZER_POLLING && !s_buzzer_polling_enabled) {
+                        continue;
+                    }
+
+                    TickType_t time_since_report = now - status_snapshot[i].last_report_tick;
+                    
+                    /* Only check time-based timeout, not status enum.
+                     * Task is OK if it reported within 2400ms, regardless of status enum value. */
+                    if (time_since_report > max_silence_time) {
+                        /* Task hasn't reported in 3x timeout - truly hung */
+                        all_tasks_ok = false;
+                        any_task_reported = true;
+                    } else if (status_snapshot[i].status == TASK_STATUS_ERROR) {
+                        /* Task explicitly reported an error */
+                        all_tasks_ok = false;
+                        any_task_reported = true;
+                    } else if (status_snapshot[i].status == TASK_STATUS_RUNNING) {
+                        /* Task reported OK recently */
+                        any_task_reported = true;
+                    }
+                }
+                
+                /* If all tasks reported OK, just reset statuses for next cycle */
+                if (all_tasks_ok && any_task_reported) {
+                    /* Reset task statuses for next cycle - take mutex briefly */
+                    if (xSemaphoreTake(s_wdt_status_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                        for (uint8_t i = 0; i < TASK_ID_COUNT; i++) {
+                            s_task_wdt_status[i].status = TASK_STATUS_UNKNOWN;
+                        }
+                        xSemaphoreGive(s_wdt_status_mutex);
+                    }
+                } else {
+                    /* Log missing/failed tasks - can take 100s of ms with USB + SD */
+                    LOG_CRITICAL_SYSTEM("[WDT] Not all tasks reported within 2400ms:\r\n");
+                    
+                    for (uint8_t i = 0; i < TASK_ID_COUNT; i++) {
+                        /* Skip MIFARE task if disabled */
+                        if (i == TASK_ID_MIFARE_POLLING && !s_mifare_polling_enabled) {
+                            continue;
+                        }
+                        /* Skip Buzzer task if disabled */
+                        if (i == TASK_ID_BUZZER_POLLING && !s_buzzer_polling_enabled) {
+                            continue;
+                        }
+
+                        const char* status_str;
+                        TickType_t time_since_report = now - status_snapshot[i].last_report_tick;
+                        
+                        /* Debug logging for USB_Command task */
+                        if (i == TASK_ID_USB_COMMAND_HANDLER) {
+                            USB_Log_Printf("[WDT_DBG] USB_Command snapshot: status=%d, last_tick=%lu, now=%lu, diff=%lu\r\n",
+                                         status_snapshot[i].status,
+                                         status_snapshot[i].last_report_tick,
+                                         now,
+                                         time_since_report);
+                        }
+                        
+                        switch (status_snapshot[i].status) {
+                            case TASK_STATUS_UNKNOWN:
+                                status_str = "NO_REPORT";
+                                break;
+                            case TASK_STATUS_RUNNING:
+                                if (time_since_report > report_timeout) {
+                                    status_str = "TIMEOUT";
+                                } else {
+                                    status_str = "OK";
+                                }
+                                break;
+                            case TASK_STATUS_ERROR:
+                                status_str = "ERROR";
+                                break;
+                            default:
+                                status_str = "UNKNOWN";
+                                break;
+                        }
+                        
+                        LOG_CRITICAL_SYSTEM("  %s: %s (last: %lu ms ago)\r\n",
+                                          status_snapshot[i].name,
+                                          status_str,
+                                          (unsigned long)time_since_report);
+                        
+                        /* Also log to SD if available */
+                        if (SD_Logger_IsReady()) {
+                            SD_Logger_LogEvent("WDT: %s - %s (last: %lu ms)",
+                                    status_snapshot[i].name,
+                                    status_str,
+                                    (unsigned long)time_since_report);
+                        }
+                    }
+                    
+                    /* Reset task statuses for next cycle to avoid spam */
+                    if (xSemaphoreTake(s_wdt_status_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                        for (uint8_t i = 0; i < TASK_ID_COUNT; i++) {
+                            s_task_wdt_status[i].status = TASK_STATUS_UNKNOWN;
+                        }
+                        xSemaphoreGive(s_wdt_status_mutex);
+                    }
+                }
+            }
+        }
+    }
 }
 
+/* Public functions -----------------------------------------------------------*/
 
-static void systemInitialisations()
+void Task_Start_System_Task(void)
 {
+    xTaskCreate(System_Task, "System_Task", SYSTEM_TASK_STACK_WORDS, NULL, SYSTEM_TASK_PRIORITY, &system_task_handle);
+}
 
-	Init_Hardware_Layer();
-	
-
-	USB_CDC_Task_Start(); 
-	
-	// Check if semaphore creation succeeded
-	
-	/* This MUST be done before any device enables GPIO interrupts */
-	Hardware_Init_GPIO_Interrupts();
-	
-	/* Initialize PN532 Driver */
-	if (PN532_Init() != PN532_STATUS_OK) {
-		LOG_ERROR_SYSTEM(": PN532 Init failed, continuing without NFC\r\n");
-		pn532_initialized = false;
-	} else {
-		LOG_CRITICAL_SYSTEM("PN532: Initialized successfully\r\n");
-		pn532_initialized = true;
-	}
-
-	/* Initialize MIFARE Transaction Manager */
-	MIFARE_TransactionManager_Init();
-	
-	/* Start MIFARE card polling task */
-	MIFARE_StartPollingTask();
-	
-	/* Start tasks */
-	Task_Start_LCD_Display_Driver_Task();
-	
-	/* Initialize dispenser (includes YS-S201 flow sensor initialization) */
-	/* Safe to initialize now that global GPIO interrupt system is ready */
-	Task_Start_Dispenser_Control_Task();
-	
-	/* NOTE: YS-S201 flow sensor is initialized by Dispenser_Control task */
-	/* Do not initialize it here - it would create a second handle and cause data mismatch */
-	
-	/* Start SD Logger task for data logging */
-	Task_Start_SD_Logger_Task();
-
-	/* Tasks will handle notifications when ready */
-	
-	TaskHandle_t dispenser_handle = task_get_handle_Dispenser_Control_Task();
-	if (dispenser_handle != NULL)
-	{
-		xTaskNotifyGive(dispenser_handle);
-	}
-	
-	TaskHandle_t lcd_handle = task_get_handle_LCD_Display_Driver_Task();
-	if (lcd_handle != NULL)
-	{
-		xTaskNotifyGive(lcd_handle); /* Start LCD task */
-	}
+TaskHandle_t task_get_handle_System_Task(void)
+{
+    return system_task_handle;
 }
 
 /* ========================================================================== */
-/*                         STATE MACHINE IMPLEMENTATION                      */
+/*                         SEMAPHORE GETTER FUNCTIONS                        */
+/* ========================================================================== */
+
+SemaphoreHandle_t System_GetGpioSemaphore(void)
+{
+    return gpio_semaphore;
+}
+
+SemaphoreHandle_t System_GetI2C0Semaphore(void)
+{
+    return i2c_semaphore;
+}
+
+SemaphoreHandle_t System_GetI2C1Semaphore(void)
+{
+    return i2c_1_Semaphore;
+}
+
+SemaphoreHandle_t System_GetMuxSemaphore(void)
+{
+    return mux_semaphore;
+}
+
+SemaphoreHandle_t System_GetSPI1Semaphore(void)
+{
+    return spi_1_Semaphore;
+}
+
+/* ========================================================================== */
+/*                    WATCHDOG TASK HEALTH REPORTING API                     */
 /* ========================================================================== */
 
 /**
- * @brief Change to a new state
- * @param new_state The state to transition to
+ * @brief Tasks call this to report their running status
+ * @param task_id Unique task identifier from System_Task_ID_t enum
+ * @param is_running_ok true if task is healthy, false if error detected
  */
-static void change_state(SystemState_t new_state)
+void System_ReportTaskStatus(System_Task_ID_t task_id, bool is_running_ok)
 {
-	if (system_context.current_state != new_state) {
-		system_context.previous_state = system_context.current_state;
-		system_context.current_state = new_state;
-		system_context.state_entry_time = xTaskGetTickCount();
-		system_context.time_in_state = 0;
-	}
+    Task_ID_t internal_id = (Task_ID_t)task_id;
+    static bool usb_mutex_not_ready_logged = false;
+    static bool usb_first_success_logged = false;
+    
+    if (internal_id >= TASK_ID_COUNT) {
+        LOG_ERROR_SYSTEM("[WDT] Invalid task ID: %d (max=%d)\r\n", internal_id, TASK_ID_COUNT);
+        return;
+    }
+    
+    if (!s_wdt_status_mutex) {
+        /* Silently ignore during early boot before mutex created */
+        if (internal_id == TASK_ID_USB_COMMAND_HANDLER && !usb_mutex_not_ready_logged) {
+            USB_Log_Printf("[WDT_DBG] USB_Command waiting for mutex initialization...\r\n");
+            usb_mutex_not_ready_logged = true;
+        }
+        return;
+    }
+    
+    if (xSemaphoreTake(s_wdt_status_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        TickType_t tick = xTaskGetTickCount();
+        s_task_wdt_status[internal_id].status = is_running_ok ? TASK_STATUS_RUNNING : TASK_STATUS_ERROR;
+        s_task_wdt_status[internal_id].last_report_tick = tick;
+        
+        if (internal_id == TASK_ID_USB_COMMAND_HANDLER && !usb_first_success_logged) {
+            USB_Log_Printf("[WDT_DBG] USB_Command now reporting successfully (tick=%lu)\r\n", tick);
+            usb_first_success_logged = true;
+        }
+        
+        xSemaphoreGive(s_wdt_status_mutex);
+    } else {
+        /* Failed to take mutex - likely System_Task holding it for logging */
+        if (internal_id == TASK_ID_USB_COMMAND_HANDLER) {
+            USB_Log_Printf("[WDT_DBG] USB_Command report failed - mutex timeout\r\n");
+        }
+    }
 }
 
+/* ========================================================================== */
+/*                    MODULE RUNTIME CONTROL API                              */
+/* ========================================================================== */
+
 /**
- * @brief STARTUP state - Wait for system to stabilize
+ * @brief Get module name string
  */
-static void state_startup(void)
+const char* System_GetModuleName(System_Module_t module)
 {
-	// Wait 2 seconds for USB CDC to initialize
-	if (system_context.time_in_state >= pdMS_TO_TICKS(2000)) {
-		LOG_CRITICAL_SYSTEM("[STATE] Startup complete, initializing hardware...\r\n");
-		change_state(SYSTEM_STATE_INITIALIZING);
-	}
+    if (module >= MODULE_COUNT) {
+        return "Unknown";
+    }
+    return s_module_names[module];
 }
 
 /**
- * @brief INITIALIZING state - Perform all hardware initialization
+ * @brief Get current state of a module
  */
-static void state_initializing(void)
+Module_State_t System_GetModuleState(System_Module_t module)
 {
-	systemInitialisations();
-	LOG_CRITICAL_SYSTEM("[STATE] Initialization complete, entering idle state\r\n");
-	change_state(SYSTEM_STATE_IDLE);
+    if (module >= MODULE_COUNT) {
+        return MODULE_STATE_ERROR;
+    }
+    return s_module_states[module];
 }
 
 /**
- * @brief IDLE state - Normal operation, waiting for events
+ * @brief Start a module at runtime
  */
+bool System_StartModule(System_Module_t module)
+{
+    if (module >= MODULE_COUNT) {
+        LOG_ERROR_SYSTEM("[MODULES] Invalid module ID: %d\r\n", module);
+        return false;
+    }
+    
+    /* Check if already running */
+    if (s_module_states[module] == MODULE_STATE_RUNNING) {
+        LOG_CRITICAL_SYSTEM("[MODULES] %s already running\r\n", s_module_names[module]);
+        return true;
+    }
+    
+    LOG_CRITICAL_SYSTEM("[MODULES] Starting %s...\r\n", s_module_names[module]);
+    
+    bool success = false;
+    
+    switch (module) {
+        case MODULE_LCD_DISPLAY:
+            Task_Start_LCD_Display_Driver_Task();
+            success = true;
+            break;
+            
+        case MODULE_MIFARE_POLLING:
+            /* Requires PN532 to be initialized - check handle exists */
+            if (pn532_handle != NULL) {
+                MIFARE_StartPollingTask();
+                s_mifare_polling_enabled = true;
+                success = true;
+            } else {
+                LOG_ERROR_SYSTEM("[MODULES] Cannot start MIFARE - PN532 not initialized\r\n");
+                success = false;
+            }
+            break;
+            
+        case MODULE_DISPENSER:
+            Task_Start_Dispenser_Task();
+            success = true;
+            break;
+            
+        case MODULE_BUZZER:
+            /* Requires buzzer to be initialized */
+            if (buzzer_handle != NULL && Buzzer_IsInitialized(buzzer_handle)) {
+                Buzzer_StartPollingTask(buzzer_handle);
+                s_buzzer_polling_enabled = true;
+                success = true;
+            } else {
+                LOG_ERROR_SYSTEM("[MODULES] Cannot start Buzzer - not initialized\r\n");
+                success = false;
+            }
+            break;
+            
+        case MODULE_IO_EXPANDER:
+            Task_Start_IO_Expander_Control_Task();
+            success = true;
+            break;
+            
+        case MODULE_RS485:
+            Task_Start_RS485_Task();
+            success = true;
+            break;
+            
+        default:
+            LOG_ERROR_SYSTEM("[MODULES] Unknown module: %d\r\n", module);
+            success = false;
+            break;
+    }
+    
+    if (success) {
+        s_module_states[module] = MODULE_STATE_RUNNING;
+        LOG_CRITICAL_SYSTEM("[✓] %s started\r\n", s_module_names[module]);
+    } else {
+        s_module_states[module] = MODULE_STATE_ERROR;
+        LOG_ERROR_SYSTEM("[✗] %s failed to start\r\n", s_module_names[module]);
+    }
+    
+    return success;
+}
+
 /**
- * @brief IDLE state - Normal operation, waiting for events
+ * @brief Stop a module at runtime
+ * @note Not all modules support stopping - some FreeRTOS tasks cannot be cleanly deleted
  */
-static void state_idle(void)
+bool System_StopModule(System_Module_t module)
 {
-	// Check if interrupt is pending
-	if (system_context.interrupt_pending) {
-		system_context.interrupt_pending = false;
-		change_state(SYSTEM_STATE_PROCESSING_INPUT);
-		return;
-	}
-	
-	// MIFARE card polling now handled by dedicated MIFARE_Polling_Task
-	// (Moved out of System task to avoid priority/starvation issues)
-	
-	// Increment diagnostic counter
-	system_context.diagnostic_counter++;
-	
-	// Every 5 seconds, run diagnostics
-	if (system_context.diagnostic_counter >= 500) {  // 500 * 10ms = 5 seconds
-		change_state(SYSTEM_STATE_DIAGNOSTICS);
-	}
+    if (module >= MODULE_COUNT) {
+        LOG_ERROR_SYSTEM("[MODULES] Invalid module ID: %d\r\n", module);
+        return false;
+    }
+    
+    /* Check if already stopped */
+    if (s_module_states[module] == MODULE_STATE_STOPPED) {
+        LOG_CRITICAL_SYSTEM("[MODULES] %s already stopped\r\n", s_module_names[module]);
+        return true;
+    }
+    
+    LOG_CRITICAL_SYSTEM("[MODULES] Stopping %s...\r\n", s_module_names[module]);
+    
+    bool success = false;
+    
+    switch (module) {
+        case MODULE_LCD_DISPLAY:
+            Task_Stop_LCD_Display_Driver_Task();
+            success = true;
+            break;
+            
+        case MODULE_MIFARE_POLLING:
+            MIFARE_StopPollingTask();
+            s_mifare_polling_enabled = false;
+            success = true;
+            break;
+            
+        case MODULE_DISPENSER:
+            Task_Stop_Dispenser_Task();
+            success = true;
+            break;
+            
+        case MODULE_BUZZER:
+            if (buzzer_handle != NULL) {
+                Buzzer_StopPollingTask(buzzer_handle);
+                s_buzzer_polling_enabled = false;
+                success = true;
+            }
+            break;
+            
+        case MODULE_IO_EXPANDER:
+            Task_Stop_IO_Expander_Control_Task();
+            success = true;
+            break;
+            
+        case MODULE_RS485:
+            /* RS485 task doesn't support runtime stop yet */
+            LOG_ERROR_SYSTEM("[MODULES] RS485 module cannot be stopped at runtime\r\n");
+            success = false;
+            break;
+            
+        default:
+            LOG_ERROR_SYSTEM("[MODULES] Unknown module: %d\r\n", module);
+            success = false;
+            break;
+    }
+    
+    if (success) {
+        s_module_states[module] = MODULE_STATE_STOPPED;
+        LOG_CRITICAL_SYSTEM("[✓] %s stopped\r\n", s_module_names[module]);
+    } else {
+        LOG_ERROR_SYSTEM("[✗] %s cannot be stopped\r\n", s_module_names[module]);
+    }
+    
+    return success;
 }
 
 /**
- * @brief PROCESSING_INPUT state - Handle CAT9555 interrupt
+ * @brief Print status of all modules
  */
-static void state_processing_input(void)
+void System_PrintModuleStatus(void)
 {
-	LOG_DEBUG_SYSTEM("CAT9555 interrupt notification received! Total count: %lu\r\n", cat9555_interrupt_count);
-	
-	// Refresh input cache with 5 reads with 10ms delays to debounce (50ms total)
-	for (int i = 0; i < 5; i++) {
-		CAT9555_RefreshInputCache(&cat9555_handle);  // I2C read updates cache
-		poll_CAT9555_UserButton();  // Read from cache (no I2C)
-		vTaskDelay(pdMS_TO_TICKS(10));
-	}
-	
-	// Return to idle state
-	change_state(SYSTEM_STATE_IDLE);
+    const SystemConfig_t* cfg = Config_Get();
+    
+    USB_Log_Printf("\r\n═══════════════════════════════════════════════════════════════\r\n");
+    USB_Log_Printf("                    MODULE STATUS                                \r\n");
+    USB_Log_Printf("═══════════════════════════════════════════════════════════════\r\n");
+    USB_Log_Printf("%-20s %-12s %-12s\r\n", "Module", "Boot Config", "Runtime State");
+    USB_Log_Printf("───────────────────────────────────────────────────────────────\r\n");
+    
+    const bool boot_enabled[MODULE_COUNT] = {
+        cfg->modules.lcd_display_enabled,
+        cfg->modules.mifare_polling_enabled,
+        cfg->modules.dispenser_enabled,
+        cfg->modules.buzzer_enabled,
+        cfg->modules.io_expander_enabled,
+        cfg->modules.rs485_enabled
+    };
+    
+    const char* state_names[] = {"STOPPED", "RUNNING", "ERROR"};
+    
+    for (int i = 0; i < MODULE_COUNT; i++) {
+        USB_Log_Printf("%-20s %-12s %-12s\r\n",
+                      s_module_names[i],
+                      boot_enabled[i] ? "Enabled" : "Disabled",
+                      state_names[s_module_states[i]]);
+    }
+    
+    USB_Log_Printf("═══════════════════════════════════════════════════════════════\r\n");
+    USB_Log_Printf("\r\nCommands: start <module>, stop <module>\r\n");
+    USB_Log_Printf("Modules: lcd, mifare, dispenser, buzzer, ioexp, rs485\r\n");
 }
-
-/**
- * @brief DIAGNOSTICS state - Run periodic system diagnostics
- */
-static void state_diagnostics(void)
-{
-	system_context.diagnostic_counter = 0;
-	
-	uint32_t current_count = cat9555_interrupt_count;
-	if (current_count != system_context.last_interrupt_count) {
-		LOG_DEBUG_SYSTEM("[CAT9555] Interrupt count: %lu (delta: %lu)\r\n", 
-		               current_count, current_count - system_context.last_interrupt_count);
-		system_context.last_interrupt_count = current_count;
-	}
-	
-#if defined(PICO_BUILD) || defined(PICO_BOARD)
-	/* Return to idle state */
-#endif
-	
-	change_state(SYSTEM_STATE_IDLE);
-}
-
-/**
- * @brief ERROR state - Handle system errors
- */
-static void state_error(void)
-{
-	LOG_DEBUG_SYSTEM("[ERROR] System in error state\r\n");
-	
-	if (system_context.time_in_state >= pdMS_TO_TICKS(1000)) {
-		LOG_DEBUG_SYSTEM("[ERROR] Attempting recovery...\r\n");
-		change_state(SYSTEM_STATE_IDLE);
-	}
-}
-
-/**
- * @brief SHUTDOWN state - Graceful system shutdown
- */
-static void state_shutdown(void)
-{
-	LOG_DEBUG_SYSTEM("[STATE] System shutdown requested\r\n");
-	
-	// Perform cleanup operations
-	// ...
-	
-	// Suspend task
-	vTaskSuspend(NULL);
-}
-
-/**
-* @brief Send a GPIO event message to the display queue (local wrapper)
-* @param pin_id GPIO pin identifier
-* @param pin_state Pin state (0=LOW, 1=HIGH)
-* @param bank_id Bank ID for I2C expanders (0 for direct GPIO)
-* @param source Event source identifier
-*/
-static void send_gpio_event(uint8_t pin_id, uint8_t pin_state, uint8_t bank_id, EVENT_SOURCE_Enum source)
-{
-	/* Stub for future implementation */
-	(void)pin_id;
-	(void)pin_state;
-	(void)bank_id;
-	(void)source;
-}
-
-/**
- * @brief Process dispensing logic when user button is pressed
- */
-static void process_dispensing_logic(void)
-{
-	static uint32_t button_press_count = 0;
-	uint32_t amount_to_dispense = 100; // Dispense 100mL per trigger
-	
-	button_press_count++;
-	
-	// Get actual balance from the card
-	uint32_t current_balance = MIFARE_GetBalanceML();
-	
-	LOG_DEBUG_SYSTEM("Dispense Trigger #%u - Card Balance: %u mL\r\n", button_press_count, current_balance);
-	
-	if (current_balance < amount_to_dispense) {
-		LOG_DEBUG_SYSTEM("Insufficient balance to dispense %u mL\r\n", amount_to_dispense);
-		return;
-	}
-	
-	if (MIFARE_BeginTransaction(amount_to_dispense) == MIFARE_RESULT_OK) {
-		MIFARE_UpdateTransactionProgress(amount_to_dispense, 10.0f);
-		
-		// Commit the transaction to the card
-		if (MIFARE_CommitTransaction() == MIFARE_RESULT_OK) {
-			// Get updated balance after transaction
-			current_balance = MIFARE_GetBalanceML();
-			LOG_DEBUG_SYSTEM("Dispense successful. New Balance: %u mL\r\n", current_balance);
-			
-			/* UI will automatically poll and update display - no direct UI calls needed */
-		} else {
-			LOG_DEBUG_SYSTEM("Transaction commit failed!\r\n");
-		}
-	} else {
-		LOG_DEBUG_SYSTEM("Failed to begin transaction (Busy or Error)\r\n");
-	}
-}
-
-/**
-* @brief Poll the state of CAT9555 user button pin (interrupt-driven mode)
-* @details Reads from cache (NO I2C) - cache must be refreshed via CAT9555_RefreshInputCache() first
-*          Uses CAT9555_PIN_USER_BUTTON definition from Hardware_Access.h
-*          Compares against cached state in the handle's current_pin_states field
-*          Implements debouncing by requiring 3 consecutive stable reads
-*          INTERRUPT-DRIVEN: No I2C access in this function - reads from cache only
-*/
-static void poll_CAT9555_UserButton(void)
-{
-	static uint32_t poll_counter = 0;
-	static uint32_t error_counter = 0;
-	static uint8_t debounce_counter = 0;
-	static uint8_t debounce_state = 0xFF; /* State being debounced */
-	static uint8_t last_stable_state = 0xFF; /* Last accepted stable state */
-	uint8_t current_raw_state;
-	uint8_t previous_state;
-	
-	#define DEBOUNCE_COUNT 3  /* Require 3 consecutive stable reads (30ms at 10ms intervals) */
-	
-	/* Extract previous state from handle's cached pin states BEFORE reading new state */
-	previous_state = (cat9555_handle.current_pin_states >> IO_PIN_USER_BUTTON) & 0x01;
-	
-	/* Initialize last_stable_state on first run */
-	if (last_stable_state == 0xFF) {
-		last_stable_state = previous_state;
-	}
-	
-	/* Read current state from cache (NO I2C - interrupt-driven mode) */
-	/* Cache is updated by CAT9555_RefreshInputCache() called after interrupt */
-	CAT9555_Status_t status = CAT9555_GetCachedInput(&cat9555_handle, IO_PIN_USER_BUTTON, &current_raw_state);
-	
-	if (status == CAT9555_OK) {
-		// current_raw_state now contains the cached pin state (no I2C transaction)
-		
-		/* Debounce logic: require consecutive stable reads before accepting state change */
-		if (current_raw_state != last_stable_state) {
-			/* Potential state change detected */
-			if (debounce_state == current_raw_state) {
-				/* Same new state as last time - increment counter */
-				debounce_counter++;
-				
-				if (debounce_counter >= DEBOUNCE_COUNT) {
-					/* State has been stable for required count - accept the change */
-					LOG_DEBUG_SYSTEM("User Button (Pin %d) state changed: %s -> %s (0x%02X)\r\n", 
-					               IO_PIN_USER_BUTTON, 
-					               last_stable_state ? "HIGH" : "LOW",
-					               current_raw_state ? "HIGH" : "LOW", 
-					               current_raw_state);
-					
-					/* Send GPIO event to display task */
-					send_gpio_event(IO_PIN_USER_BUTTON, current_raw_state, 1, EVENT_SOURCE_CAT9555_PIN);
-					
-					/* UI will automatically poll button state - no direct UI call needed */
-					
-					/* Detect LOW to HIGH transition (button press) */
-					if (last_stable_state == 0 && current_raw_state == 1) {
-						#ifdef DISPENSE_ON_BUTTON_PRESS
-						process_dispensing_logic();
-						#endif
-					}
-					
-					/* Update last stable state */
-					last_stable_state = current_raw_state;
-					
-					/* Note: Cache is already updated by CAT9555_RefreshInputCache() in interrupt handler */
-					
-					/* Reset debounce counter */
-					debounce_counter = 0;
-					debounce_state = 0xFF;
-				}
-			} else {
-				/* Different state than we were debouncing - restart debounce */
-				debounce_state = current_raw_state;
-				debounce_counter = 1;
-			}
-		} else {
-			/* State matches last stable - reset debounce tracking */
-			debounce_counter = 0;
-			debounce_state = 0xFF;
-			
-			/* State unchanged - log periodically every 100 polls (approximately 1 second at 10ms intervals) */
-			poll_counter++;
-			if (poll_counter >= 100) {
-				
-				poll_counter = 0;
-			}
-		}
-	} else {
-		/* Error reading pin state */
-		error_counter++;
-		if (error_counter >= 50) { /* Log errors every 50 failures (approximately 500ms) */
-			LOG_ERROR_SYSTEM(": Failed to read User Button (Pin %d) state: %s\r\n", 
-			               IO_PIN_USER_BUTTON, CAT9555_GetStatusString(status));
-			error_counter = 0;
-		}
-	}
-	
-	#undef DEBOUNCE_COUNT
-}
-
-
-void Task_Start_System_Task()
-{
-
-	xTaskCreate(System_Task, "System Task", SYSTEM_TASK_STACK_WORDS, NULL, SYSTEM_TASK_PRIORITY, &System_Task_TaskHandle);
-}
-
-
-

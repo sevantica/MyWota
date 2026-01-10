@@ -25,14 +25,17 @@
 #include "hardware/uart.h"
 #include "hardware/pwm.h"
 #include "hardware/clocks.h"
+#include "hardware/dma.h"
 #include "FreeRTOS.h"
 #include "semphr.h"
+
+#define I2C_TIMEOUT_US 50000  /* 50ms timeout for I2C operations */
 
 /* ===================================================================== */
 /* Hardware Configuration Constants                                     */
 /* ===================================================================== */
 
-#define SPI_0_BAUDRATE          10000000    // 10 MHz for LCD and SD card
+#define SPI_0_BAUDRATE          62500000    // 62.5 MHz (RP2040 max) for LCD and SD card
 #define I2C_0_BAUDRATE          400000      // 400 kHz for NFC/RFID and I/O expander
 #define I2C_1_BAUDRATE          400000      // 400 kHz for secondary I2C bus
 
@@ -159,6 +162,9 @@ static bool i2c_0_initialized = false;
 static bool i2c_1_initialized = false;
 static uint8_t pwm_slice_initialized = 0;  // Bitmask for initialized PWM slices (8 slices)
 
+/* DMA channel for SPI TX */
+static int spi_0_dma_tx_channel = -1;
+
 /* SPI mutex for thread-safe access */
 static SemaphoreHandle_t spi_0_mutex = NULL;
 
@@ -188,7 +194,7 @@ void Init_Hardware_Layer(void)
 }
 
 /**
- * @brief Initialize SPI0 peripheral
+ * @brief Initialize SPI0 peripheral with DMA support
  * @param baudrate SPI clock frequency in Hz
  */
 void Init_SPI_0(uint32_t baudrate)
@@ -201,6 +207,20 @@ void Init_SPI_0(uint32_t baudrate)
     gpio_set_function(SPI_0_SCK, GPIO_FUNC_SPI);
     gpio_set_function(SPI_0_MOSI, GPIO_FUNC_SPI);
     gpio_set_function(SPI_0_MISO, GPIO_FUNC_SPI);
+    
+    // Claim a DMA channel for SPI TX
+    spi_0_dma_tx_channel = dma_claim_unused_channel(true);
+    
+    // Configure DMA channel for SPI TX
+    dma_channel_config c = dma_channel_get_default_config(spi_0_dma_tx_channel);
+    channel_config_set_transfer_data_size(&c, DMA_SIZE_8);
+    channel_config_set_dreq(&c, spi_get_dreq(SPI_0, true));  // TX DREQ
+    channel_config_set_read_increment(&c, true);   // Increment read address
+    channel_config_set_write_increment(&c, false); // Fixed write address (SPI DR)
+    
+    // Save config for later use (will be applied when writing)
+    dma_channel_set_config(spi_0_dma_tx_channel, &c, false);
+    dma_channel_set_write_addr(spi_0_dma_tx_channel, &spi_get_hw(SPI_0)->dr, false);
     
     spi_0_initialized = true;
 }
@@ -215,7 +235,11 @@ bool SPI_0_Acquire(void)
     if (spi_0_mutex == NULL) {
         return false;
     }
-    return xSemaphoreTake(spi_0_mutex, pdMS_TO_TICKS(SPI_MUTEX_TIMEOUT_MS)) == pdTRUE;
+    if (xSemaphoreTake(spi_0_mutex, pdMS_TO_TICKS(SPI_MUTEX_TIMEOUT_MS)) == pdTRUE) {
+        return true;
+    }
+    USB_Log_Printf("[SPI] TIMEOUT acquiring mutex from %s!\r\n", pcTaskGetName(NULL));
+    return false;
 }
 
 /**
@@ -251,13 +275,27 @@ uint8_t SPI_0_ReadByte_Raw(uint8_t repeated_tx_data)
 }
 
 /**
- * @brief Write buffer to SPI0 (no CS control, no mutex - caller must acquire first)
+ * @brief Write buffer to SPI0 using DMA (no CS control, no mutex - caller must acquire first)
  * @param src Source buffer
  * @param len Number of bytes to write
+ * @note Uses DMA for transfers >= 32 bytes, blocking for smaller transfers
  */
 void SPI_0_WriteBuffer_Raw(const uint8_t *src, size_t len)
 {
-    spi_write_blocking(SPI_0, src, len);
+    // Use DMA for larger transfers (reduces CPU load during display updates)
+    if (spi_0_dma_tx_channel >= 0 && len >= 32) {
+        dma_channel_set_read_addr(spi_0_dma_tx_channel, src, false);
+        dma_channel_set_trans_count(spi_0_dma_tx_channel, len, true);  // Start transfer
+        dma_channel_wait_for_finish_blocking(spi_0_dma_tx_channel);
+        
+        // Wait for SPI FIFO to drain completely
+        while (spi_is_busy(SPI_0)) {
+            tight_loop_contents();
+        }
+    } else {
+        // Small transfers use blocking (faster for small data)
+        spi_write_blocking(SPI_0, src, len);
+    }
 }
 
 /**
@@ -295,22 +333,36 @@ void SPI_0_SetFormat(uint8_t data_bits, uint8_t cpol, uint8_t cpha)
 }
 
 /**
+ * @brief Generic I2C initialization helper
+ * @param instance I2C peripheral instance (I2C_0 or I2C_1)
+ * @param sda_pin SDA pin number
+ * @param scl_pin SCL pin number
+ * @param initialized_flag Pointer to initialization flag
+ * @param baudrate I2C clock frequency in Hz
+ */
+static void Init_I2C_Generic(i2c_inst_t *instance, uint sda_pin, uint scl_pin, 
+                             bool *initialized_flag, uint32_t baudrate)
+{
+    if (*initialized_flag) {
+        return;  // Already initialized
+    }
+    
+    i2c_init(instance, baudrate);
+    gpio_set_function(sda_pin, GPIO_FUNC_I2C);
+    gpio_set_function(scl_pin, GPIO_FUNC_I2C);
+    gpio_pull_up(sda_pin);
+    gpio_pull_up(scl_pin);
+    
+    *initialized_flag = true;
+}
+
+/**
  * @brief Initialize I2C0 peripheral
  * @param baudrate I2C clock frequency in Hz (typically 100000 or 400000)
  */
 void Init_I2C_0(uint32_t baudrate)
 {
-    if (i2c_0_initialized) {
-        return;  // Already initialized
-    }
-    
-    i2c_init(I2C_0, baudrate);
-    gpio_set_function(I2C_0_SDA, GPIO_FUNC_I2C);
-    gpio_set_function(I2C_0_SCL, GPIO_FUNC_I2C);
-    gpio_pull_up(I2C_0_SDA);
-    gpio_pull_up(I2C_0_SCL);
-    
-    i2c_0_initialized = true;
+    Init_I2C_Generic(I2C_0, I2C_0_SDA, I2C_0_SCL, &i2c_0_initialized, baudrate);
 }
 
 /**
@@ -319,17 +371,7 @@ void Init_I2C_0(uint32_t baudrate)
  */
 void Init_I2C_1(uint32_t baudrate)
 {
-    if (i2c_1_initialized) {
-        return;  // Already initialized
-    }
-    
-    i2c_init(I2C_1, baudrate);
-    gpio_set_function(I2C_1_SDA, GPIO_FUNC_I2C);
-    gpio_set_function(I2C_1_SCL, GPIO_FUNC_I2C);
-    gpio_pull_up(I2C_1_SDA);
-    gpio_pull_up(I2C_1_SCL);
-    
-    i2c_1_initialized = true;
+    Init_I2C_Generic(I2C_1, I2C_1_SDA, I2C_1_SCL, &i2c_1_initialized, baudrate);
 }
 
 /**
@@ -362,7 +404,7 @@ int I2C_0_WriteByte_Raw(uint8_t addr, uint8_t data)
  */
 int I2C_0_ReadByte_Raw(uint8_t addr, uint8_t *data)
 {
-    return i2c_read_blocking(I2C_0, addr, data, 1, false);
+    return i2c_read_timeout_us(I2C_0, addr, data, 1, false, I2C_TIMEOUT_US);
 }
 
 /**
@@ -375,7 +417,7 @@ int I2C_0_ReadByte_Raw(uint8_t addr, uint8_t *data)
  */
 int I2C_0_WriteBuffer_Raw(uint8_t addr, const uint8_t *src, size_t len, bool nostop)
 {
-    return i2c_write_blocking(I2C_0, addr, src, len, nostop);
+    return i2c_write_timeout_us(I2C_0, addr, src, len, nostop, I2C_TIMEOUT_US);
 }
 
 /**
@@ -388,7 +430,7 @@ int I2C_0_WriteBuffer_Raw(uint8_t addr, const uint8_t *src, size_t len, bool nos
  */
 int I2C_0_ReadBuffer_Raw(uint8_t addr, uint8_t *dst, size_t len, bool nostop)
 {
-    return i2c_read_blocking(I2C_0, addr, dst, len, nostop);
+    return i2c_read_timeout_us(I2C_0, addr, dst, len, nostop, I2C_TIMEOUT_US);
 }
 
 /**
@@ -409,7 +451,7 @@ int I2C_0_Write(uint8_t addr, const uint8_t *src, size_t len, bool nostop)
         return -1;  // Timeout acquiring mutex
     }
     
-    int result = i2c_write_blocking(I2C_0, addr, src, len, nostop);
+    int result = i2c_write_timeout_us(I2C_0, addr, src, len, nostop, I2C_TIMEOUT_US);
     
     xSemaphoreGive(i2c_0_mutex);
     return result;
@@ -433,7 +475,7 @@ int I2C_0_Read(uint8_t addr, uint8_t *dst, size_t len, bool nostop)
         return -1;  // Timeout acquiring mutex
     }
     
-    int result = i2c_read_blocking(I2C_0, addr, dst, len, nostop);
+    int result = i2c_read_timeout_us(I2C_0, addr, dst, len, nostop, I2C_TIMEOUT_US);
     
     xSemaphoreGive(i2c_0_mutex);
     return result;
@@ -459,14 +501,14 @@ int I2C_0_WriteRead(uint8_t addr, const uint8_t *src, size_t src_len, uint8_t *d
     }
     
     // Write with nostop=true to keep bus control
-    int write_result = i2c_write_blocking(I2C_0, addr, src, src_len, true);
+    int write_result = i2c_write_timeout_us(I2C_0, addr, src, src_len, true, I2C_TIMEOUT_US);
     if (write_result < 0) {
         xSemaphoreGive(i2c_0_mutex);
         return -1;
     }
     
     // Read with nostop=false to release bus
-    int result = i2c_read_blocking(I2C_0, addr, dst, dst_len, false);
+    int result = i2c_read_timeout_us(I2C_0, addr, dst, dst_len, false, I2C_TIMEOUT_US);
     
     xSemaphoreGive(i2c_0_mutex);
     return result;
@@ -581,15 +623,11 @@ bool Set_GPIO_PWM(uint32_t gpio, uint16_t duty_cycle, uint32_t frequency)
     
     // Get PWM slice and channel for this GPIO
     uint slice_num = pwm_gpio_to_slice_num(gpio);
-    // uint channel = pwm_gpio_to_channel(gpio);  // Unused for now
     
     // Check if this slice has been initialized
     bool slice_is_initialized = (pwm_slice_initialized & (1 << slice_num)) != 0;
     
     if (!slice_is_initialized) {
-        // Set GPIO function to PWM
-        gpio_set_function(gpio, GPIO_FUNC_PWM);
-        
         // Configure PWM frequency
         if (frequency == 0) {
             frequency = 1000;  // Default 1kHz
@@ -605,10 +643,24 @@ bool Set_GPIO_PWM(uint32_t gpio, uint16_t duty_cycle, uint32_t frequency)
         pwm_config config = pwm_get_default_config();
         pwm_config_set_clkdiv(&config, clock_div);
         pwm_config_set_wrap(&config, 65535);  // 16-bit resolution
-        pwm_init(slice_num, &config, true);   // Start PWM running
+        
+        // Initialize PWM slice but DON'T start it yet (false = don't start)
+        pwm_init(slice_num, &config, false);
+        
+        // Set duty cycle BEFORE starting PWM and switching GPIO function
+        // This ensures no glitch when the GPIO transitions to PWM mode
+        pwm_set_gpio_level(gpio, duty_cycle);
+        
+        // NOW start the PWM running
+        pwm_set_enabled(slice_num, true);
+        
+        // Finally switch GPIO to PWM function (output should already be at correct level)
+        gpio_set_function(gpio, GPIO_FUNC_PWM);
         
         // Mark slice as initialized
         pwm_slice_initialized |= (1 << slice_num);
+        
+        return true;
     }
     
     // Set duty cycle
@@ -679,12 +731,14 @@ void init_lcd_hw(void)
     // Initialize LCD control pins
     Init_GPIO_Output(LCD_DC_PIN);
     Init_GPIO_Output(LCD_RESET_PIN);
-    Init_GPIO_Output(LCD_BACKLIGHT_PIN);
+    
+    // Initialize backlight as PWM at 100% duty cycle (backlight OFF)
+    // Hardware uses inverted logic: 100% PWM = backlight off, 0% PWM = backlight on
+    Set_GPIO_PWM_Percent(LCD_BACKLIGHT_PIN, 100);
     
     // Set default states
     gpio_put(LCD_DC_PIN, 1);           // Data mode (default HIGH to prevent glitches)
     gpio_put(LCD_RESET_PIN, 0);        // Not in reset (inverted in HW)
-    gpio_put(LCD_BACKLIGHT_PIN, 0);    // Backlight off
 }
 
 /**

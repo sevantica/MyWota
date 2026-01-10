@@ -125,7 +125,6 @@ void Init_SPI_0(uint32_t baudrate);
 void Init_I2C_0(uint32_t baudrate);
 void Init_I2C_1(uint32_t baudrate);
 void Init_UART_0(uint32_t baudrate);
-void Init_UART_1(uint32_t baudrate);
 
 /* GPIO Initialization Functions */
 void Init_GPIO_Output(uint32_t gpio);
@@ -144,7 +143,6 @@ bool GPIO_Is_PWM_Capable(uint32_t gpio);
 bool Set_GPIO_PWM(uint32_t gpio, uint16_t duty_cycle, uint32_t frequency);
 bool Set_GPIO_PWM_Duty(uint32_t gpio, uint16_t duty_cycle);
 bool Set_GPIO_PWM_Percent(uint32_t gpio, uint8_t percent);
-void Disable_GPIO_PWM(uint32_t gpio);
 
 /* SPI Bus Control Functions */
 bool SPI_0_Acquire(void);
@@ -155,7 +153,6 @@ void SPI_0_WriteBuffer_Raw(const uint8_t *src, size_t len);
 void SPI_0_ReadBuffer_Raw(uint8_t repeated_tx_data, uint8_t *dst, size_t len);
 int SPI_0_Write(uint32_t cs_pin, const uint8_t *src, size_t len);
 int SPI_0_Read(uint32_t cs_pin, uint8_t repeated_tx_data, uint8_t *dst, size_t len);
-int SPI_0_Transfer(uint32_t cs_pin, const uint8_t *src, uint8_t *dst, size_t len);
 uint32_t SPI_0_SetBaudrate(uint32_t baudrate);
 void SPI_0_SetFormat(uint8_t data_bits, uint8_t cpol, uint8_t cpha);
 
@@ -170,24 +167,12 @@ int I2C_0_Write(uint8_t addr, const uint8_t *src, size_t len, bool nostop);
 int I2C_0_Read(uint8_t addr, uint8_t *dst, size_t len, bool nostop);
 int I2C_0_WriteRead(uint8_t addr, const uint8_t *src, size_t src_len, uint8_t *dst, size_t dst_len);
 
-/* I2C Bus Control Functions - I2C1 */
-bool I2C_1_Acquire(void);
-void I2C_1_Release(void);
-int I2C_1_WriteByte_Raw(uint8_t addr, uint8_t data);
-int I2C_1_ReadByte_Raw(uint8_t addr, uint8_t *data);
-int I2C_1_WriteBuffer_Raw(uint8_t addr, const uint8_t *src, size_t len, bool nostop);
-int I2C_1_ReadBuffer_Raw(uint8_t addr, uint8_t *dst, size_t len, bool nostop);
-int I2C_1_Write(uint8_t addr, const uint8_t *src, size_t len, bool nostop);
-int I2C_1_Read(uint8_t addr, uint8_t *dst, size_t len, bool nostop);
-int I2C_1_WriteRead(uint8_t addr, const uint8_t *src, size_t src_len, uint8_t *dst, size_t dst_len);
-
 /* Module-Specific Hardware Initialization Functions */
 void init_lcd_hw(void);
 void init_pcd_hw(void);
 void init_sd_hw(void);
 void init_io_expander_hw(void);
 void init_application_gpio_hw(void);
-void init_all_hw(void);
 
 /* Hardware Control Functions */
 void Hardware_GPIO_Set_State(uint32_t gpio, bool state);

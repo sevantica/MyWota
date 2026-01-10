@@ -19,14 +19,29 @@
 #include "queue.h"
 #include "semphr.h"
 #include "Hardware_Access.h"
-#include "Dispenser_Control.h"
 #include "RFID_RC522_Driver.h"
-#include "mywota_ui_driver.h"
+#include "MyWota_ui_driver.h"
+#include "Buzzer_Driver.h"
 
 
 
 
 /*Typedefs -----------------------------------------------------------*/
+
+/* Watchdog Task IDs - used for reporting task health */
+typedef enum {
+    SYSTEM_TASK_ID_SD_LOGGER = 0,
+    SYSTEM_TASK_ID_USB_CDC,
+    SYSTEM_TASK_ID_USB_COMMAND_HANDLER,
+    SYSTEM_TASK_ID_LCD_DISPLAY,
+    SYSTEM_TASK_ID_DISPENSER,
+    SYSTEM_TASK_ID_BUZZER_POLLING,
+    SYSTEM_TASK_ID_MIFARE_POLLING,
+    SYSTEM_TASK_ID_IO_EXPANDER,
+    SYSTEM_TASK_ID_RTC,
+    SYSTEM_TASK_ID_RS485,
+} System_Task_ID_t;
+
 typedef enum{
 
 EXP1_I2C_A0_POS	=0,
@@ -204,23 +219,86 @@ typedef DISPLAY_MSG_Def EVENT_MSG_Def;
 
 /* NOTE: IO_READ_STATE macro retained conceptually but adapted to FreeRTOS primitives. */
 #define IO_READ_STATE(pin_name) do { \
-	if(gpio_semaphore && xSemaphoreTake(gpio_semaphore, portMAX_DELAY)==pdTRUE){ \
+	SemaphoreHandle_t _gpio_sem = System_GetGpioSemaphore(); \
+	if(_gpio_sem && xSemaphoreTake(_gpio_sem, portMAX_DELAY)==pdTRUE){ \
 		system_io_collection[pin_name##_POS].requestTime = xTaskGetTickCount(); \
 		system_io_collection[pin_name##_POS].rw = IO_read; \
 		QueueHandle_t q = get_msg_queue_io(); \
 		if(q) xQueueSend(q, &system_io_collection[pin_name##_POS], pdMS_TO_TICKS(100)); \
-		xSemaphoreGive(gpio_semaphore); \
+		xSemaphoreGive(_gpio_sem); \
 		vTaskDelay(pdMS_TO_TICKS(2)); \
 	} \
 } while(0)
 
-/*Extern Variables ---------------------------------------------------*/
-extern SemaphoreHandle_t gpio_semaphore;
-extern SemaphoreHandle_t i2c_semaphore;
-extern SemaphoreHandle_t i2c_1_Semaphore;
-extern SemaphoreHandle_t mux_semaphore;
+/*Function Prototypes ------------------------------------------------*/
+
+/* Semaphore Getter Functions - modules poll these instead of direct access */
+SemaphoreHandle_t System_GetGpioSemaphore(void);
+SemaphoreHandle_t System_GetI2C0Semaphore(void);
+SemaphoreHandle_t System_GetI2C1Semaphore(void);
+SemaphoreHandle_t System_GetMuxSemaphore(void);
+SemaphoreHandle_t System_GetSPI1Semaphore(void);
+
+/* Task Handle Getter Functions */
+TaskHandle_t task_get_handle_System_Task(void);
+
+/* Driver Handle Getter Functions */
+Buzzer_Handle_t* System_GetBuzzerHandle(void);
+
+/* Watchdog Task Health Reporting - tasks call this to report they're running */
+void System_ReportTaskStatus(System_Task_ID_t task_id, bool is_running_ok);
 
 void Task_Start_System_Task();
+
+/* Module Runtime Control - Start/Stop modules dynamically */
+typedef enum {
+    MODULE_LCD_DISPLAY = 0,
+    MODULE_MIFARE_POLLING,
+    MODULE_DISPENSER,
+    MODULE_BUZZER,
+    MODULE_IO_EXPANDER,
+    MODULE_RS485,
+    MODULE_COUNT
+} System_Module_t;
+
+typedef enum {
+    MODULE_STATE_STOPPED = 0,
+    MODULE_STATE_RUNNING,
+    MODULE_STATE_ERROR
+} Module_State_t;
+
+/**
+ * @brief Start a module at runtime
+ * @param module Module to start
+ * @return true if module started successfully
+ */
+bool System_StartModule(System_Module_t module);
+
+/**
+ * @brief Stop a module at runtime
+ * @param module Module to stop
+ * @return true if module stopped successfully
+ */
+bool System_StopModule(System_Module_t module);
+
+/**
+ * @brief Get current state of a module
+ * @param module Module to query
+ * @return Current module state
+ */
+Module_State_t System_GetModuleState(System_Module_t module);
+
+/**
+ * @brief Get module name string
+ * @param module Module ID
+ * @return Module name string
+ */
+const char* System_GetModuleName(System_Module_t module);
+
+/**
+ * @brief Print status of all modules
+ */
+void System_PrintModuleStatus(void);
 
 void* getUIComponent(uint8_t type);
 
@@ -229,43 +307,6 @@ QueueHandle_t get_msg_queue_spi_tx();
 QueueHandle_t get_msg_queue_picc();
 // Removed undefined get_msg_queue_display declaration
 
-/* ========================================================================== */
-/*                         EVENT UTILITY FUNCTIONS - DEPRECATED             */
-/* ========================================================================== */
-/* NOTE: UI now uses getter functions to poll data instead of events */
-
-/**
- * @brief Send a sensor reading event
- * @param sensor_id Sensor identifier
- * @param sensor_type Sensor type
- * @param sensor_value Sensor reading value
- * @param sensor_status Sensor status flags
- * @param source Event source identifier
- * @return pdTRUE if event sent successfully, pdFALSE otherwise
- */
-BaseType_t send_event_sensor(uint8_t sensor_id, uint8_t sensor_type, uint32_t sensor_value, uint8_t sensor_status, EVENT_SOURCE_Enum source);
-
-/**
- * @brief Send a system state change event
- * @param component System component identifier
- * @param state New system state
- * @param error_code Error code if applicable
- * @param additional_info Additional context information
- * @param source Event source identifier
- * @return pdTRUE if event sent successfully, pdFALSE otherwise
- */
-BaseType_t send_event_system_state(uint8_t component, uint8_t state, uint16_t error_code, uint32_t additional_info, EVENT_SOURCE_Enum source);
-
-/**
- * @brief Send a user input event
- * @param input_id Input source identifier
- * @param input_type Input type (button, touch, etc.)
- * @param input_action Action (press, release, hold)
- * @param input_duration Duration of input in milliseconds
- * @param source Event source identifier
- * @return pdTRUE if event sent successfully, pdFALSE otherwise
- */
-BaseType_t send_event_user_input(uint8_t input_id, uint8_t input_type, uint8_t input_action, uint32_t input_duration, EVENT_SOURCE_Enum source);
 
 
 #endif /* APPLICATION_INCLUDE_SYSTEM_H_ */

@@ -2,7 +2,7 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Build and Flash (Picotool)",
+            "name": "Build and Flash with Bootloader",
             "type": "cppdbg",
             "request": "launch",
             "program": "${workspaceFolder}/build/UI_PICO_PORT.elf",
@@ -13,7 +13,7 @@
             "externalConsole": false,
             "MIMode": "gdb",
             "miDebuggerPath": "${env:USERPROFILE}/.pico-sdk/toolchain/14_2_Rel1/bin/arm-none-eabi-gdb.exe",
-            "preLaunchTask": "Build and Flash (Picotool)",
+            "preLaunchTask": "Build and Flash with Bootloader",
             "setupCommands": [
                 {
                     "description": "Enable pretty-printing for gdb",
@@ -28,7 +28,7 @@
             }
         },
         {
-            "name": "Flash Only (Picotool)",
+            "name": "Flash Only with Bootloader",
             "type": "cppdbg",
             "request": "launch",
             "program": "${workspaceFolder}/build/UI_PICO_PORT.elf",
@@ -39,7 +39,7 @@
             "externalConsole": false,
             "MIMode": "gdb",
             "miDebuggerPath": "${env:USERPROFILE}/.pico-sdk/toolchain/14_2_Rel1/bin/arm-none-eabi-gdb.exe",
-            "preLaunchTask": "Flash with Picotool",
+            "preLaunchTask": "Flash with Bootloader",
             "setupCommands": [
                 {
                     "description": "Enable pretty-printing for gdb",

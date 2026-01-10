@@ -30,8 +30,9 @@
 
 /*Extern Variables ---------------------------------------------------*/
 
-void Task_Start_LCD_Display_Driver_Task();
-TaskHandle_t task_get_handle_LCD_Display_Driver_Task();
+void Task_Start_LCD_Display_Driver_Task(void);
+void Task_Stop_LCD_Display_Driver_Task(void);
+TaskHandle_t task_get_handle_LCD_Display_Driver_Task(void);
 
 /* LCD Backlight Control Functions */
 void lcd_backlight_on(uint8_t brightness);  /* brightness: 0-100 with gamma correction */
@@ -57,10 +58,7 @@ void lcd_rotate_display(uint8_t rotation);
 void lcd_hardware_test(void);
 void lcd_basic_init(void);
 
-/* UI Update Functions - Generic */
-bool ui_set_visibility(lv_obj_t * obj, bool visible);
-bool ui_set_label_text(lv_obj_t * label, const char * text);
-bool ui_set_bar_value(lv_obj_t * bar, int32_t value, lv_anim_enable_t anim);
-bool ui_set_obj_style_bg_color(lv_obj_t * obj, lv_color_t color, lv_style_selector_t selector);
+/* Note: UI update functions are now internal to MyWota_ui_driver.c
+ * Modules should provide getters which the UI task polls. */
 
 #endif /* APPLICATION_INCLUDE_MYWOTA_UI_DRIVER_H_ */

@@ -19,35 +19,41 @@
 
 /* Includes ------------------------------------------------------------------*/
 #include "MIFARE_Transaction_Manager.h"
+#include "MIFARE_Classic_Driver.h"
+#include "MIFARE_Security.h"
+#include "System_Config.h"
 #include "PN532_Driver.h"
 #include "USB_Logging.h"
+#include "USB_Command_Handler.h"
 #include "System.h"
-#include "mywota_ui_driver.h"
 #include "SD_Logger_Task.h"
+#include "SHA256_Crypto.h"
+#include "Dispenser_Controller.h"
+#include "task_stack_config.h"
 #include <string.h>
 #include <stdio.h>
 #include <stddef.h>
 #include "ui.h"
 #include "ui_Screen1.h"
+#ifdef PICO_BOARD
+#include "pico/unique_id.h"
+#endif
 
 /*Private defines ---------------------------------------------------*/
-#define MIFARE_AUTH_KEY_A               {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}  // Default key for now
 #define PN532_POST_RESET_COOLDOWN_MS    1200
 
-/* MIFARE Classic 1K Sector Structure:
- * - 16 sectors (0-15)
- * - Each sector has 4 blocks (blocks 0-63 total)
- * - Block 3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47, 51, 55, 59, 63 are sector trailers
- * - Sector trailers contain Key A, Access Bits, and Key B - MUST NOT BE WRITTEN BY APPLICATION
- */
-#define MIFARE_BLOCKS_PER_SECTOR        4
-#define MIFARE_IS_SECTOR_TRAILER(block) (((block) % MIFARE_BLOCKS_PER_SECTOR) == 3)
-#define MIFARE_GET_SECTOR(block)        ((block) / MIFARE_BLOCKS_PER_SECTOR)
+/* Legacy macros - map to driver definitions */
+#define MIFARE_BLOCKS_PER_SECTOR        MIFARE_CLASSIC_BLOCKS_PER_SECTOR
+#define MIFARE_IS_SECTOR_TRAILER(block) MIFARE_CLASSIC_IS_SECTOR_TRAILER(block)
+#define MIFARE_GET_SECTOR(block)        MIFARE_CLASSIC_GET_SECTOR(block)
 
 /* Logging Configuration -----------------------------------------------------*/
-#define LOG_DEBUG_MIFARE_TRANSACTION_MANAGER_EN      1
+#define LOG_DEBUG_MIFARE_TRANSACTION_MANAGER_EN      0  // Disabled for production (set to 1 for debugging)
 #define LOG_CRITICAL_MIFARE_TRANSACTION_MANAGER_EN   1
 #define LOG_ERROR_MIFARE_TRANSACTION_MANAGER_EN      1
+
+/* Feature Configuration -----------------------------------------------------*/
+#define MIFARE_ERROR_STATE_AUTO_RECOVERY_EN          0  // 0=Stay in ERROR until card removed, 1=Auto-retry
 
 #if LOG_DEBUG_MIFARE_TRANSACTION_MANAGER_EN
     #define LOG_DEBUG_MIFARE_TRANSACTION_MANAGER(...) USB_Log_Printf(__VA_ARGS__)
@@ -67,41 +73,63 @@
     #define LOG_ERROR_MIFARE_TRANSACTION_MANAGER(...)
 #endif
 
-/* Legacy macro for compatibility - maps to DEBUG */
-#define MIFARE_LOG(fmt, ...) LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: " fmt "\r\n", ##__VA_ARGS__)
-
 /*Private variables -------------------------------------------------*/
-MIFARE_TransactionManager_t g_transaction_manager;
-static uint8_t mifare_auth_key[6] = MIFARE_AUTH_KEY_A;
-static uint32_t transaction_start_timestamp = 0;
+static MIFARE_TransactionManager_t g_transaction_manager;
 static int8_t last_authenticated_sector = -1;  // Cache last authenticated sector (-1 = none)
-static TickType_t pn532_recovery_ready_tick = 0;
+static uint8_t derived_sector_key[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};  // Derived per-card sector key
+static bool use_factory_keys_for_writes = false;  // Temporary override for blank card initialization
 static bool last_card_write_changed = false;
 static bool no_change_log_reported = false;
+static bool skip_sd_logging = false;  // Flag to skip SD logging during verification reads
 
 /*Private function prototypes ---------------------------------------*/
-static bool mifare_is_valid_block(uint8_t block_number, bool is_write);
-static MIFARE_Result_t mifare_authenticate_block(uint8_t block_number);
-static MIFARE_Result_t mifare_read_block_safe(uint8_t block_number, uint8_t *data);
-static MIFARE_Result_t mifare_write_block_safe(uint8_t block_number, uint8_t *data);
-static void mifare_transition_state(MIFARE_DispenseState_t new_state);
-static uint32_t mifare_get_timestamp(void);
+static MIFARE_Result_t mifare_read_block(uint8_t block_number, uint8_t *data);
+static MIFARE_Result_t mifare_write_block(uint8_t block_number, uint8_t *data, bool allow_trailer_write);
+static void mifare_transition_state(MIFARE_TransactionState_t new_state);
+static MIFARE_Result_t MIFARE_HandleCardRemovalDuringTransaction(void);
 
-static uint32_t mifare_fast_balance_crc32(const uint8_t *data, size_t length);
-static void mifare_fast_balance_update(MIFARE_FastBalance_t *fast_balance, uint32_t balance_ml);
-static bool mifare_fast_balance_validate(const MIFARE_FastBalance_t *fast_balance);
-static void mifare_fast_balance_sync_to_main(MIFARE_CardData_t *card_data);
-#define mifare_calculate_crc32            mifare_fast_balance_crc32
-#define mifare_update_fast_balance        mifare_fast_balance_update
-#define mifare_validate_fast_balance      mifare_fast_balance_validate
-#define mifare_sync_fast_balance_to_main  mifare_fast_balance_sync_to_main
 static void mifare_clear_write_snapshot(void);
+static bool mifare_is_block_encrypted(uint8_t block_number);
 static void mifare_update_write_snapshot(const MIFARE_CardData_t *card_data);
 static bool mifare_card_data_changed(const MIFARE_CardData_t *card_data);
 static void mifare_encode_account_data(MIFARE_AccountData_t *account_data, const char *phone_str, MIFARE_CardValidity_t validity);
 static bool mifare_is_account_data_empty(const MIFARE_AccountData_t *account_data);
 
 /*Utility Functions ---------------------------------------------*/
+
+/**
+ * @brief Check if a block should be encrypted based on config
+ */
+static bool mifare_is_block_encrypted(uint8_t block_num)
+{
+    const SystemConfig_t *config = Config_Get();
+    
+    if (!config->mifare.security.encryption_enabled) {
+        return false;
+    }
+    
+    // Header block is never encrypted - needed for card detection
+    if (block_num == MIFARE_BLOCK_HEADER) {
+        return false;
+    }
+    
+    // User data blocks (primary and backup)
+    if ((block_num == MIFARE_BLOCK_USER_PRIMARY || block_num == MIFARE_BLOCK_USER_BACKUP) && config->mifare.security.encrypt_user_data) {
+        return true;
+    }
+    
+    // Transaction log blocks
+    if ((block_num == MIFARE_BLOCK_TRANSACTION_LOG || block_num == MIFARE_BLOCK_TRANSACTION_LOG + 1) && config->mifare.security.encrypt_transactions) {
+        return true;
+    }
+    
+    // Account data block
+    if (block_num == MIFARE_BLOCK_ACCOUNT_DATA && config->mifare.security.encrypt_account_data) {
+        return true;
+    }
+    
+    return false;
+}
 
 /**
  * @brief Get string representation of MIFARE result
@@ -127,105 +155,57 @@ const char* MIFARE_GetResultString(MIFARE_Result_t result)
 }
 
 /**
- * @brief Get string representation of dispensing state
- * @param state Dispensing state
+ * @brief Get string representation of transaction state
+ * @param state Transaction state
  * @return const char* State string
  */
-const char* MIFARE_GetStateString(MIFARE_DispenseState_t state)
+const char* MIFARE_GetTransactionStateString(MIFARE_TransactionState_t state)
 {
     switch (state) {
-        case DISPENSE_STATE_IDLE:               return "Idle";
-        case DISPENSE_STATE_CARD_DETECTED:      return "Card Detected";
-        case DISPENSE_STATE_AUTHENTICATING:     return "Authenticating";
-        case DISPENSE_STATE_READING_DATA:       return "Reading Data";
-        case DISPENSE_STATE_VALIDATING:         return "Validating";
-        case DISPENSE_STATE_READY_TO_DISPENSE:  return "Ready to Dispense";
-        case DISPENSE_STATE_DISPENSING:         return "Dispensing";
-        case DISPENSE_STATE_UPDATING_CARD:      return "Updating Card";
-        case DISPENSE_STATE_FINALIZING:         return "Finalizing";
-        case DISPENSE_STATE_ERROR:              return "Error";
-        case DISPENSE_STATE_CARD_REMOVED:       return "Card Removed";
-        case DISPENSE_STATE_CARD_REMOVED_DURING_DISPENSING: return "Card Removed During Dispensing";
-        default:                                return "Unknown";
+        case TRANSACTION_STATE_IDLE:               return "Idle";
+        case TRANSACTION_STATE_CARD_DETECTED:      return "Card Detected";
+        case TRANSACTION_STATE_AUTHENTICATING:     return "Authenticating";
+        case TRANSACTION_STATE_READING_DATA:       return "Reading Data";
+        case TRANSACTION_STATE_VALIDATING:         return "Validating";
+        case TRANSACTION_STATE_READY:              return "Ready";
+        case TRANSACTION_STATE_READY_AFTER_TOPUP:  return "Ready After Topup";
+        case TRANSACTION_STATE_INITIALIZED:        return "Initialized";
+        case TRANSACTION_STATE_WRITING_DATA:       return "Writing Data";
+        case TRANSACTION_STATE_FINALIZING:         return "Finalizing";
+        case TRANSACTION_STATE_ERROR:              return "Error";
+        case TRANSACTION_STATE_ERROR_NO_FLOW:      return "Error - No Flow";
+        case TRANSACTION_STATE_ERROR_CARD_CORRUPTED: return "Error - Card Corrupted";
+        case TRANSACTION_STATE_ERROR_MODULE_FAILURE: return "Error - Module Failure";
+        case TRANSACTION_STATE_ERROR_VALIDATION_FAILED: return "Error - Validation";
+        case TRANSACTION_STATE_ERROR_WRITE_FAILED: return "Error - Write Failed";
+        case TRANSACTION_STATE_CARD_REMOVED:       return "Card Removed";
+        case TRANSACTION_STATE_WAITING_FOR_REMOVAL: return "Waiting for Removal";
+        default:                                   return "Unknown";
     }
 }
 
-/*Fast balance helpers --------------------------------------------------*/
-static uint32_t mifare_fast_balance_crc32(const uint8_t *data, size_t length)
+/**
+ * @brief Get string representation of card state
+ * @param state Card state
+ * @return const char* State string
+ */
+const char* MIFARE_GetCardStateString(MIFARE_CardState_t state)
 {
-    uint32_t crc = 0xFFFFFFFF;
-
-    for (size_t i = 0; i < length; i++) {
-        crc ^= data[i];
-        for (uint8_t j = 0; j < 8; j++) {
-            crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
-        }
-    }
-
-    return ~crc;
-}
-
-static bool mifare_fast_balance_validate(const MIFARE_FastBalance_t *fast_balance)
-{
-    // Calculate CRC32 over first 12 bytes (balance + sequence + reserved + timestamp) ONLY
-    // Structure: 4 bytes balance + 2 bytes sequence + 2 bytes reserved + 4 bytes timestamp = 12 bytes
-    uint32_t calculated_crc = mifare_fast_balance_crc32((const uint8_t*)fast_balance, 12);
-    return (calculated_crc == fast_balance->crc32);
-}
-
-static void mifare_fast_balance_update(MIFARE_FastBalance_t *fast_balance, uint32_t balance_ml)
-{
-    fast_balance->balance_ml = balance_ml;
-    fast_balance->sequence_number++;
-    fast_balance->timestamp = (uint32_t)xTaskGetTickCount();
-
-    // Calculate CRC32 over first 12 bytes (balance + sequence + reserved + timestamp) ONLY
-    // Structure: 4 bytes balance + 2 bytes sequence + 2 bytes reserved + 4 bytes timestamp = 12 bytes
-    fast_balance->crc32 = mifare_fast_balance_crc32((uint8_t*)fast_balance, 12);
-}
-
-static void mifare_fast_balance_sync_to_main(MIFARE_CardData_t *card_data)
-{
-    // Validate fast balance integrity
-    if (!mifare_fast_balance_validate(&card_data->fast_balance_primary)) {
-        MIFARE_LOG("Fast balance primary corrupted, rebuilding from main balance");
-        // Rebuild corrupted fast balance from main balance
-        mifare_fast_balance_update(&card_data->fast_balance_primary, card_data->user_primary.balance_ml);
-        MIFARE_LOG("Fast balance rebuilt with %u mL", card_data->user_primary.balance_ml);
-        
-        // Write repaired fast balance back to card
-        MIFARE_Result_t result = mifare_write_block_safe(MIFARE_BLOCK_FAST_BALANCE_PRIMARY, 
-                                                         (uint8_t*)&card_data->fast_balance_primary);
-        if (result == MIFARE_RESULT_OK) {
-            MIFARE_LOG("Fast balance primary written to card");
-            // Also update backup
-            memcpy(&card_data->fast_balance_backup, &card_data->fast_balance_primary, 
-                   sizeof(MIFARE_FastBalance_t));
-            mifare_write_block_safe(MIFARE_BLOCK_FAST_BALANCE_BACKUP, 
-                                   (uint8_t*)&card_data->fast_balance_backup);
-        } else {
-            MIFARE_LOG("WARNING: Failed to write repaired fast balance to card");
-        }
-        return;
-    }
-
-    // Check if fast balance is different from main balance
-    // We trust fast balance if it's valid (validated above)
-    if (card_data->fast_balance_primary.balance_ml != card_data->user_primary.balance_ml) {
-        MIFARE_LOG("Syncing fast balance %u mL (seq %u) to main balance %u mL",
-                    card_data->fast_balance_primary.balance_ml,
-                    card_data->fast_balance_primary.sequence_number,
-                    card_data->user_primary.balance_ml);
-
-        card_data->user_primary.balance_ml = card_data->fast_balance_primary.balance_ml;
-        card_data->user_backup.balance_ml = card_data->fast_balance_primary.balance_ml;
-        
-        // CRITICAL: Update CRCs to match the new balance so validation passes
-        // The main data has been modified in memory, so the old CRCs read from the card are no longer valid for this data
-        card_data->recovery_info.primary_data_crc = MIFARE_CALCULATE_CRC16((uint8_t*)&card_data->user_primary, sizeof(MIFARE_UserData_t));
-        card_data->recovery_info.backup_data_crc = MIFARE_CALCULATE_CRC16((uint8_t*)&card_data->user_backup, sizeof(MIFARE_UserData_t));
+    switch (state) {
+        case MIFARE_CARD_STATE_ABSENT:             return "Absent";
+        case MIFARE_CARD_STATE_PRESENT:            return "Present";
+        case MIFARE_CARD_STATE_INITIALIZING:       return "Initializing";
+        case MIFARE_CARD_STATE_NEEDS_POLLING_CYCLE: return "Needs Polling Cycle";
+        case MIFARE_CARD_STATE_ERROR:              return "Error";
+        default:                                   return "Unknown";
     }
 }
+
+/* Forward declarations for state transition helpers */
+void MIFARE_SetErrorState_CardCorrupted(void);
+void MIFARE_SetErrorState_ModuleFailure(void);
+void MIFARE_SetErrorState_ValidationFailed(void);
+void MIFARE_SetErrorState_WriteFailed(void);
 
 /**
  * @brief Fully re-initializes the PN532 driver to recover from a bad state.
@@ -234,17 +214,17 @@ static void mifare_fast_balance_sync_to_main(MIFARE_CardData_t *card_data)
  *          function resets the driver, preparing it for fresh operations.
  */
 void mifare_recover_and_reinit_pn532(void) {
-    MIFARE_LOG("CRITICAL: PN532 seems to be in a bad state. Re-initializing driver.");
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: CRITICAL: PN532 seems to be in a bad state. Re-initializing driver.\r\n");
 
     // 1. Notify the system about the impending reset
     MIFARE_NotifyPN532Reset();
 
     // 2. Perform the re-initialization of the PN532 driver
     // This will reset its internal state machine and communication buffers.
-    if (PN532_Init() == PN532_STATUS_OK) {
-        MIFARE_LOG("PN532 driver re-initialized successfully.");
+    if (PN532_Init(g_transaction_manager.pn532_handle) == PN532_STATUS_OK) {
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: PN532 driver re-initialized successfully.\r\n");
     } else {
-        MIFARE_LOG("ERROR: PN532 driver re-initialization failed.");
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: ERROR: PN532 driver re-initialization failed.\r\n");
         // If re-initialization fails, we are in a deeper trouble.
         // A system reset might be the only way out, but for now, we log it.
     }
@@ -256,7 +236,7 @@ void mifare_recover_and_reinit_pn532(void) {
     // If we don't reset this, the next write failure will incorrectly trigger card removal
     g_transaction_manager.write_failure_first_tick = 0;
     g_transaction_manager.consecutive_write_failures = 0;
-    MIFARE_LOG("Write failure tracking reset after PN532 recovery");
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Write failure tracking reset after PN532 recovery\r\n");
 }
 
 /*Core Transaction Manager Functions --------------------------------*/
@@ -270,19 +250,25 @@ MIFARE_Result_t MIFARE_TransactionManager_Init(void)
     // Initialize the transaction manager structure
     memset(&g_transaction_manager, 0, sizeof(MIFARE_TransactionManager_t));
 
+    // Get PN532 driver handle
+    g_transaction_manager.pn532_handle = PN532_GetHandle(0);
+    if (g_transaction_manager.pn532_handle == NULL) {
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: ERROR: Failed to get PN532 handle\r\n");
+        return MIFARE_RESULT_ERROR;
+    }
+
     // Create mutex for transaction safety
     g_transaction_manager.transaction_mutex = xSemaphoreCreateMutex();
     if (g_transaction_manager.transaction_mutex == NULL) {
-        MIFARE_LOG("ERROR: Failed to create transaction mutex");
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: ERROR: Failed to create transaction mutex\r\n");
         return MIFARE_RESULT_ERROR;
     }
     
     // Initialize state
-    g_transaction_manager.dispense_state = DISPENSE_STATE_IDLE;
+    g_transaction_manager.transaction_state = TRANSACTION_STATE_IDLE;
     g_transaction_manager.card_state = MIFARE_CARD_STATE_ABSENT;
     g_transaction_manager.transaction_active = false;
     g_transaction_manager.consecutive_errors = 0;
-    g_transaction_manager.card_removal_abort = false;
     g_transaction_manager.pn532_recovery_until_tick = 0;
     
     // Initialize stability layer
@@ -292,13 +278,42 @@ MIFARE_Result_t MIFARE_TransactionManager_Init(void)
     g_transaction_manager.card_confirmed_present_tick = 0;
     g_transaction_manager.card_first_lost_tick = 0;
     g_transaction_manager.card_presence_confirmed = false;
-    g_transaction_manager.ui_state_card_present = false;
     
     mifare_clear_write_snapshot();
     last_card_write_changed = false;
     no_change_log_reported = false;
     
-    MIFARE_LOG("Transaction manager initialized successfully");
+    // Initialize security layer with config from System_Config
+    const SystemConfig_t *sys_config = Config_Get();
+    MIFARE_SecurityConfig_t sec_config = {
+        .encryption_enabled = sys_config->mifare.security.encryption_enabled,
+        .hmac_enabled = sys_config->mifare.security.enable_hmac_auth,
+        .challenge_response_enabled = sys_config->mifare.security.enable_challenge_response,
+        .replay_protection_enabled = sys_config->mifare.security.enable_replay_protection,
+        .pbkdf2_iterations = sys_config->mifare.security.pbkdf2_iterations,
+        .max_timestamp_drift_sec = sys_config->mifare.security.max_timestamp_drift_sec,
+        .failed_challenge_lockout = sys_config->mifare.security.failed_challenge_lockout
+    };
+    memcpy(sec_config.master_key, sys_config->mifare.security.master_key, 32);
+    memcpy(sec_config.hmac_key, sys_config->mifare.security.hmac_key, 32);
+    
+    // Get platform unique ID
+#ifdef PICO_BOARD
+    pico_unique_board_id_t board_id;
+    pico_get_unique_board_id(&board_id);
+    memcpy(sec_config.device_id, board_id.id, 8);
+#else
+    memset(sec_config.device_id, 0, 8);
+#endif
+    
+    MIFARE_Security_Status_t sec_status = MIFARE_Security_Init(&sec_config);
+    if (sec_status != MIFARE_SEC_OK) {
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: WARNING: Security layer initialization failed: %s", 
+                   MIFARE_Security_GetStatusString(sec_status));
+        // Continue anyway - security might be disabled
+    }
+    
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Transaction manager initialized successfully\r\n");
     return MIFARE_RESULT_OK;
 }
 
@@ -320,7 +335,7 @@ MIFARE_Result_t MIFARE_ProcessCardDetected(PN532_CardInfo_t *card_info)
         // Don't spam logs - only log every ~5 seconds
         static TickType_t last_cooldown_log = 0;
         if (now - last_cooldown_log > pdMS_TO_TICKS(5000)) {
-            MIFARE_LOG("Card detection deferred - in cooldown period (%lu ms remaining)", remaining_ms);
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card detection deferred - in cooldown period (%lu ms remaining)", remaining_ms);
             last_cooldown_log = now;
         }
         return MIFARE_RESULT_BUSY;
@@ -333,69 +348,126 @@ MIFARE_Result_t MIFARE_ProcessCardDetected(PN532_CardInfo_t *card_info)
     
     MIFARE_Result_t result = MIFARE_RESULT_OK;
     
-    // Copy card info with size validation
-    if (sizeof(PN532_CardInfo_t) <= sizeof(g_transaction_manager.card_info)) {
-        memcpy(&g_transaction_manager.card_info, card_info, sizeof(PN532_CardInfo_t));
-    } else {
-        MIFARE_LOG("ERROR: Card info structure size mismatch");
-        xSemaphoreGive(g_transaction_manager.transaction_mutex);
-        return MIFARE_RESULT_ERROR;
-    }
+    // Copy card info
+    memcpy(&g_transaction_manager.card_info, card_info, sizeof(PN532_CardInfo_t));
     MIFARE_SetCardState(MIFARE_CARD_STATE_INITIALIZING);
     g_transaction_manager.consecutive_errors = 0;
     last_authenticated_sector = -1;  // Clear authentication cache for new card
     
-    // CRITICAL: Clear any previous abort flags when a new card is detected
-    g_transaction_manager.card_removal_abort = false;
+    // Derive per-card security keys from UID
+    const SystemConfig_t *config = Config_Get();
+    MIFARE_SecurityConfig_t sec_config = {
+        .encryption_enabled = config->mifare.security.encryption_enabled,
+        .hmac_enabled = config->mifare.security.enable_hmac_auth,
+        .pbkdf2_iterations = config->mifare.security.pbkdf2_iterations
+    };
+    memcpy(sec_config.master_key, config->mifare.security.master_key, 32);
+    memcpy(sec_config.hmac_key, config->mifare.security.hmac_key, 32);
+    
+    // Derive per-card sector authentication key (for MIFARE Classic access)
+    if (config->mifare.security.use_custom_sector_keys) {
+        // Use SHA256(master_key || UID || "SECTOR") to generate unique 6-byte key
+        SHA256_CTX sha_ctx;
+        uint8_t hash[32];
+        SHA256_Init(&sha_ctx);
+        SHA256_Update(&sha_ctx, config->mifare.security.master_key, 32);
+        SHA256_Update(&sha_ctx, card_info->uid, card_info->uid_length);
+        SHA256_Update(&sha_ctx, (const uint8_t*)"SECTOR", 6);
+        SHA256_Final(&sha_ctx, hash);
+        memcpy(derived_sector_key, hash, 6);
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Derived sector key: %02X%02X%02X%02X%02X%02X",
+                   derived_sector_key[0], derived_sector_key[1], derived_sector_key[2],
+                   derived_sector_key[3], derived_sector_key[4], derived_sector_key[5]);
+    } else {
+        memset(derived_sector_key, 0xFF, 6);
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Using factory default sector keys (0xFF...)\r\n");
+    }
+    
+    MIFARE_Security_Status_t sec_status = MIFARE_Security_DeriveCardKeys(
+        &g_transaction_manager.security_context,
+        &sec_config,
+        card_info->uid,
+        card_info->uid_length,
+        NULL  // Report task status after this call instead
+    );
+    
+    /* Report task status after key derivation (can take 300ms+) */
+    System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+    
+    if (sec_status != MIFARE_SEC_OK) {
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: WARNING: Failed to derive card security keys: %s",
+                   MIFARE_Security_GetStatusString(sec_status));
+        // Continue anyway - encryption might be disabled
+    } else {
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card security keys derived (UID: %02X%02X%02X%02X)",
+                   card_info->uid[0], card_info->uid[1], card_info->uid[2], card_info->uid[3]);
+    }
     
     // Transition to appropriate state
-    if (g_transaction_manager.dispense_state == DISPENSE_STATE_IDLE ||
-        g_transaction_manager.dispense_state == DISPENSE_STATE_ERROR) {
+    if (g_transaction_manager.transaction_state == TRANSACTION_STATE_IDLE ||
+        g_transaction_manager.transaction_state == TRANSACTION_STATE_ERROR) {
         
         // Clear error state when attempting new card initialization
-        if (g_transaction_manager.dispense_state == DISPENSE_STATE_ERROR) {
-            MIFARE_LOG("Clearing error state to retry card initialization");
+        if (g_transaction_manager.transaction_state == TRANSACTION_STATE_ERROR) {
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Clearing error state to retry card initialization\r\n");
             MIFARE_SetCardState(MIFARE_CARD_STATE_INITIALIZING);
             g_transaction_manager.consecutive_errors = 0;
         }
         
-        mifare_transition_state(DISPENSE_STATE_CARD_DETECTED);
+        mifare_transition_state(TRANSACTION_STATE_CARD_DETECTED);
         
         // Start stability timer for card presence confirmation
         TickType_t now = xTaskGetTickCount();
         g_transaction_manager.card_first_detected_tick = now;
-        MIFARE_LOG("Card first detected - waiting %d ms for stability confirmation", 
-                   MIFARE_STABILITY_TIMEOUT_MS);
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card first detected - waiting %lu ms for stability confirmation", 
+                   Config_Get()->mifare.stability_timeout_ms);
         
-        // Release mutex before calling auto-initialize (it takes its own mutex)
+        // Release mutex before calling detect function (it takes its own mutex)
         xSemaphoreGive(g_transaction_manager.transaction_mutex);
         
-        // Attempt to detect and auto-initialize card (1000000 mL = 1000L default balance)
+        // Detect and read existing cards (will NOT initialize blank cards)
         result = MIFARE_DetectAndAutoInitializeCard(&g_transaction_manager.card_info, 1000000);
+        
+        /* Report task status after card detection (can take 200-500ms) */
+        System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+        
         if (result == MIFARE_RESULT_OK) {
-            MIFARE_LOG("Card detected and validated - Ready for dispensing");
-            mifare_transition_state(DISPENSE_STATE_READY_TO_DISPENSE);
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card detected and validated - Ready for dispensing\r\n");
+            mifare_transition_state(TRANSACTION_STATE_READY);
             
             // Set card state to PRESENT after successful initialization
             MIFARE_CardState_t current_state = MIFARE_GetCardState();
-            MIFARE_LOG("Setting card state to PRESENT (was %d)", current_state);
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Setting card state to PRESENT (was %d)", current_state);
             MIFARE_SetCardState(MIFARE_CARD_STATE_PRESENT);
+            
+            // Log successful card read to console
+            LOG_CRITICAL_MIFARE_TRANSACTION_MANAGER("[✓] Card read OK: UID=%02X%02X%02X%02X, Balance=%lu ml\r\n",
+                               g_transaction_manager.card_info.uid[0],
+                               g_transaction_manager.card_info.uid[1],
+                               g_transaction_manager.card_info.uid[2],
+                               g_transaction_manager.card_info.uid[3],
+                               g_transaction_manager.current_card.user_primary.balance_ml);
+            
+            // Log card detection to SD card
+            SD_Logger_LogEvent("CARD_DETECTED: UID=%02X%02X%02X%02X, Balance=%lu ml",
+                               g_transaction_manager.card_info.uid[0],
+                               g_transaction_manager.card_info.uid[1],
+                               g_transaction_manager.card_info.uid[2],
+                               g_transaction_manager.card_info.uid[3],
+                               g_transaction_manager.current_card.user_primary.balance_ml);
         } else if (result == MIFARE_RESULT_PN532_CORRUPTED) {
-            mifare_transition_state(DISPENSE_STATE_ERROR);
-            MIFARE_SetCardState(MIFARE_CARD_STATE_ERROR);
-            MIFARE_LOG("Card validation failed due to PN532 corruption. System in error state.");
-            
-            // Set cooldown to prevent immediate re-detection loop
-            g_transaction_manager.pn532_recovery_until_tick = xTaskGetTickCount() + pdMS_TO_TICKS(2000);
-            MIFARE_LOG("Error state cooldown: 2000ms before retry allowed");
+            MIFARE_SetErrorState_ModuleFailure();
+            LOG_CRITICAL_MIFARE_TRANSACTION_MANAGER("    Context: PN532 communication error\r\n");
+        } else if (result == MIFARE_RESULT_CARD_CORRUPTED) {
+            MIFARE_SetErrorState_CardCorrupted();
+        } else if (result == MIFARE_RESULT_BUSY) {
+            // USB command is pending - card detected, waiting for manual command execution
+            // Stay in CARD_DETECTED state to prevent re-detection loop
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: USB command pending - staying in CARD_DETECTED state\r\n");
+            // No state transition - remain in CARD_DETECTED, USB command handler will execute
         } else {
-            mifare_transition_state(DISPENSE_STATE_IDLE);  // CRITICAL: Reset to IDLE to allow retry
-            MIFARE_SetCardState(MIFARE_CARD_STATE_ABSENT);
-            MIFARE_LOG("Card validation failed: %s - resetting to IDLE for retry", MIFARE_GetResultString(result));
-            
-            // Set short cooldown to prevent immediate re-detection loop
-            g_transaction_manager.pn532_recovery_until_tick = xTaskGetTickCount() + pdMS_TO_TICKS(500);
-            MIFARE_LOG("Init failure cooldown: 500ms before retry allowed");
+            MIFARE_SetErrorState_ValidationFailed();
+            LOG_CRITICAL_MIFARE_TRANSACTION_MANAGER("    Reason: %s\r\n", MIFARE_GetResultString(result));
         }
         return result;
     }
@@ -405,85 +477,79 @@ MIFARE_Result_t MIFARE_ProcessCardDetected(PN532_CardInfo_t *card_info)
 }
 
 /**
- * @brief Process card removal event (with stability timeout)
+ * @brief Force immediate card removal - resets ALL card/transaction state
+ * @details Single function that handles all card removal cleanup.
+ *          Call directly when card removal is confirmed (via write failures + PN532 poll).
+ *          Called by MIFARE_ProcessCardRemoved() after stability check passes.
  * @return MIFARE_Result_t Operation result
  */
-MIFARE_Result_t MIFARE_ProcessCardRemoved(void)
+MIFARE_Result_t MIFARE_ForceCardRemoval(void)
 {
     if (xSemaphoreTake(g_transaction_manager.transaction_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
         return MIFARE_RESULT_BUSY;
     }
 
-    TickType_t now = xTaskGetTickCount();
+    LOG_CRITICAL_MIFARE_TRANSACTION_MANAGER("[✓] Card removed - cleaning up state\r\n");
     
-    // Stability layer: Don't immediately declare card removed
-    // Start/update the "card lost" timer
-    if (g_transaction_manager.card_first_lost_tick == 0) {
-        g_transaction_manager.card_first_lost_tick = now;
-        MIFARE_LOG("Card first lost - waiting %d ms for removal confirmation", MIFARE_REMOVAL_STABILITY_MS);
-        xSemaphoreGive(g_transaction_manager.transaction_mutex);
-        return MIFARE_RESULT_OK;  // Don't act yet
-    }
-    
-    // Check if card has been absent for required stability time
-    uint32_t absent_ms = pdTICKS_TO_MS(now - g_transaction_manager.card_first_lost_tick);
-    if (absent_ms < MIFARE_REMOVAL_STABILITY_MS) {
-        // Not absent long enough yet - might be transient RF issue
-        MIFARE_LOG("Card absent for %lu ms (need %d ms)", absent_ms, MIFARE_REMOVAL_STABILITY_MS);
-        xSemaphoreGive(g_transaction_manager.transaction_mutex);
-        return MIFARE_RESULT_OK;  // Don't act yet
-    }
-    
-    // Card has been absent for >1s - CONFIRMED removal
-    MIFARE_LOG("Card removal CONFIRMED after %lu ms - State: %s", 
-               absent_ms, MIFARE_GetStateString(g_transaction_manager.dispense_state));
-    
+    // Reset card state
     MIFARE_SetCardState(MIFARE_CARD_STATE_ABSENT);
-    last_authenticated_sector = -1;  // Clear authentication cache
+    g_transaction_manager.transaction_state = TRANSACTION_STATE_IDLE;
+    g_transaction_manager.transaction_active = false;
+    
+    // Clear card data
+    memset(&g_transaction_manager.current_card, 0, sizeof(MIFARE_CardData_t));
+    last_authenticated_sector = -1;
     mifare_clear_write_snapshot();
     last_card_write_changed = false;
     no_change_log_reported = false;
     
-    // Reset write failure tracking when card removed
+    // Reset all tracking
     g_transaction_manager.write_failure_first_tick = 0;
     g_transaction_manager.consecutive_write_failures = 0;
-    
-    // Reset stability tracking
     g_transaction_manager.card_first_detected_tick = 0;
     g_transaction_manager.card_confirmed_present_tick = 0;
     g_transaction_manager.card_first_lost_tick = 0;
     g_transaction_manager.card_presence_confirmed = false;
 
-    // Only handle emergency rollback if ACTIVELY DISPENSING (transaction in progress)
-    // Don't trigger emergency rollback for cards that are just sitting in ready state
-    if (g_transaction_manager.transaction_active &&
-        (g_transaction_manager.dispense_state == DISPENSE_STATE_DISPENSING ||
-         g_transaction_manager.dispense_state == DISPENSE_STATE_UPDATING_CARD ||
-         g_transaction_manager.dispense_state == DISPENSE_STATE_FINALIZING)) {
-        mifare_transition_state(DISPENSE_STATE_CARD_REMOVED_DURING_DISPENSING);
-        MIFARE_HandleCardRemovalDuringDispense();
-    } else {
-        // Ensure PN532 is unlocked even if card removed before transaction started
-        // This prevents the polling task from staying paused forever
-        
-        // CLEANUP: Clear card data if removed while idle/ready
-        memset(&g_transaction_manager.current_card, 0, sizeof(MIFARE_CardData_t));
-    }
-
-    // Update UI - card is confirmed removed
-    if (g_transaction_manager.ui_state_card_present) {
-        ui_set_label_text(ui_cardRemaining, "0mL");
-        ui_set_bar_value(ui_totalRemainingBar, 0, LV_ANIM_ON);
-        // Clear customer ID display
-        ui_set_visibility(ui_customerID, false);
-        g_transaction_manager.ui_state_card_present = false;
-    }
-    
-    // Reset the dispense state machine
-    g_transaction_manager.dispense_state = DISPENSE_STATE_IDLE;
-
     xSemaphoreGive(g_transaction_manager.transaction_mutex);
     return MIFARE_RESULT_OK;
+}
+
+/**
+ * @brief Process card removal event (with stability timeout)
+ * @details Called by polling task. Waits for stability period before confirming removal.
+ * @return MIFARE_Result_t Operation result
+ */
+MIFARE_Result_t MIFARE_ProcessCardRemoved(void)
+{
+    if (xSemaphoreTake(g_transaction_manager.transaction_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: ProcessCardRemoved - mutex busy\r\n");
+        return MIFARE_RESULT_BUSY;
+    }
+
+    TickType_t now = xTaskGetTickCount();
+    
+    // Start stability timer on first call
+    if (g_transaction_manager.card_first_lost_tick == 0) {
+        g_transaction_manager.card_first_lost_tick = now;
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: ProcessCardRemoved - stability timer started (%lu ms required)\r\n", 
+                                              Config_Get()->mifare.removal_stability_ms);
+        xSemaphoreGive(g_transaction_manager.transaction_mutex);
+        return MIFARE_RESULT_OK;
+    }
+    
+    // Check if card has been absent long enough
+    uint32_t time_absent_ms = pdTICKS_TO_MS(now - g_transaction_manager.card_first_lost_tick);
+    if (time_absent_ms < Config_Get()->mifare.removal_stability_ms) {
+        // Still waiting - no logging to avoid spam
+        xSemaphoreGive(g_transaction_manager.transaction_mutex);
+        return MIFARE_RESULT_OK;
+    }
+    
+    // Stability check passed - do full cleanup
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: ProcessCardRemoved - stability passed (%lu ms), calling ForceCardRemoval\r\n", time_absent_ms);
+    xSemaphoreGive(g_transaction_manager.transaction_mutex);
+    return MIFARE_ForceCardRemoval();
 }
 
 /**
@@ -492,8 +558,7 @@ MIFARE_Result_t MIFARE_ProcessCardRemoved(void)
  */
 void MIFARE_NotifyPN532Reset(void)
 {
-    pn532_recovery_ready_tick = xTaskGetTickCount() + pdMS_TO_TICKS(PN532_POST_RESET_COOLDOWN_MS);
-    USB_Log_Printf("MIFARE: PN532 recovery cooldown started for %u ms\r\n", PN532_POST_RESET_COOLDOWN_MS);
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: PN532 recovery cooldown started for %u ms", PN532_POST_RESET_COOLDOWN_MS);
 }
 
 /*Card Data Operations ----------------------------------------------*/
@@ -502,206 +567,194 @@ void MIFARE_NotifyPN532Reset(void)
  * @brief Read and validate card data with error recovery
  * @param card_data Pointer to card data structure
  * @return MIFARE_Result_t Operation result
+ * 
+ * @note Uses single-exit pattern for maintainability - all paths converge at 'exit' label
  */
 MIFARE_Result_t MIFARE_ReadCardData(MIFARE_CardData_t *card_data)
 {
+    // Single-exit pattern: declare result at top, use goto exit for all error paths
+    MIFARE_Result_t result = MIFARE_RESULT_ERROR;
+    uint8_t block_data[16];
+    size_t copy_size;
+    bool primary_valid = false;
+    (void)primary_valid;  // May be used for validation later
+    
+    // === SECTION 1: Parameter validation ===
     if (card_data == NULL) {
-        return MIFARE_RESULT_ERROR;
+        goto exit;
     }
     
-    MIFARE_Result_t result;
-    uint8_t block_data[16];
-    
-    // Verify card is still present
-    MIFARE_LOG("[READ CARD DATA] Verifying card presence before read...");
+    // === SECTION 2: Verify card presence ===
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [READ CARD DATA] Verifying card presence before read...\r\n");
     result = MIFARE_VerifyCardPresence();
     if (result != MIFARE_RESULT_OK) {
-        MIFARE_LOG("[READ CARD DATA] Card presence check FAILED: %s", MIFARE_GetResultString(result));
-        return result;
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [READ CARD DATA] Card presence check FAILED: %s", MIFARE_GetResultString(result));
+        goto exit;
     }
-    MIFARE_LOG("[READ CARD DATA] Card presence verified OK");
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [READ CARD DATA] Card presence verified OK\r\n");
     
-    // Read header block (authentication is handled internally by mifare_read_block_safe)
-    result = mifare_read_block_safe(MIFARE_BLOCK_HEADER, block_data);
+    // CRITICAL: Presence check resets PN532 auth state - clear cache so driver re-authenticates
+    last_authenticated_sector = -1;
+    System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+    
+    // === SECTION 3: Read and validate header ===
+    result = mifare_read_block(MIFARE_BLOCK_HEADER, block_data);
     if (result != MIFARE_RESULT_OK) {
-        return result;
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [READ CARD DATA] Header read failed: %s", MIFARE_GetResultString(result));
+        goto exit;
     }
     
-    // Ensure we don't copy more than the block size or destination size
-    size_t copy_size = sizeof(MIFARE_CardHeader_t);
-    if (copy_size > 16) {  // MIFARE block size is 16 bytes
-        MIFARE_LOG("ERROR: Header size exceeds block size");
-        return MIFARE_RESULT_ERROR;
+    copy_size = sizeof(MIFARE_CardHeader_t);
+    if (copy_size > 16) {
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: ERROR: Header size exceeds block size\r\n");
+        result = MIFARE_RESULT_ERROR;
+        goto exit;
     }
     memcpy(&card_data->header, block_data, copy_size);
     
-    // Validate header
     if (card_data->header.magic_bytes != MIFARE_MAGIC_BYTES) {
-        MIFARE_LOG("Invalid magic bytes: 0x%08lX", card_data->header.magic_bytes);
-        return MIFARE_RESULT_CARD_CORRUPTED;
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Invalid magic bytes: 0x%08lX", card_data->header.magic_bytes);
+        result = MIFARE_RESULT_CARD_CORRUPTED;
+        goto exit;
     }
     
     if (card_data->header.format_version != MIFARE_FORMAT_VERSION) {
-        MIFARE_LOG("Unsupported format version: %d", card_data->header.format_version);
-        return MIFARE_RESULT_CARD_CORRUPTED;
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Unsupported format version: %d", card_data->header.format_version);
+        result = MIFARE_RESULT_CARD_CORRUPTED;
+        goto exit;
     }
     
-    // OPTIMIZED: Read recovery info FIRST to get CRCs for validation
-    // This allows us to validate primary/backup immediately as we read them
-    result = mifare_read_block_safe(MIFARE_BLOCK_RECOVERY_INFO, block_data);
-    if (result != MIFARE_RESULT_OK) {
-        MIFARE_LOG("Failed to read recovery info block - cannot validate data");
-        return result;
-    }
-    
-    copy_size = sizeof(MIFARE_RecoveryInfo_t);
-    if (copy_size > 16) {
-        MIFARE_LOG("ERROR: Recovery info size exceeds block size");
-        return MIFARE_RESULT_ERROR;
-    }
-    memcpy(&card_data->recovery_info, block_data, copy_size);
-    
-    USB_Log_Printf("MIFARE: Recovery info read - Primary CRC: 0x%04X, Backup CRC: 0x%04X\r\n",
-                   card_data->recovery_info.primary_data_crc,
-                   card_data->recovery_info.backup_data_crc);
-    
-    // OPTIMIZED: Read and validate primary user data immediately
-    result = mifare_read_block_safe(MIFARE_BLOCK_USER_PRIMARY, block_data);
-    bool primary_valid = false;
-    
+    // === SECTION 4: Read and validate primary user data ===
+    // HMAC validation happens inside mifare_read_block - if it passes, data is valid
+    result = mifare_read_block(MIFARE_BLOCK_USER_PRIMARY, block_data);
     if (result == MIFARE_RESULT_OK) {
         copy_size = sizeof(MIFARE_UserData_t);
         if (copy_size > 16) {
-            MIFARE_LOG("ERROR: User data size exceeds block size");
-            return MIFARE_RESULT_ERROR;
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: ERROR: User data size exceeds block size\r\n");
+            result = MIFARE_RESULT_ERROR;
+            goto exit;
         }
         memcpy(&card_data->user_primary, block_data, copy_size);
-        
-        // Validate CRC immediately
-        uint16_t calculated_crc = MIFARE_CALCULATE_CRC16((uint8_t*)&card_data->user_primary, 
-                                                          sizeof(MIFARE_UserData_t));
-        if (calculated_crc == card_data->recovery_info.primary_data_crc) {
-            primary_valid = true;
-            MIFARE_LOG("Primary data CRC valid - proceeding immediately");
-        } else {
-            MIFARE_LOG("Primary CRC mismatch: calc=0x%04X, stored=0x%04X", 
-                      calculated_crc, card_data->recovery_info.primary_data_crc);
-        }
+        primary_valid = true;
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Primary data read OK (HMAC validated)\r\n");
+    } else {
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Primary read failed: %s", MIFARE_GetResultString(result));
     }
+    System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
     
-    // OPTIMIZED: Only read backup if primary is invalid
-    // If primary is valid, backup will be overwritten during next write operation
+    // === SECTION 5: Read backup if primary failed ===
     if (!primary_valid) {
-        MIFARE_LOG("Primary invalid, checking backup...");
-        result = mifare_read_block_safe(MIFARE_BLOCK_USER_BACKUP, block_data);
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Primary invalid, checking backup...\r\n");
+        result = mifare_read_block(MIFARE_BLOCK_USER_BACKUP, block_data);
         
         if (result == MIFARE_RESULT_OK) {
             copy_size = sizeof(MIFARE_UserData_t);
-            if (copy_size > 16) {
-                MIFARE_LOG("ERROR: Backup user data size exceeds block size");
-                return MIFARE_RESULT_ERROR;
-            }
             memcpy(&card_data->user_backup, block_data, copy_size);
-            
-            // Validate backup CRC
-            uint16_t calculated_crc = MIFARE_CALCULATE_CRC16((uint8_t*)&card_data->user_backup, 
-                                                              sizeof(MIFARE_UserData_t));
-            if (calculated_crc == card_data->recovery_info.backup_data_crc) {
-                MIFARE_LOG("Backup data CRC valid - using backup");
-                // Copy backup to primary (backup will be fixed during next write)
-                memcpy(&card_data->user_primary, &card_data->user_backup, sizeof(MIFARE_UserData_t));
-                // Sync CRC so validation passes
-                card_data->recovery_info.primary_data_crc = card_data->recovery_info.backup_data_crc;
-                primary_valid = true;  // Now we have valid data in primary
-            } else {
-                MIFARE_LOG("Backup CRC mismatch: calc=0x%04X, stored=0x%04X", 
-                          calculated_crc, card_data->recovery_info.backup_data_crc);
-                // Both primary and backup invalid - try recovery
-                MIFARE_LOG("Neither primary nor backup CRC valid - attempting recovery");
-                return MIFARE_RESULT_CARD_CORRUPTED;
-            }
+            // Copy backup to primary
+            memcpy(&card_data->user_primary, &card_data->user_backup, sizeof(MIFARE_UserData_t));
+            primary_valid = true;
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Backup data valid - using backup\r\n");
         } else {
-            // Failed to read backup
-            MIFARE_LOG("Failed to read backup block - attempting recovery");
-            return MIFARE_RESULT_CARD_CORRUPTED;
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Backup also invalid - card corrupted\r\n");
+            result = MIFARE_RESULT_CARD_CORRUPTED;
+            goto exit;
         }
     } else {
-        // Primary is valid, so we skipped reading backup.
-        // Copy primary to backup so that validation passes (since we assume backup is irrelevant if primary is good)
+        // Primary is valid - sync backup in memory for consistency
         memcpy(&card_data->user_backup, &card_data->user_primary, sizeof(MIFARE_UserData_t));
-        // Sync CRC so validation passes
-        card_data->recovery_info.backup_data_crc = card_data->recovery_info.primary_data_crc;
     }
-    // If primary is valid, we're done - skip reading backup entirely (will be overwritten later)
     
-    // Read usage data block (lifetime statistics)
-    result = mifare_read_block_safe(MIFARE_BLOCK_USAGE_DATA, block_data);
+    // === SECTION 6: Read usage data (non-critical) ===
+    result = mifare_read_block(MIFARE_BLOCK_USAGE_DATA, block_data);
     if (result != MIFARE_RESULT_OK) {
-        MIFARE_LOG("Failed to read usage data block");
-        // Initialize to zero if read fails (non-critical for operation)
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Failed to read usage data block\r\n");
         memset(&card_data->usage_data, 0, sizeof(MIFARE_UsageData_t));
     } else {
         copy_size = sizeof(MIFARE_UsageData_t);
-        if (copy_size > 16) {  // MIFARE block size is 16 bytes
-            MIFARE_LOG("ERROR: Usage data size exceeds block size");
-            return MIFARE_RESULT_ERROR;
+        if (copy_size > 16) {
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: ERROR: Usage data size exceeds block size\r\n");
+            result = MIFARE_RESULT_ERROR;
+            goto exit;
         }
         memcpy(&card_data->usage_data, block_data, copy_size);
     }
+    System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
     
-    // Recovery info already read earlier for CRC validation (skip duplicate read)
-    
-    // Read fast balance cache (non-critical, continue if fails)
-    result = mifare_read_block_safe(MIFARE_BLOCK_FAST_BALANCE_PRIMARY, block_data);
-    if (result == MIFARE_RESULT_OK) {
-        copy_size = sizeof(MIFARE_FastBalance_t);
-        if (copy_size <= 16) {
-            memcpy(&card_data->fast_balance_primary, block_data, copy_size);
-            
-            // Sync fast balance to main if it's newer
-            mifare_fast_balance_sync_to_main(card_data);
-        }
-    } else {
-        MIFARE_LOG("Fast balance cache read failed (non-critical)");
-    }
-    
-    // Read fast balance backup (non-critical)
-    result = mifare_read_block_safe(MIFARE_BLOCK_FAST_BALANCE_BACKUP, block_data);
-    if (result == MIFARE_RESULT_OK) {
-        copy_size = sizeof(MIFARE_FastBalance_t);
-        if (copy_size <= 16) {
-            memcpy(&card_data->fast_balance_backup, block_data, copy_size);
-        }
-    }
-    
-    // Read account data (phone number, validity)
-    result = mifare_read_block_safe(MIFARE_BLOCK_ACCOUNT_DATA, block_data);
+    // === SECTION 7: Read account data (non-critical) ===
+    result = mifare_read_block(MIFARE_BLOCK_ACCOUNT_DATA, block_data);
     if (result == MIFARE_RESULT_OK) {
         copy_size = sizeof(MIFARE_AccountData_t);
         if (copy_size <= 16) {
             memcpy(&card_data->account_data, block_data, copy_size);
-            MIFARE_LOG("Account data read successfully");
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Account data read successfully\r\n");
         }
     } else {
-        MIFARE_LOG("Account data read failed - will initialize on validation");
-        // Clear account data if read fails
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Account data read failed - will initialize on validation\r\n");
         memset(&card_data->account_data, 0, sizeof(MIFARE_AccountData_t));
     }
+    System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
     
-    // Validate data integrity
+    // === SECTION 10: Final validation and recovery ===
     result = MIFARE_ValidateCardData(card_data);
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [READ CARD DATA] Validation result: %s", MIFARE_GetResultString(result));
+    
+    if (result == MIFARE_RESULT_DATA_MISMATCH) {
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [READ CARD DATA] Data mismatch detected - attempting recovery...\r\n");
+        System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+        
+        MIFARE_Result_t recovery_result = MIFARE_RecoverCardData(card_data);
+        if (recovery_result == MIFARE_RESULT_OK) {
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [READ CARD DATA] Recovery successful - card data restored\r\n");
+            result = MIFARE_RESULT_OK;
+        } else {
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [READ CARD DATA] Recovery failed: %s", MIFARE_GetResultString(recovery_result));
+            result = recovery_result;
+            goto exit;
+        }
+    }
+    
     if (result == MIFARE_RESULT_OK) {
         card_data->data_valid = true;
-        card_data->last_read_time = mifare_get_timestamp();
+        card_data->last_read_time = (uint32_t)xTaskGetTickCount();
         mifare_update_write_snapshot(card_data);
         last_card_write_changed = false;
         no_change_log_reported = false;
+        
+        // Fix garbage balance_ml values (from old card format)
+        // Invalid if: > 200000 (200 liters max - reasonable for dispenser)
+        uint32_t current_balance = card_data->user_primary.balance_ml;
+
+        
+        // Fix garbage last_topup_ml values
+        // Invalid if: > 200000 (200 liters max) OR < balance_ml (impossible - can't have more than topped up)
+        uint32_t current_topup = card_data->user_primary.last_topup_ml;
+        bool topup_too_high = (current_topup > 200000);  // > 200 liters
+        bool topup_too_low = (current_topup < current_balance);  // Less than current balance
+        
+        if (topup_too_high || topup_too_low) {
+            // Set topup to 50 liters - standard capacity
+            uint32_t corrected_topup = 50000;  // 50 liters in ml
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Fixing invalid last_topup_ml: %lu -> %lu ml [too_%s]",
+                      current_topup, corrected_topup, topup_too_high ? "high" : "low\r\n");
+            card_data->user_primary.last_topup_ml = corrected_topup;
+            
+            // Update backup to match
+            card_data->user_backup.last_topup_ml = corrected_topup;
+            
+            // Write corrected data back to card (HMAC computed during write)
+            MIFARE_Result_t fix_result = MIFARE_WriteCardData(card_data);
+            if (fix_result == MIFARE_RESULT_OK) {
+                LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card data corrected and written successfully\r\n");
+            } else {
+                LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Failed to write corrected card data: %d", fix_result);
+            }
+        }
         
         // Check if phone number is empty (all zeros) and initialize with default
         bool phone_is_empty = mifare_is_account_data_empty(&card_data->account_data);
         
         if (phone_is_empty) {
-            MIFARE_LOG("Phone number empty, initializing with default: 07970242024");
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Phone number empty, initializing with default: 07970242024\r\n");
             
             // Encode default phone number "07970242024" with Normal validity into raw_data
             mifare_encode_account_data(&card_data->account_data, "07970242024", CARD_VALIDITY_NORMAL);
@@ -712,44 +765,44 @@ MIFARE_Result_t MIFARE_ReadCardData(MIFARE_CardData_t *card_data)
             phone_debug[ACCOUNT_DATA_PHONE_SIZE] = '\0';
             uint16_t crc = card_data->account_data.raw_data[ACCOUNT_DATA_CRC_OFFSET] | 
                           (card_data->account_data.raw_data[ACCOUNT_DATA_CRC_OFFSET + 1] << 8);
-            MIFARE_LOG("Writing account data: phone=%s, validity=%u, CRC=0x%04X",
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Writing account data: phone=%s, validity=%u, CRC=0x%04X",
                       phone_debug,
                       card_data->account_data.raw_data[ACCOUNT_DATA_VALIDITY_OFFSET],
                       crc);
             
             // Write account data to card
-            result = mifare_write_block_safe(MIFARE_BLOCK_ACCOUNT_DATA, 
-                                             card_data->account_data.raw_data);
+            result = mifare_write_block(MIFARE_BLOCK_ACCOUNT_DATA, 
+                                             card_data->account_data.raw_data, false);
             if (result == MIFARE_RESULT_OK) {
-                MIFARE_LOG("Default phone number written to card successfully");
+                LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Default phone number written to card successfully\r\n");
                 
                 // Verify by reading it back
                 uint8_t verify_block[16];
                 vTaskDelay(pdMS_TO_TICKS(20)); // Small delay for card to settle
-                result = mifare_read_block_safe(MIFARE_BLOCK_ACCOUNT_DATA, verify_block);
+                result = mifare_read_block(MIFARE_BLOCK_ACCOUNT_DATA, verify_block);
                 if (result == MIFARE_RESULT_OK) {
                     char phone_verify[12];
                     memcpy(phone_verify, &verify_block[ACCOUNT_DATA_PHONE_OFFSET], ACCOUNT_DATA_PHONE_SIZE);
                     phone_verify[ACCOUNT_DATA_PHONE_SIZE] = '\0';
-                    MIFARE_LOG("Verification read: phone=%s, validity=%u",
+                    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Verification read: phone=%s, validity=%u",
                               phone_verify,
                               verify_block[ACCOUNT_DATA_VALIDITY_OFFSET]);
                 } else {
-                    MIFARE_LOG("Failed to verify account data write");
+                    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Failed to verify account data write\r\n");
                 }
             } else {
-                MIFARE_LOG("Failed to write default phone number to card");
+                LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Failed to write default phone number to card\r\n");
             }
         } else {
             // Log existing phone number
             static char phone_existing[12];
             memcpy(phone_existing, &card_data->account_data.raw_data[ACCOUNT_DATA_PHONE_OFFSET], ACCOUNT_DATA_PHONE_SIZE);
             phone_existing[ACCOUNT_DATA_PHONE_SIZE] = '\0';
-            MIFARE_LOG("Phone number already set: '%s' (validity=%u)", 
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Phone number already set: '%s' (validity=%u)", 
                       phone_existing,
                       card_data->account_data.raw_data[ACCOUNT_DATA_VALIDITY_OFFSET]);
             // Debug: dump raw bytes
-            MIFARE_LOG("Raw phone bytes: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Raw phone bytes: %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
                       card_data->account_data.raw_data[0], card_data->account_data.raw_data[1], 
                       card_data->account_data.raw_data[2], card_data->account_data.raw_data[3],
                       card_data->account_data.raw_data[4], card_data->account_data.raw_data[5],
@@ -758,24 +811,30 @@ MIFARE_Result_t MIFARE_ReadCardData(MIFARE_CardData_t *card_data)
                       card_data->account_data.raw_data[10]);
         }
         
-        // Log card scan to SD card with all MIFARE block data
-        if (SD_Logger_IsReady()) {
+        System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+        
+        // Log card scan to SD card with all MIFARE block data (skip if flag set - e.g. during verification)
+        if (SD_Logger_IsReady() && !skip_sd_logging) {
             // Get card UID from transaction manager
             uint8_t uid_length = g_transaction_manager.card_info.uid_length;
             const uint8_t *card_uid = g_transaction_manager.card_info.uid;
             
             if (SD_Logger_LogMIFARECardScan(card_uid, uid_length, card_data, SD_LOG_TYPE_MIFARE_CARD_SCAN)) {
-                MIFARE_LOG("Card scan logged to SD card successfully");
+                LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card scan logged to SD card successfully\r\n");
             } else {
-                MIFARE_LOG("Failed to log card scan to SD card");
+                LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Failed to log card scan to SD card\r\n");
             }
-        } else {
-            MIFARE_LOG("SD Logger not ready - skipping card scan logging");
+        } else if (!skip_sd_logging) {
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: SD Logger not ready - skipping card scan logging\r\n");
         }
         
-        return MIFARE_RESULT_OK;
+        System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+        
+        result = MIFARE_RESULT_OK;  // Success path
     }
     
+exit:
+    // Single exit point - all paths converge here
     return result;
 }
 
@@ -791,103 +850,46 @@ MIFARE_Result_t MIFARE_UpdateTransactionProgress(uint32_t dispensed_ml, float fl
         return MIFARE_RESULT_ERROR;
     }
     
-    // Check if System.c polling detected card removal
-    // This catches removals even when PN532 writes succeed due to caching
-    if (g_transaction_manager.card_state != MIFARE_CARD_STATE_PRESENT) {
-        MIFARE_LOG("[UPDATE PROGRESS] Card removed (state=%d) - aborting", 
-                   g_transaction_manager.card_state);
-        return MIFARE_HandleCardRemovalDuringDispense();
-    }
-    
     MIFARE_Result_t result = MIFARE_RESULT_OK;
     
-    // Update dispensed amounts with underflow protection
-    g_transaction_manager.total_dispensed_this_session += dispensed_ml;
+    /* NOTE: This function is legacy from liquid dispensing system.
+     * For dispenser system, volume deduction happens in Dispenser Integration layer.
+     * This function just updates the transaction state on the card. */
     
-    // Prevent underflow: ensure dispensed_ml doesn't exceed balance
-    uint32_t current_balance = g_transaction_manager.current_card.user_primary.balance_ml;
-    if (dispensed_ml > current_balance) {
-        MIFARE_LOG("WARNING: Dispensed (%lu mL) exceeds balance (%lu mL), clamping to zero", 
-                   dispensed_ml, current_balance);
-        g_transaction_manager.current_card.user_primary.balance_ml = 0;
-    } else {
-        g_transaction_manager.current_card.user_primary.balance_ml -= dispensed_ml;
-    }
+    g_transaction_manager.current_card.user_primary.transaction_state = CARD_TRANSACTION_DISPENSING;
     
-    g_transaction_manager.current_card.usage_data.total_dispensed_ml += dispensed_ml;
-    g_transaction_manager.current_card.user_primary.transaction_state = TRANSACTION_STATE_IN_PROGRESS;
+    /* Main Data Update - write primary+backup every MIFARE_MAIN_DATA_UPDATE_MS */
+    uint32_t current_time = (uint32_t)xTaskGetTickCount();
+    uint32_t time_since_main_update = current_time - g_transaction_manager.last_card_update_time;
     
-    bool fast_balance_updated = false;
-
-    // Update fast balance cache every 500ms (lightweight, balance-only write)
-    uint32_t current_time = mifare_get_timestamp();
-    if ((current_time - g_transaction_manager.last_fast_balance_update_time) >= MIFARE_FAST_BALANCE_UPDATE_MS) {
-        // Update fast balance structure
-        mifare_fast_balance_update(&g_transaction_manager.current_card.fast_balance_primary,
-                                   g_transaction_manager.current_card.user_primary.balance_ml);
-        
-        // Alternating write pattern for fast balance: write primary OR backup, not both
-        // This reduces I2C traffic during high-frequency updates
-        bool write_primary = (g_transaction_manager.write_cycle_counter == 0);
-        uint8_t target_block = write_primary ? MIFARE_BLOCK_FAST_BALANCE_PRIMARY : MIFARE_BLOCK_FAST_BALANCE_BACKUP;
-        
-        uint8_t block_data[16];
-        memcpy(block_data, &g_transaction_manager.current_card.fast_balance_primary, sizeof(MIFARE_FastBalance_t));
-        
-        MIFARE_Result_t fast_result = mifare_write_block_safe(target_block, block_data);
-        if (fast_result == MIFARE_RESULT_OK) {
-            g_transaction_manager.last_fast_balance_update_time = current_time;
-            fast_balance_updated = true;
-        } else if (fast_result == MIFARE_RESULT_CARD_REMOVED) {
-            // Card removed during write - detected by mifare_write_block_safe()
-            MIFARE_LOG("Fast balance write failed - card removed during write");
-            return MIFARE_HandleCardRemovalDuringDispense();
-        } else if (fast_result == MIFARE_RESULT_WRITE_FAILED) {
-            // Write failed but card is still present (I2C/PN532 issue)
-            // This is non-critical for fast balance updates - continue dispensing
-            MIFARE_LOG("Fast balance write failed (I2C issue, card present, non-critical)");
-            g_transaction_manager.last_fast_balance_update_time = current_time; 
-        } else {
-            // Other error types - log but continue
-            MIFARE_LOG("Fast balance write failed (non-critical), result: %s", MIFARE_GetResultString(fast_result));
-            g_transaction_manager.last_fast_balance_update_time = current_time; 
-        }
-    }
-    
-    // Update main user data every 2000ms (full data write)
-    // STAGGER LOGIC: Only update main data if we didn't just update fast balance
-    // This prevents "double writes" in the same tick which can overwhelm the I2C bus/PN532
-    if (!fast_balance_updated && (current_time - g_transaction_manager.last_card_update_time) >= MIFARE_MAIN_DATA_UPDATE_MS) {
+    if (time_since_main_update >= MIFARE_MAIN_DATA_UPDATE_MS) {
         result = MIFARE_WriteCardData(&g_transaction_manager.current_card);
         if (result == MIFARE_RESULT_OK) {
             g_transaction_manager.last_card_update_time = current_time;
             g_transaction_manager.consecutive_errors = 0;
             if (last_card_write_changed) {
-                MIFARE_LOG("Main data updated: %lu mL dispensed, %lu mL remaining (%.2f L/min)", 
-                           g_transaction_manager.total_dispensed_this_session,
-                           g_transaction_manager.current_card.user_primary.balance_ml,
-                           flow_rate_lpm);
+                LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card updated: %lu ml remaining", 
+                           g_transaction_manager.current_card.user_primary.balance_ml);
             } else if (!no_change_log_reported) {
-                MIFARE_LOG("Main data unchanged - skipping PN532 write (dispensed=%lu mL)",
-                           g_transaction_manager.total_dispensed_this_session);
+                LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Data unchanged - skipping write\r\n");
                 no_change_log_reported = true;
             }
         } else if (result == MIFARE_RESULT_CARD_REMOVED) {
             // Card removed during write - detected immediately
-            MIFARE_LOG("Main data write failed - card removed");
-            return MIFARE_HandleCardRemovalDuringDispense();
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Write failed - card removed\r\n");
+            return MIFARE_HandleCardRemovalDuringTransaction();
         } else {
             // Other errors (WRITE_FAILED, etc) - card still present but I2C issues
             g_transaction_manager.consecutive_errors++;
-            MIFARE_LOG("Failed to update main data (error %u/%u): %s", 
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Write failed (error %u/%u): %s", 
                        g_transaction_manager.consecutive_errors,
-                       MIFARE_CARD_REMOVAL_FAIL_COUNT,
+                       Config_Get()->mifare.card_removal_fail_count,
                        MIFARE_GetResultString(result));
             
             // If multiple consecutive I2C errors, something is seriously wrong
-            if (g_transaction_manager.consecutive_errors >= MIFARE_CARD_REMOVAL_FAIL_COUNT) {
-                MIFARE_LOG("Excessive write failures despite card present - critical I2C error");
-                return MIFARE_HandleCardRemovalDuringDispense();
+            if (g_transaction_manager.consecutive_errors >= Config_Get()->mifare.card_removal_fail_count) {
+                LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Excessive write failures - critical I2C error\r\n");
+                return MIFARE_HandleCardRemovalDuringTransaction();
             }
         }
     }
@@ -897,6 +899,7 @@ MIFARE_Result_t MIFARE_UpdateTransactionProgress(uint32_t dispensed_ml, float fl
 
 /**
  * @brief Commit the transaction (mark as completed)
+ * @details Writes COMMIT_READY state, logs transaction, then writes COMMITTED state
  * @return MIFARE_Result_t Operation result
  */
 MIFARE_Result_t MIFARE_CommitTransaction(void)
@@ -905,33 +908,42 @@ MIFARE_Result_t MIFARE_CommitTransaction(void)
         return MIFARE_RESULT_ERROR;
     }
     
-    // Set commit ready state
-    g_transaction_manager.current_card.user_primary.transaction_state = TRANSACTION_STATE_COMMIT_READY;
+    /* Step 1: Write Commit Ready State */
+    g_transaction_manager.current_card.user_primary.transaction_state = CARD_TRANSACTION_COMMIT_READY;
     
     MIFARE_Result_t result = MIFARE_WriteCardData(&g_transaction_manager.current_card);
     if (result != MIFARE_RESULT_OK) {
-        MIFARE_LOG("Failed to write commit ready state");
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Failed to write commit ready state\r\n");
         g_transaction_manager.transaction_active = false;
-        mifare_transition_state(DISPENSE_STATE_ERROR);
+        // Only transition to WAITING_FOR_REMOVAL if card wasn't removed (removal already cleaned up state)
+        if (result != MIFARE_RESULT_CARD_REMOVED) {
+            mifare_transition_state(TRANSACTION_STATE_WAITING_FOR_REMOVAL);
+            LOG_CRITICAL_MIFARE_TRANSACTION_MANAGER("[✗] Transaction commit failed\r\n");
+            LOG_CRITICAL_MIFARE_TRANSACTION_MANAGER("[→] Remove card and re-insert to retry.\r\n");
+        }
         return result;
     }
     
-    // Log the transaction
-    MIFARE_LogTransaction(2, g_transaction_manager.total_dispensed_this_session, 0);
+    /* Step 2: Log Transaction */
+    MIFARE_LogTransaction(2, 0, 0);  // Type 2 = Dispense Completed, volume handled by business logic
     
-    // Final commit
-    g_transaction_manager.current_card.user_primary.transaction_state = TRANSACTION_STATE_COMMITTED;
+    /* Step 3: Write Final Commit State */
+    g_transaction_manager.current_card.user_primary.transaction_state = CARD_TRANSACTION_COMMITTED;
     result = MIFARE_WriteCardData(&g_transaction_manager.current_card);
     
     if (result == MIFARE_RESULT_OK) {
         g_transaction_manager.transaction_active = false;
-        mifare_transition_state(DISPENSE_STATE_READY_TO_DISPENSE);
-        MIFARE_LOG("Transaction committed successfully - %lu mL dispensed", 
-                   g_transaction_manager.total_dispensed_this_session);
+        // total_dispensed_this_session removed - handled by business logic
+        mifare_transition_state(TRANSACTION_STATE_READY);
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Transaction committed successfully - dispensed amount logged\r\n");
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Transaction flag cleared - polling resumed\r\n");
     } else {
         g_transaction_manager.transaction_active = false;
-        mifare_transition_state(DISPENSE_STATE_ERROR);
-        MIFARE_LOG("Transaction commit failed");
+        // Only transition to error if card wasn't removed (removal already cleaned up state)
+        if (result != MIFARE_RESULT_CARD_REMOVED) {
+            MIFARE_SetErrorState_WriteFailed();
+        }
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Transaction flag cleared (after error) - polling resumed\r\n");
     }
     
     
@@ -945,49 +957,22 @@ MIFARE_Result_t MIFARE_CommitTransaction(void)
 MIFARE_Result_t MIFARE_RollbackTransaction(void)
 {
     if (!g_transaction_manager.transaction_active) {
-        MIFARE_LOG("No active transaction to rollback");
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: No active transaction to rollback\r\n");
         return MIFARE_RESULT_ERROR;
     }
     
-    // Check if card removal abort flag is set - if so, discard transaction data
-    if (g_transaction_manager.card_removal_abort) {
-        MIFARE_LOG("Card removed during transaction - DISCARDING rollback data (different card may be placed)");
-        
-        // DO NOT restore balance or modify current_card data
-        // The card that was removed has whatever balance it had at last successful write
-        // A different card may be placed next, so we must not keep stale data
-        
-        // Log the aborted/discarded transaction
-        MIFARE_LogTransaction(3, g_transaction_manager.total_dispensed_this_session, 0); // Type 3 = Rollback/Abort
-        
-        // Clear ALL transaction state and card data
-        g_transaction_manager.transaction_active = false;
-        g_transaction_manager.total_dispensed_this_session = 0;
-        g_transaction_manager.has_last_written_snapshot = false;  // Invalidate snapshot
-        
-        // Zero out card data to prevent confusion with next card
-        memset(&g_transaction_manager.current_card, 0, sizeof(MIFARE_CardData_t));
-        memset(&g_transaction_manager.last_written_user_data, 0, sizeof(MIFARE_UserData_t));
-        memset(&g_transaction_manager.last_written_recovery_info, 0, sizeof(MIFARE_RecoveryInfo_t));
-        
-        // Transition to idle state (card is gone, ready for new card)
-        mifare_transition_state(DISPENSE_STATE_IDLE);
-        MIFARE_LOG("Transaction data discarded - system ready for new card");
-        
-        return MIFARE_RESULT_CARD_REMOVED;
-    }
+    // Perform rollback
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Rolling back transaction - restoring previous balance\r\n");
     
-    // Card is still present - perform normal rollback
-    MIFARE_LOG("Rolling back transaction - restoring previous balance");
-    
-    // Restore original balance by undoing any dispensed amount
-    g_transaction_manager.current_card.user_primary.balance_ml += g_transaction_manager.total_dispensed_this_session;
+    // NOTE: Balance restoration is handled by business logic (Dispenser Integration)
+    // Transaction Manager just resets the card state
+    // g_transaction_manager.current_card.user_primary.balance_ml managed by business logic
     
     // Reset transaction state
-    g_transaction_manager.current_card.user_primary.transaction_state = TRANSACTION_STATE_IDLE;
+    g_transaction_manager.current_card.user_primary.transaction_state = CARD_TRANSACTION_IDLE;
     
     // Card is still present - attempt to write rollback to card
-    MIFARE_LOG("Card still present - attempting to write rollback to card");
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card still present - attempting to write rollback to card\r\n");
     
     // CRITICAL: Wait for any in-progress I2C operations to complete
     // If safety timeout occurred during a write, the I2C semaphore may still be held
@@ -995,14 +980,14 @@ MIFARE_Result_t MIFARE_RollbackTransaction(void)
     vTaskDelay(pdMS_TO_TICKS(200));
     
     // Wake PN532 if it entered sleep mode during long dispense operation
-    PN532_Status_t pn532_status = PN532_Wakeup();
+    PN532_Status_t pn532_status = PN532_Wakeup(g_transaction_manager.pn532_handle);
     if (pn532_status != PN532_STATUS_OK) {
-        MIFARE_LOG("Failed to wake PN532 for rollback, continuing anyway...");
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Failed to wake PN532 for rollback, continuing anyway...\r\n");
         // Give it another chance - maybe still recovering from interrupted operation
         vTaskDelay(pdMS_TO_TICKS(100));
-        pn532_status = PN532_Wakeup();
+        pn532_status = PN532_Wakeup(g_transaction_manager.pn532_handle);
         if (pn532_status != PN532_STATUS_OK) {
-            MIFARE_LOG("PN532 wakeup failed again - I2C may be stuck");
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: PN532 wakeup failed again - I2C may be stuck\r\n");
         }
     }
     
@@ -1019,29 +1004,28 @@ MIFARE_Result_t MIFARE_RollbackTransaction(void)
         }
         
         if (retry < max_retries - 1) {
-            MIFARE_LOG("Rollback write failed (attempt %d/%d), retrying...", retry + 1, max_retries);
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Rollback write failed (attempt %d/%d), retrying...", retry + 1, max_retries);
             vTaskDelay(pdMS_TO_TICKS(100));  // Wait before retry
         }
     }
     
     if (result != MIFARE_RESULT_OK) {
-        MIFARE_LOG("Failed to write rollback to card after %d attempts - balance restored in memory only", max_retries);
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Failed to write rollback to card after %d attempts - balance restored in memory only", max_retries);
     }
     
     // Log the rollback transaction
-    MIFARE_LogTransaction(3, g_transaction_manager.total_dispensed_this_session, 0); // Type 3 = Rollback
+    MIFARE_LogTransaction(3, 0, 0); // Type 3 = Rollback, handled by business logic
     
     // Clear transaction state
     g_transaction_manager.transaction_active = false;
-    g_transaction_manager.total_dispensed_this_session = 0;
+    // total_dispensed_this_session removed - handled by business logic
     
     // Transition to appropriate state
     if (result == MIFARE_RESULT_OK) {
-        mifare_transition_state(DISPENSE_STATE_READY_TO_DISPENSE);
-        MIFARE_LOG("Transaction rollback completed successfully");
+        mifare_transition_state(TRANSACTION_STATE_READY);
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Transaction rollback completed successfully\r\n");
     } else {
-        mifare_transition_state(DISPENSE_STATE_ERROR);
-        MIFARE_LOG("Transaction rollback completed with errors");
+        MIFARE_SetErrorState_WriteFailed();
     }
 
     
@@ -1049,65 +1033,22 @@ MIFARE_Result_t MIFARE_RollbackTransaction(void)
 }
 
 /**
- * @brief Handle card removal during dispensing with rollback
- * @return MIFARE_Result_t Operation result
+ * @brief Handle card removal during transaction - logs event and cleans up state
+ * @return MIFARE_RESULT_CARD_REMOVED always
  */
-MIFARE_Result_t MIFARE_HandleCardRemovalDuringDispense(void)
+MIFARE_Result_t MIFARE_HandleCardRemovalDuringTransaction(void)
 {
-    MIFARE_LOG("CRITICAL: Card removed during dispensing - attempting emergency rollback");
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card removed during transaction\r\n");
 
-    // CRITICAL: Set abort flag to prevent any further write attempts
-    // This is essential because the card is gone and PN532 may be in bad state
-    g_transaction_manager.card_removal_abort = true;
+    // Log to SD card for audit trail
+    SD_Logger_LogEvent("CARD_REMOVED: UID=%02X%02X%02X%02X",
+                       g_transaction_manager.card_info.uid[0],
+                       g_transaction_manager.card_info.uid[1],
+                       g_transaction_manager.card_info.uid[2],
+                       g_transaction_manager.card_info.uid[3]);
     
-    // Set recovery delay - PN532 needs time to recover from failed operations
-    // Prevents immediate re-detection causing further errors
-    g_transaction_manager.pn532_recovery_until_tick = xTaskGetTickCount() + pdMS_TO_TICKS(150);
-    
-    // Set card state to ABSENT so polling can resume
-    MIFARE_SetCardState(MIFARE_CARD_STATE_ABSENT);
-    last_authenticated_sector = -1;  // Clear authentication cache
-    
-    mifare_clear_write_snapshot();
-    last_card_write_changed = false;
-    no_change_log_reported = false;
-    
-    // Reset write failure tracking
-    g_transaction_manager.write_failure_first_tick = 0;
-    g_transaction_manager.consecutive_write_failures = 0;
-    
-    // Mark transaction as needing rollback
-    g_transaction_manager.current_card.user_primary.transaction_state = TRANSACTION_STATE_ROLLBACK;
-    
-    // If we can't write to the card (it's gone), we need to store the rollback information
-    // for when the card is reinserted
-    // This is where a system-side transaction log would be critical
-    
-    g_transaction_manager.transaction_active = false;
-    
-    // Update UI - card removed during dispensing
-    if (g_transaction_manager.ui_state_card_present) {
-        ui_set_label_text(ui_cardRemaining, "0mL");
-        ui_set_bar_value(ui_totalRemainingBar, 0, LV_ANIM_ON);
-        g_transaction_manager.ui_state_card_present = false;
-        MIFARE_LOG("UI updated - card absent");
-    }
-    
-    // Log the incomplete transaction for audit purposes
-    MIFARE_LOG("Emergency rollback: %lu mL was dispensed before card removal", 
-               g_transaction_manager.total_dispensed_this_session);
-    
-    // CLEANUP: Clear transaction session data
-    g_transaction_manager.total_dispensed_this_session = 0;
-    
-    // CLEANUP: Clear card data to prevent stale data usage
-    memset(&g_transaction_manager.current_card, 0, sizeof(MIFARE_CardData_t));
-    
-    // Reset to IDLE state so system can accept new cards
-    // This must be done AFTER logging/cleanup but before returning
-    g_transaction_manager.dispense_state = DISPENSE_STATE_IDLE;
-    MIFARE_LOG("State transition: Card Removed -> Idle (ready for new card)");
-
+    // Clean up all state (ForceCardRemoval takes mutex, we're not holding it here)
+    MIFARE_ForceCardRemoval();
     
     return MIFARE_RESULT_CARD_REMOVED;
 }
@@ -1115,39 +1056,55 @@ MIFARE_Result_t MIFARE_HandleCardRemovalDuringDispense(void)
 /*Private helper functions --------------------------------------*/
 
 /**
- * @brief Validate if a block number is safe to access
- * @param block_number Block number to validate
- * @param is_write True if validating for write operation, false for read
- * @return bool True if block is valid and safe to access
- * 
- * @details MIFARE Classic 1K has blocks 0-63 organized in 16 sectors.
- *          Sector trailers (blocks 3, 7, 11, 15, etc.) contain authentication keys
- *          and access bits. Writing to these blocks can permanently lock the card.
- *          This function prevents accidental writes to sector trailers.
+ * @brief Write block with retry logic (handles timeouts and card removal)
+ * @param block_number Block number to write
+ * @param data Data buffer to write (16 bytes)
+ * @param timeout_ms Maximum time to retry before giving up
+ * @param block_name Description for logging
+ * @return MIFARE_Result_t Operation result
  */
-static bool mifare_is_valid_block(uint8_t block_number, bool is_write)
+static MIFARE_Result_t mifare_write_block_with_retry(
+    uint8_t block_number, 
+    uint8_t *data, 
+    uint32_t timeout_ms,
+    const char *block_name)
 {
-    // Block 0 is manufacturer data - read-only, should never be written
-    if (is_write && block_number == 0) {
-        MIFARE_LOG("ERROR: Attempted to write to manufacturer block 0");
-        return false;
-    }
+    TickType_t start_tick = xTaskGetTickCount();
+    MIFARE_Result_t result;
     
-    // MIFARE Classic 1K has blocks 0-63
-    if (block_number > 63) {
-        MIFARE_LOG("ERROR: Invalid block number %d (max 63)", block_number);
-        return false;
-    }
+    do {
+        /* Feed WDT at start of each retry iteration */
+        System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+        
+        // Check for card removal
+        if (g_transaction_manager.card_state == MIFARE_CARD_STATE_ABSENT) {
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Write aborted - card removed during retry loop\r\n");
+            return MIFARE_RESULT_CARD_REMOVED;
+        }
+
+        result = mifare_write_block(block_number, data, false);
+        if (result == MIFARE_RESULT_OK) break;
+        if (result == MIFARE_RESULT_CARD_REMOVED) {
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card removed during %s write", block_name);
+            break;
+        }
+        
+        // Check timeout
+        uint32_t elapsed_ms = pdTICKS_TO_MS(xTaskGetTickCount() - start_tick);
+        if (elapsed_ms > timeout_ms) {
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Write timeout (%lu ms) for %s", elapsed_ms, block_name);
+            return MIFARE_RESULT_TIMEOUT;
+        }
+        
+        /* Feed WDT before delay */
+        System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+        vTaskDelay(pdMS_TO_TICKS(20));
+    } while (result != MIFARE_RESULT_OK);
     
-    // Sector trailers contain keys and access bits - MUST NOT be written
-    if (is_write && MIFARE_IS_SECTOR_TRAILER(block_number)) {
-        MIFARE_LOG("ERROR: Attempted to write to sector trailer block %d", block_number);
-        MIFARE_LOG("       Sector trailers contain authentication keys and must not be modified");
-        return false;
-    }
-    
-    return true;
+    return result;
 }
+
+
 
 /**
  * @brief Unified card presence verification - SINGLE SOURCE OF TRUTH for all presence checks
@@ -1169,11 +1126,17 @@ static bool mifare_is_valid_block(uint8_t block_number, bool is_write)
  */
 MIFARE_Result_t MIFARE_VerifyCardPresence(void)
 {
+    /* Feed WDT before potentially blocking I2C operation */
+    System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+    
     PN532_CardInfo_t current_card;
-    PN532_Status_t status = PN532_DetectCard(&current_card);
+    PN532_Status_t status = PN532_DetectCard(g_transaction_manager.pn532_handle, &current_card);
+    
+    /* Feed WDT after I2C operation */
+    System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
     
     if (status != PN532_STATUS_CARD_DETECTED) {
-        MIFARE_LOG("[PRESENCE CHECK] Card not detected (status=%d)", status);
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [PRESENCE CHECK] Card not detected (status=%d)", status);
         return MIFARE_RESULT_CARD_REMOVED;
     }
     
@@ -1182,7 +1145,7 @@ MIFARE_Result_t MIFARE_VerifyCardPresence(void)
         current_card.uid_length > sizeof(current_card.uid) ||
         g_transaction_manager.card_info.uid_length > sizeof(g_transaction_manager.card_info.uid) ||
         memcmp(current_card.uid, g_transaction_manager.card_info.uid, current_card.uid_length) != 0) {
-        MIFARE_LOG("[PRESENCE CHECK] Different card detected (UID mismatch)");
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [PRESENCE CHECK] Different card detected (UID mismatch)\r\n");
         return MIFARE_RESULT_CARD_REMOVED;
     }
     
@@ -1191,189 +1154,421 @@ MIFARE_Result_t MIFARE_VerifyCardPresence(void)
 }
 
 /**
- * @brief Authenticate MIFARE block with sector caching
- * @param block_number Block to authenticate
- * @return MIFARE_Result_t Operation result
- * 
- * @details This function caches the last authenticated sector to avoid
- *          unnecessary re-authentication. MIFARE Classic keeps authentication
- *          active for a sector until another sector is accessed or card is removed.
+ * @brief Helper to convert driver status to transaction manager result
  */
-static MIFARE_Result_t mifare_authenticate_block(uint8_t block_number)
+static MIFARE_Result_t mifare_convert_driver_status(MIFARE_Classic_Status_t status)
 {
-    uint8_t sector = MIFARE_GET_SECTOR(block_number);
-    
-    // Skip authentication if we're already authenticated to this sector
-    if (last_authenticated_sector == (int8_t)sector) {
-        // Using cached auth - no logging to reduce spam
-        return MIFARE_RESULT_OK;
-    }
-    
-    MIFARE_LOG("Authenticating block %d (sector %d) with UID length %d", 
-               block_number, sector, g_transaction_manager.card_info.uid_length);
-    
-    // Retry authentication up to 3 times with delay between attempts
-    // This handles transient I2C communication errors
-    const uint8_t max_retries = 3;
-    PN532_Status_t status = PN532_STATUS_ERROR;
-    
-    for (uint8_t retry = 0; retry < max_retries; retry++) {
-        if (retry > 0) {
-            // Check if card is still present before retrying - fail fast if removed
-            MIFARE_LOG("[AUTH RETRY] Checking card presence before retry %d/%d...", retry, max_retries);
-            MIFARE_Result_t presence = MIFARE_VerifyCardPresence();
-            if (presence != MIFARE_RESULT_OK) {
-                MIFARE_LOG("[AUTH RETRY] Card removed during authentication retry - aborting");
-                last_authenticated_sector = -1;
-                return MIFARE_RESULT_CARD_REMOVED;
-            }
-            MIFARE_LOG("[AUTH RETRY] Card still present, proceeding with retry");
-            
-            USB_Log_Printf("MIFARE: Authentication retry %d/%d for block %d\r\n", 
-                          retry, max_retries - 1, block_number);
-            vTaskDelay(pdMS_TO_TICKS(50));  // Allow I2C/RF recovery
-        }
-        
-
-        status = PN532_MifareAuthenticate(
-            block_number, 
-            g_transaction_manager.card_info.uid,
-            g_transaction_manager.card_info.uid_length,
-            mifare_auth_key
-        );
-        
-        if (status == PN532_STATUS_OK) {
-            if (retry > 0) {
-                 MIFARE_LOG("MIFARE: Authentication succeeded on retry %d\r\n", retry);
-            }
-            last_authenticated_sector = (int8_t)sector;
-            MIFARE_LOG("Authentication successful for sector %d", sector);
+    switch (status) {
+        case MIFARE_CLASSIC_OK:
             return MIFARE_RESULT_OK;
-        }
+        case MIFARE_CLASSIC_ERROR_AUTHENTICATION_FAILED:
+            return MIFARE_RESULT_AUTHENTICATION_FAILED;
+        case MIFARE_CLASSIC_ERROR_READ_FAILED:
+            return MIFARE_RESULT_ERROR;
+        case MIFARE_CLASSIC_ERROR_WRITE_FAILED:
+            return MIFARE_RESULT_WRITE_FAILED;
+        case MIFARE_CLASSIC_ERROR_SECTOR_TRAILER:
+        case MIFARE_CLASSIC_ERROR_MANUFACTURER_BLOCK:
+        case MIFARE_CLASSIC_ERROR_INVALID_BLOCK:
+        case MIFARE_CLASSIC_ERROR_INVALID_PARAM:
+        default:
+            return MIFARE_RESULT_ERROR;
     }
-    
-    // All retries failed
-    last_authenticated_sector = -1;  // Clear cache on failure
-    MIFARE_LOG("Authentication FAILED for block %d (sector %d) after %d attempts, PN532 status: %d", 
-               block_number, sector, max_retries, status);
-    return MIFARE_RESULT_AUTHENTICATION_FAILED;
 }
 
 /**
- * @brief Safely read MIFARE block with authentication and verification
+ * @brief Read MIFARE block and handle decryption/HMAC (business logic)
  * @param block_number Block to read
  * @param data Buffer to store data (16 bytes)
  * @return MIFARE_Result_t Operation result
- * 
- * @details This function performs the following safety checks:
- *          1. Validates the block number
- *          2. Authenticates the block before reading
- *          3. Reads the block data
  */
-static MIFARE_Result_t mifare_read_block_safe(uint8_t block_number, uint8_t *data)
+static MIFARE_Result_t mifare_read_block(uint8_t block_number, uint8_t *data)
 {
     if (data == NULL) {
         return MIFARE_RESULT_ERROR;
     }
     
-    // Validate block number (reads can access any block except invalid ones)
-    if (!mifare_is_valid_block(block_number, false)) {
-        return MIFARE_RESULT_ERROR;
+    // Setup authentication credentials with derived sector key
+    MIFARE_Classic_Auth_t auth = {
+        .uid_length = g_transaction_manager.card_info.uid_length
+    };
+    memcpy(auth.key, derived_sector_key, 6);  // Use derived key
+    memcpy(auth.uid, g_transaction_manager.card_info.uid, auth.uid_length);
+    
+    // Debug: show auth cache state before read
+    uint8_t target_sector = MIFARE_GET_SECTOR(block_number);
+    if (last_authenticated_sector != target_sector) {
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [READ BLOCK %d] Will re-auth (cached sector=%d, target=%d)", 
+                   block_number, last_authenticated_sector, target_sector);
     }
     
-    // Authenticate the block before reading
-    MIFARE_Result_t auth_result = mifare_authenticate_block(block_number);
-    if (auth_result != MIFARE_RESULT_OK) {
-        MIFARE_LOG("Authentication failed for block %d", block_number);
-        return auth_result;
-    }
+    // Call driver - it handles all validation, authentication, and retries
+    // Feed WDT before and after potentially long I2C operations
+    System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+    MIFARE_Classic_Status_t driver_status = MIFARE_Classic_ReadBlock(
+        g_transaction_manager.pn532_handle,
+        block_number,
+        &auth,
+        &last_authenticated_sector,
+        data
+    );
+    System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
     
-    // Read the block with retries
-    PN532_Status_t status = PN532_STATUS_ERROR;
-    const uint8_t max_retries = 3;
+    // If derived key fails, try factory key as fallback for all sectors
+    // when custom keys are disabled (decryptcard/recovery mode)
+    const SystemConfig_t *config = Config_Get();
+    bool try_factory_fallback = !config->mifare.security.use_custom_sector_keys;
     
-    for (uint8_t retry = 0; retry < max_retries; retry++) {
-        status = PN532_MifareReadBlock(block_number, data);
-        if (status == PN532_STATUS_OK) {
-            return MIFARE_RESULT_OK;
+    if (driver_status != MIFARE_CLASSIC_OK && try_factory_fallback) {
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [READ BLOCK %d] Derived key failed (0x%02X) - trying factory key fallback", 
+                   block_number, driver_status);
+        
+        // CRITICAL: After failed auth, PN532 requires re-selecting card before trying another key
+        last_authenticated_sector = -1;
+        vTaskDelay(pdMS_TO_TICKS(50));
+        System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+        
+        PN532_CardInfo_t reselect_info;
+        PN532_Status_t reselect_status = PN532_ReadPassiveTargetID(
+            g_transaction_manager.pn532_handle,
+            PN532_CARD_TYPE_106_TYPE_A,
+            &reselect_info
+        );
+        
+        if (reselect_status != PN532_STATUS_CARD_DETECTED) {
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [READ BLOCK %d] Card re-selection failed for factory key retry", block_number);
+            return MIFARE_RESULT_CARD_REMOVED;  // Fast fail - card likely removed
         }
         
-        if (retry < max_retries - 1) {
-            // If read failed, maybe we need to re-authenticate?
-            // Some cards lose auth state on error
-            // Force re-authentication by clearing cache
+        // Now try with factory key
+        uint8_t factory_key[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+        memcpy(auth.key, factory_key, 6);
+        
+        System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+        driver_status = MIFARE_Classic_ReadBlock(
+            g_transaction_manager.pn532_handle,
+            block_number,
+            &auth,
+            &last_authenticated_sector,
+            data
+        );
+        System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+        
+        if (driver_status == MIFARE_CLASSIC_OK) {
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [READ BLOCK %d] Factory key fallback succeeded", block_number);
+            
+            // CRITICAL: After factory key fallback succeeds, invalidate auth cache
+            // This forces re-auth with derived keys on next operation to a different sector
+            // Otherwise PN532 may be in an inconsistent state causing subsequent derived key auths to fail
             last_authenticated_sector = -1;
-            vTaskDelay(pdMS_TO_TICKS(10));
-            mifare_authenticate_block(block_number);
+        } else {
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [READ BLOCK %d] Factory key also failed: 0x%02X", block_number, driver_status);
         }
+    } else if (driver_status != MIFARE_CLASSIC_OK) {
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [READ BLOCK %d] Derived key failed (0x%02X) - no fallback for sector %d", 
+                   block_number, driver_status, target_sector);
     }
     
-    MIFARE_LOG("Read failed for block %d after %d attempts, status: 0x%02X", block_number, max_retries, status);
-    return MIFARE_RESULT_ERROR;
+    if (driver_status == MIFARE_CLASSIC_OK) {
+        // Successful read - decrypt if needed
+        if (mifare_is_block_encrypted(block_number)) {
+            // Decrypt the block
+            const SystemConfig_t *config = Config_Get();
+            MIFARE_SecurityConfig_t sec_config = {
+                .encryption_enabled = config->mifare.security.encryption_enabled
+            };
+            memcpy(sec_config.master_key, config->mifare.security.master_key, 32);
+            
+            MIFARE_Security_Status_t sec_status = MIFARE_Security_DecryptBlock(
+                &g_transaction_manager.security_context,
+                &sec_config,
+                block_number,
+                data
+            );
+            
+            if (sec_status != MIFARE_SEC_OK) {
+                LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Decryption failed for block %d: %s", 
+                           block_number, MIFARE_Security_GetStatusString(sec_status));
+                return MIFARE_RESULT_ERROR;
+            }
+            
+            // Verify HMAC if enabled (for encrypted blocks with authentication)
+            const SystemConfig_t *config_hmac = Config_Get();
+            if (config_hmac->mifare.security.enable_hmac_auth) {
+                // Extract HMAC tag from last 4 bytes
+                uint8_t hmac_tag[4];
+                memcpy(hmac_tag, &data[12], 4);
+                
+                MIFARE_SecurityConfig_t sec_config_hmac = {
+                    .hmac_enabled = config_hmac->mifare.security.enable_hmac_auth
+                };
+                memcpy(sec_config_hmac.hmac_key, config_hmac->mifare.security.hmac_key, 32);
+                
+                // Verify HMAC on first 12 bytes (encrypted payload)
+                sec_status = MIFARE_Security_VerifyHMAC(
+                    &g_transaction_manager.security_context,
+                    &sec_config_hmac,
+                    block_number,
+                    data,
+                    hmac_tag
+                );
+                
+                if (sec_status == MIFARE_SEC_ERROR_HMAC_MISMATCH) {
+                    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: HMAC verification failed for block %d - data may be tampered", block_number);
+                    
+                    // For user data blocks (primary/backup), return error so caller can try backup
+                    // This handles sudden card removal corruption - backup may still be valid
+                    if (block_number == MIFARE_BLOCK_USER_PRIMARY || block_number == MIFARE_BLOCK_USER_BACKUP) {
+                        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: User data block HMAC failed - enabling backup fallback\r\n");
+                        return MIFARE_RESULT_CARD_CORRUPTED;  // Signals "try backup" in ReadCardData
+                    }
+                    
+                    // For other blocks (header, etc), check auto_reinit policy
+                    if (!config_hmac->mifare.auto_reinit_on_corruption) {
+                        return MIFARE_RESULT_CARD_CORRUPTED;
+                    }
+                    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Auto-reinit enabled - continuing despite HMAC mismatch\r\n");
+                } else if (sec_status != MIFARE_SEC_OK) {
+                    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: HMAC verification error for block %d: %s",
+                               block_number, MIFARE_Security_GetStatusString(sec_status));
+                }
+            }
+        }
+        
+        return MIFARE_RESULT_OK;
+    }
+    
+    // Driver returned error - convert to transaction manager result
+    return mifare_convert_driver_status(driver_status);
 }
 
 /**
- * @brief Safely write MIFARE block with authentication and protection
+ * @brief Write MIFARE block with encryption/HMAC handling (business logic)
  * @param block_number Block to write
  * @param data Data to write (16 bytes)
  * @return MIFARE_Result_t Operation result
- * 
- * @details This function performs critical safety checks:
- *          1. Validates the block number is not a sector trailer (contains keys)
- *          2. Validates the block number is not block 0 (manufacturer data)
- *          3. Authenticates the block before writing
- *          4. Writes the block data
- * 
- * @warning This function will REJECT writes to:
- *          - Block 0 (manufacturer block)
- *          - Blocks 3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47, 51, 55, 59, 63
- *            (sector trailers containing authentication keys and access bits)
  */
-static MIFARE_Result_t mifare_write_block_safe(uint8_t block_number, uint8_t *data)
+static MIFARE_Result_t mifare_write_block(uint8_t block_number, uint8_t *data, bool allow_trailer_write)
 {
+    TickType_t block_write_start = xTaskGetTickCount();  // BENCHMARK: Total block write time
+    uint32_t hmac_ms = 0, encrypt_ms = 0, reselect_ms = 0, driver_write_ms = 0;
+    
     if (data == NULL) {
         return MIFARE_RESULT_ERROR;
     }
     
-    // CRITICAL: Validate block number to prevent writing to key blocks
-    if (!mifare_is_valid_block(block_number, true)) {
-        MIFARE_LOG("CRITICAL: Blocked write to protected block %d", block_number);
+    // Validate block - protect sector trailers unless explicitly allowed
+    if (MIFARE_IS_SECTOR_TRAILER(block_number) && !allow_trailer_write) {
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Blocked attempt to write sector trailer block %d without permission", block_number);
         return MIFARE_RESULT_ERROR;
     }
     
-    // Only log full writes, not fast balance updates (block 13/14)
-    if (block_number != MIFARE_BLOCK_FAST_BALANCE_PRIMARY && block_number != MIFARE_BLOCK_FAST_BALANCE_BACKUP) {
-        MIFARE_LOG("Writing to block %d (sector %d)", block_number, MIFARE_GET_SECTOR(block_number));
+    // Log all write operations
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Writing to block %d (sector %d)", block_number, MIFARE_GET_SECTOR(block_number));
+    
+    // Encrypt data if needed (before writing)
+    uint8_t encrypted_data[16];
+    uint8_t *write_data = data;  // Default to original data
+    
+    if (mifare_is_block_encrypted(block_number)) {
+        // Copy data to temp buffer for encryption
+        memcpy(encrypted_data, data, 16);
+        
+        // Add HMAC authentication tag if enabled
+        const SystemConfig_t *config = Config_Get();
+        if (config->mifare.security.enable_hmac_auth) {
+            TickType_t hmac_start = xTaskGetTickCount();  // BENCHMARK: HMAC time
+            
+            // Calculate HMAC on first 12 bytes (payload)
+            uint8_t hmac_tag[4];
+            MIFARE_SecurityConfig_t sec_config_hmac = {
+                .hmac_enabled = config->mifare.security.enable_hmac_auth
+            };
+            memcpy(sec_config_hmac.hmac_key, config->mifare.security.hmac_key, 32);
+            
+            MIFARE_Security_Status_t sec_status = MIFARE_Security_CalculateHMAC(
+                &g_transaction_manager.security_context,
+                &sec_config_hmac,
+                block_number,
+                encrypted_data,
+                hmac_tag
+            );
+            
+            hmac_ms = pdTICKS_TO_MS(xTaskGetTickCount() - hmac_start);
+            
+            if (sec_status != MIFARE_SEC_OK) {
+                LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: HMAC calculation failed for block %d: %s",
+                           block_number, MIFARE_Security_GetStatusString(sec_status));
+                return MIFARE_RESULT_ERROR;
+            }
+            
+            // Store HMAC in last 4 bytes
+            memcpy(&encrypted_data[12], hmac_tag, 4);
+        }
+        
+        // Encrypt the block
+        TickType_t encrypt_start = xTaskGetTickCount();  // BENCHMARK: Encryption time
+        
+        const SystemConfig_t *config_enc = Config_Get();
+        MIFARE_SecurityConfig_t sec_config_enc = {
+            .encryption_enabled = config_enc->mifare.security.encryption_enabled
+        };
+        memcpy(sec_config_enc.master_key, config_enc->mifare.security.master_key, 32);
+        
+        MIFARE_Security_Status_t sec_status = MIFARE_Security_EncryptBlock(
+            &g_transaction_manager.security_context,
+            &sec_config_enc,
+            block_number,
+            encrypted_data
+        );
+        
+        encrypt_ms = pdTICKS_TO_MS(xTaskGetTickCount() - encrypt_start);
+        
+        if (sec_status != MIFARE_SEC_OK) {
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Encryption failed for block %d: %s",
+                       block_number, MIFARE_Security_GetStatusString(sec_status));
+            return MIFARE_RESULT_ERROR;
+        }
+        
+        write_data = encrypted_data;  // Use encrypted data
     }
     
-    // Authenticate the block before writing
-    // The mifare_authenticate_block function handles caching properly:
-    // - It will use cached auth if the sector matches and auth is still valid
-    // - It will re-auth if needed (different sector or cache invalidated)
-    MIFARE_Result_t auth_result = mifare_authenticate_block(block_number);
-    if (auth_result != MIFARE_RESULT_OK) {
-        MIFARE_LOG("Authentication failed for write to block %d", block_number);
-        return auth_result;
+    // Setup authentication credentials for driver with derived sector key
+    MIFARE_Classic_Auth_t auth = {
+        .uid_length = g_transaction_manager.card_info.uid_length
+    };
+    
+    // Use factory keys during initial blank card setup, derived keys otherwise
+    if (use_factory_keys_for_writes) {
+        uint8_t factory_key[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+        memcpy(auth.key, factory_key, 6);
+    } else {
+        memcpy(auth.key, derived_sector_key, 6);  // Use derived key
     }
     
-    /* Write the block */
-    PN532_Status_t status = PN532_MifareWriteBlock(block_number, data);
-    if (status != PN532_STATUS_OK) {
+    memcpy(auth.uid, g_transaction_manager.card_info.uid, auth.uid_length);
+    
+    // CRITICAL: If auth cache is invalid (-1), re-select card before write
+    // This ensures clean PN532 state after factory key fallback operations
+    uint8_t target_sector = MIFARE_GET_SECTOR(block_number);
+    if (last_authenticated_sector == -1 || last_authenticated_sector != (int8_t)target_sector) {
+        TickType_t reselect_start = xTaskGetTickCount();  // BENCHMARK: Re-selection time
+        
+        // Re-select to ensure clean state before auth to new sector
+        // Short delay to allow PN532 to stabilize (reduced from 20ms to 5ms)
+        vTaskDelay(pdMS_TO_TICKS(5));
+        System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+        
+        PN532_CardInfo_t reselect_info;
+        PN532_Status_t reselect_status = PN532_ReadPassiveTargetID(
+            g_transaction_manager.pn532_handle,
+            PN532_CARD_TYPE_106_TYPE_A,
+            &reselect_info
+        );
+        
+        // Retry once if first attempt fails (PN532 may need recovery time)
+        if (reselect_status != PN532_STATUS_CARD_DETECTED) {
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [WRITE] First re-selection failed, retrying after delay...\r\n");
+            vTaskDelay(pdMS_TO_TICKS(50));  // Reduced from 100ms to 50ms
+            System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+            
+            reselect_status = PN532_ReadPassiveTargetID(
+                g_transaction_manager.pn532_handle,
+                PN532_CARD_TYPE_106_TYPE_A,
+                &reselect_info
+            );
+        }
+        
+        reselect_ms = pdTICKS_TO_MS(xTaskGetTickCount() - reselect_start);
+        
+        if (reselect_status != PN532_STATUS_CARD_DETECTED) {
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [WRITE] Card re-selection failed before block %d write (reselect took %lums)", block_number, reselect_ms);
+            return MIFARE_RESULT_CARD_REMOVED;
+        }
+        last_authenticated_sector = -1;  // Force re-auth after re-select
+    }
+    
+    /* Write the block using driver - this can take up to several seconds with retries */
+    /* Feed WDT before and after to prevent timeout during long I2C operations */
+    System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+    
+    TickType_t driver_start = xTaskGetTickCount();  // BENCHMARK: Driver write time
+    
+    MIFARE_Classic_Status_t driver_status = MIFARE_Classic_WriteBlock(
+        g_transaction_manager.pn532_handle,
+        block_number,
+        &auth,
+        &last_authenticated_sector,
+        write_data,
+        allow_trailer_write
+    );
+    
+    driver_write_ms = pdTICKS_TO_MS(xTaskGetTickCount() - driver_start);
+    
+    /* Feed WDT after potentially long write operation */
+    System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+    
+    // If derived key fails, try factory key as fallback for all sectors
+    // when custom keys are disabled (decryptcard/recovery mode)
+    const SystemConfig_t *config_write = Config_Get();
+    bool try_factory_fallback = !config_write->mifare.security.use_custom_sector_keys;
+    
+    if (driver_status != MIFARE_CLASSIC_OK && try_factory_fallback) {
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [WRITE] Derived key failed for block %d (sector 4) - trying factory key fallback", block_number);
+        
+        // CRITICAL: After failed auth, PN532 requires re-selecting card before trying another key
+        last_authenticated_sector = -1;
+        vTaskDelay(pdMS_TO_TICKS(50));
+        System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+        
+        PN532_CardInfo_t reselect_info;
+        PN532_Status_t reselect_status = PN532_ReadPassiveTargetID(
+            g_transaction_manager.pn532_handle,
+            PN532_CARD_TYPE_106_TYPE_A,
+            &reselect_info
+        );
+        
+        if (reselect_status != PN532_STATUS_CARD_DETECTED) {
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [WRITE] Card re-selection failed for factory key retry on block %d", block_number);
+            return MIFARE_RESULT_CARD_REMOVED;  // Fast fail - card likely removed
+        }
+        
+        // Now try with factory key
+        uint8_t factory_key[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+        memcpy(auth.key, factory_key, 6);
+        
+        System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+        driver_status = MIFARE_Classic_WriteBlock(
+            g_transaction_manager.pn532_handle,
+            block_number,
+            &auth,
+            &last_authenticated_sector,
+            write_data,
+            allow_trailer_write
+        );
+        System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+        
+        if (driver_status == MIFARE_CLASSIC_OK) {
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [WRITE] Factory key fallback succeeded for block %d", block_number);
+        }
+    }
+    
+    if (driver_status != MIFARE_CLASSIC_OK) {
         /* Track consecutive write failures across ALL write attempts (not just this function call) */
         TickType_t now = xTaskGetTickCount();
         
         // Check if we're in an existing failure period or starting a new one
         if (g_transaction_manager.write_failure_first_tick == 0) {
             // First failure - check immediately if card removed
-            MIFARE_LOG("[WRITE FAILURE #1] Checking if card present...");
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [WRITE FAILURE #1] Checking if card present...\r\n");
             if (MIFARE_VerifyCardPresence() != MIFARE_RESULT_OK) {
-                MIFARE_LOG("[WRITE FAILURE #1] Card NOT present - returning CARD_REMOVED");
+                LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [WRITE FAILURE #1] Card NOT present - returning CARD_REMOVED\r\n");
                 return MIFARE_RESULT_CARD_REMOVED;
             }
             // Card present - start tracking
             g_transaction_manager.write_failure_first_tick = now;
             g_transaction_manager.consecutive_write_failures = 1;
-            MIFARE_LOG("[WRITE FAILURE #1] Card still present - starting failure tracking");
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [WRITE FAILURE #1] Card still present - starting failure tracking\r\n");
         } else {
             // Check if this failure is part of the same failure period (within last 1 second)
             uint32_t time_since_first_failure = pdTICKS_TO_MS(now - g_transaction_manager.write_failure_first_tick);
@@ -1384,7 +1579,7 @@ static MIFARE_Result_t mifare_write_block_safe(uint8_t block_number, uint8_t *da
                 // Old failure period expired, start new one
                 g_transaction_manager.write_failure_first_tick = now;
                 g_transaction_manager.consecutive_write_failures = 1;
-                MIFARE_LOG("Previous failure period expired, starting new tracking");
+                LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Previous failure period expired, starting new tracking\r\n");
             }
         }
         
@@ -1392,70 +1587,27 @@ static MIFARE_Result_t mifare_write_block_safe(uint8_t block_number, uint8_t *da
         uint32_t failure_duration_ms = pdTICKS_TO_MS(now - g_transaction_manager.write_failure_first_tick);
         if (g_transaction_manager.consecutive_write_failures > 1) {
             // Multiple failures - check if card actually removed
-            MIFARE_LOG("[WRITE FAILURE #%d] Checking card presence after %lu ms...", 
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [WRITE FAILURE #%d] Checking card presence after %lu ms...", 
                        g_transaction_manager.consecutive_write_failures, failure_duration_ms);
             if (MIFARE_VerifyCardPresence() != MIFARE_RESULT_OK) {
-                MIFARE_LOG("[WRITE FAILURE #%d] Card REMOVED after %lu ms (count: %d)", 
+                LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [WRITE FAILURE #%d] Card REMOVED after %lu ms (count: %d)", 
                            g_transaction_manager.consecutive_write_failures, failure_duration_ms, 
                            g_transaction_manager.consecutive_write_failures);
                 return MIFARE_RESULT_CARD_REMOVED;
             }
-            MIFARE_LOG("[WRITE FAILURE #%d] Card still PRESENT at %lu ms - I2C issue", 
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [WRITE FAILURE #%d] Card still PRESENT at %lu ms - I2C issue", 
                        g_transaction_manager.consecutive_write_failures, failure_duration_ms);
         }
-
-        // Force re-authentication for this sector before retrying
-        last_authenticated_sector = -1;
-
-        // Brief pause to let PN532/I2C recover from the failed exchange
-        vTaskDelay(pdMS_TO_TICKS(10));
-
-        MIFARE_LOG("Retrying write to block %d after clearing auth cache", block_number);
-        MIFARE_Result_t retry_auth = mifare_authenticate_block(block_number);
-        if (retry_auth == MIFARE_RESULT_OK) {
-            status = PN532_MifareWriteBlock(block_number, data);
-            if (status == PN532_STATUS_OK) {
-                MIFARE_LOG("Write to block %d succeeded after re-authentication", block_number);
-                // Reset write failure tracking on success
-                g_transaction_manager.write_failure_first_tick = 0;
-                g_transaction_manager.consecutive_write_failures = 0;
-                return MIFARE_RESULT_OK;
-            }
-        } else if (retry_auth == MIFARE_RESULT_CARD_REMOVED) {
-            MIFARE_LOG("Card removed during write retry authentication");
-            return MIFARE_RESULT_CARD_REMOVED;
-        } else {
-            MIFARE_LOG("Re-authentication failed for block %d during write retry", block_number);
-        }
-
-        /* If write fails, perform recovery based on error type */
-        if (status != PN532_STATUS_OK) {
-            if (status == PN532_STATUS_TIMEOUT) {
-                // Card timeout (0x27) - likely card removed
-                MIFARE_LOG("Card timeout detected - card likely removed");
-            } else {
-                // Other error types - log and treat as transient
-                MIFARE_LOG("Write failed with status %d", status);
-            }
-            
-            // When write fails after authentication succeeds, actively verify card presence
-            // Don't rely on state flags - check PN532 directly for immediate detection
-            MIFARE_LOG("[WRITE RETRY] Performing active card presence check via PN532...");
-            MIFARE_Result_t presence_check = MIFARE_VerifyCardPresence();
-            if (presence_check != MIFARE_RESULT_OK) {
-                MIFARE_LOG("[WRITE RETRY] Active presence check FAILED - card removed");
-                return MIFARE_RESULT_CARD_REMOVED;
-            }
-            MIFARE_LOG("[WRITE RETRY] Active presence check OK - card still present");
-            
-            return MIFARE_RESULT_WRITE_FAILED;
-        }
+        
+        // Driver already handles retries and authentication, so convert error and return
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Write failed with driver status: %s", MIFARE_Classic_GetStatusString(driver_status));
+        return mifare_convert_driver_status(driver_status);
     }
     
-    // Only log full data writes, not fast balance updates
-    if (block_number != MIFARE_BLOCK_FAST_BALANCE_PRIMARY && block_number != MIFARE_BLOCK_FAST_BALANCE_BACKUP) {
-        MIFARE_LOG("Successfully wrote to block %d", block_number);
-    }
+    // Log benchmark data
+    uint32_t total_block_ms = pdTICKS_TO_MS(xTaskGetTickCount() - block_write_start);
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [BENCHMARK] Block %d write: total=%lums, hmac=%lums, encrypt=%lums, reselect=%lums, driver=%lums",
+               block_number, total_block_ms, hmac_ms, encrypt_ms, reselect_ms, driver_write_ms);
     
     // Reset write failure tracking on success
     g_transaction_manager.write_failure_first_tick = 0;
@@ -1468,43 +1620,25 @@ static MIFARE_Result_t mifare_write_block_safe(uint8_t block_number, uint8_t *da
  * @brief Transition to new dispensing state
  * @param new_state New state to transition to
  */
-static void mifare_transition_state(MIFARE_DispenseState_t new_state)
+static void mifare_transition_state(MIFARE_TransactionState_t new_state)
 {
-    MIFARE_DispenseState_t old_state = g_transaction_manager.dispense_state;
-    g_transaction_manager.dispense_state = new_state;
+    MIFARE_TransactionState_t old_state = g_transaction_manager.transaction_state;
+    g_transaction_manager.transaction_state = new_state;
     
     if (old_state != new_state) {
-        MIFARE_LOG("State transition: %s -> %s", 
-                   MIFARE_GetStateString(old_state), 
-                   MIFARE_GetStateString(new_state));
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: State: %s -> %s", 
+                   MIFARE_GetTransactionStateString(old_state), 
+                   MIFARE_GetTransactionStateString(new_state));
         
-        // Initialize stability timer when entering READY_TO_DISPENSE if not already set
-        if (new_state == DISPENSE_STATE_READY_TO_DISPENSE && 
+        // Initialize stability timer when entering READY if not already set
+        if (new_state == TRANSACTION_STATE_READY && 
             g_transaction_manager.card_first_detected_tick == 0) {
             TickType_t now = xTaskGetTickCount();
             g_transaction_manager.card_first_detected_tick = now;
-            MIFARE_LOG("Card ready - stability timer started (wait %d ms for confirmation)", 
-                       MIFARE_STABILITY_TIMEOUT_MS);
-        }
-        
-        // Clear card removal abort flag when entering READY_TO_DISPENSE
-        // The card has been verified present and valid, ready for new transaction
-        if (new_state == DISPENSE_STATE_READY_TO_DISPENSE) {
-            if (g_transaction_manager.card_removal_abort) {
-                MIFARE_LOG("Clearing card removal abort flag - card verified present and ready");
-                g_transaction_manager.card_removal_abort = false;
-            }
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card ready - stability timer started (wait %lu ms for confirmation)", 
+                       Config_Get()->mifare.stability_timeout_ms);
         }
     }
-}
-
-/**
- * @brief Get current system timestamp
- * @return uint32_t Current timestamp in milliseconds
- */
-static uint32_t mifare_get_timestamp(void)
-{
-    return (uint32_t)xTaskGetTickCount();
 }
 
 /*Write Snapshot Helpers ------------------------------------------*/
@@ -1512,7 +1646,6 @@ static uint32_t mifare_get_timestamp(void)
 static void mifare_clear_write_snapshot(void)
 {
     memset(&g_transaction_manager.last_written_user_data, 0, sizeof(MIFARE_UserData_t));
-    memset(&g_transaction_manager.last_written_recovery_info, 0, sizeof(MIFARE_RecoveryInfo_t));
     g_transaction_manager.has_last_written_snapshot = false;
 }
 
@@ -1525,9 +1658,6 @@ static void mifare_update_write_snapshot(const MIFARE_CardData_t *card_data)
     memcpy(&g_transaction_manager.last_written_user_data,
            &card_data->user_primary,
            sizeof(MIFARE_UserData_t));
-    memcpy(&g_transaction_manager.last_written_recovery_info,
-           &card_data->recovery_info,
-           sizeof(MIFARE_RecoveryInfo_t));
     g_transaction_manager.has_last_written_snapshot = true;
 }
 
@@ -1541,23 +1671,10 @@ static bool mifare_card_data_changed(const MIFARE_CardData_t *card_data)
         return true;
     }
 
+    // Only compare user data - HMAC validates integrity
     if (memcmp(&card_data->user_primary,
                &g_transaction_manager.last_written_user_data,
                sizeof(MIFARE_UserData_t)) != 0) {
-        return true;
-    }
-
-    if (card_data->recovery_info.primary_data_crc !=
-            g_transaction_manager.last_written_recovery_info.primary_data_crc ||
-        card_data->recovery_info.backup_data_crc !=
-            g_transaction_manager.last_written_recovery_info.backup_data_crc ||
-        card_data->recovery_info.sequence_number !=
-            g_transaction_manager.last_written_recovery_info.sequence_number ||
-        card_data->recovery_info.recovery_attempts !=
-            g_transaction_manager.last_written_recovery_info.recovery_attempts ||
-        card_data->recovery_info.integrity_flags !=
-            g_transaction_manager.last_written_recovery_info.integrity_flags)
-    {
         return true;
     }
 
@@ -1592,7 +1709,7 @@ static bool mifare_is_account_data_empty(const MIFARE_AccountData_t *account_dat
     bool is_empty = all_zeros || !has_valid_ascii;
     
     if (is_empty) {
-        MIFARE_LOG("Account data invalid - all_zeros=%d, has_valid_ascii=%d", all_zeros, has_valid_ascii);
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Account data invalid - all_zeros=%d, has_valid_ascii=%d", all_zeros, has_valid_ascii);
     }
     
     return is_empty;
@@ -1627,144 +1744,86 @@ static void mifare_encode_account_data(MIFARE_AccountData_t *account_data, const
 }
 
 /**
- * @brief Write card data with atomic transaction support
+ * @brief Internal write function with backup control
  * @param card_data Pointer to card data structure
+ * @param skip_backup If true, only write primary block (faster, use during active dispense)
  * @return MIFARE_Result_t Operation result
+ * 
+ * @note BACKUP WRITE TRADEOFF:
+ *       - Full write (primary+backup): ~430ms total
+ *       - Fast write (primary only):   ~320ms total (saves ~110ms)
+ *       
+ *       During active dispenser, we use fast writes because:
+ *       1. Card can be removed at ANY time - there is no "final commit" moment
+ *       2. Primary block has HMAC for integrity validation
+ *       3. Backup block may become stale, but primary is always current
+ *       4. On next card read, if primary is corrupted, system falls back to backup
+ *          (backup may be slightly behind, but better than total data loss)
+ *       5. 110ms savings per write reduces chance of write-in-progress during removal
  */
-MIFARE_Result_t MIFARE_WriteCardData(MIFARE_CardData_t *card_data)
+static MIFARE_Result_t mifare_write_card_data_internal(MIFARE_CardData_t *card_data, bool skip_backup)
 {
+    TickType_t write_start_tick = xTaskGetTickCount();  // BENCHMARK: Total write time
+    
     if (card_data == NULL || !card_data->data_valid) {
         return MIFARE_RESULT_ERROR;
-    }
-    
-    // CRITICAL: If card removal was detected mid-operation, abort immediately
-    if (g_transaction_manager.card_removal_abort) {
-        MIFARE_LOG("Write aborted - card removal flag set");
-        return MIFARE_RESULT_CARD_REMOVED;
     }
     
     // Check if PN532 is still recovering from previous write failure
     TickType_t now = xTaskGetTickCount();
     if (now < g_transaction_manager.pn532_recovery_until_tick) {
         uint32_t remaining_ms = pdTICKS_TO_MS(g_transaction_manager.pn532_recovery_until_tick - now);
-        MIFARE_LOG("Write deferred - PN532 recovering for %lu ms more", remaining_ms);
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Write deferred - PN532 recovering for %lu ms more", remaining_ms);
         return MIFARE_RESULT_BUSY;
     }
     
     MIFARE_Result_t result;
     uint8_t block_data[16];
     
+    TickType_t change_check_start = xTaskGetTickCount();
     if (!mifare_card_data_changed(card_data)) {
         last_card_write_changed = false;
         return MIFARE_RESULT_OK;
     }
+    uint32_t change_check_ms = pdTICKS_TO_MS(xTaskGetTickCount() - change_check_start);
     
-    // Update timestamps and sequence numbers
+    // Update transaction counter
     card_data->user_primary.transaction_counter++;
-    card_data->recovery_info.last_update_time = mifare_get_timestamp();
-    card_data->recovery_info.sequence_number = (card_data->recovery_info.sequence_number + 1) & 0x01;
-    
-    // Alternating write pattern
-    bool write_primary = (g_transaction_manager.write_cycle_counter == 0);
-    uint8_t target_block = write_primary ? MIFARE_BLOCK_USER_PRIMARY : MIFARE_BLOCK_USER_BACKUP;
-    const char *target_name = write_primary ? "primary" : "backup";
     
     // Update the backup copy in RAM to match primary
-    if (sizeof(MIFARE_UserData_t) <= sizeof(card_data->user_backup)) {
-        memcpy(&card_data->user_backup, &card_data->user_primary, sizeof(MIFARE_UserData_t));
-    } else {
-        MIFARE_LOG("ERROR: User data structure size mismatch");
-        return MIFARE_RESULT_ERROR;
-    }
+    memcpy(&card_data->user_backup, &card_data->user_primary, sizeof(MIFARE_UserData_t));
     
-    // Update CRC
-    uint16_t current_data_crc = MIFARE_CALCULATE_CRC16(&card_data->user_primary, sizeof(MIFARE_UserData_t));
-    if (write_primary) {
-        card_data->recovery_info.primary_data_crc = current_data_crc;
-    } else {
-        card_data->recovery_info.backup_data_crc = current_data_crc;
-    }
+    /* Write User Primary Block (block 5, sector 1) */
+    memcpy(block_data, (uint8_t*)&card_data->user_primary, sizeof(MIFARE_UserData_t));
     
-    // Write the selected data block
-    size_t data_size = sizeof(MIFARE_UserData_t);
-    memcpy(block_data, write_primary ? (uint8_t*)&card_data->user_primary : (uint8_t*)&card_data->user_backup, data_size);
+    TickType_t primary_write_start = xTaskGetTickCount();
+    result = mifare_write_block_with_retry(MIFARE_BLOCK_USER_PRIMARY, block_data, 500, "primary");
+    uint32_t primary_write_ms = pdTICKS_TO_MS(xTaskGetTickCount() - primary_write_start);
     
-    // Retry loop for robustness against transient noise (up to 500ms)
-    TickType_t loop_start_tick = xTaskGetTickCount();
-    do {
-        // Check for external abort signals (e.g. from polling task)
-        if (g_transaction_manager.card_removal_abort || 
-            g_transaction_manager.card_state == MIFARE_CARD_STATE_ABSENT) {
-            MIFARE_LOG("Write aborted - card removed during retry loop");
-            result = MIFARE_RESULT_CARD_REMOVED;
-            break;
-        }
-
-        result = mifare_write_block_safe(target_block, block_data);
-        if (result == MIFARE_RESULT_OK) break;
-        if (result == MIFARE_RESULT_CARD_REMOVED) {
-            MIFARE_LOG("Card removed during %s data write", target_name);
-            break;
-        }
-        
-        // Check local timeout (robust against other tasks resetting global flags)
-        // Increased from 1000ms to 2000ms to allow more retries in noisy environments
-        if (pdTICKS_TO_MS(xTaskGetTickCount() - loop_start_tick) > 2000) {
-             MIFARE_LOG("Write timeout exceeded (2000ms) - persistent I2C errors");
-             result = MIFARE_RESULT_TIMEOUT; // Explicitly set result to timeout
-             break;
-        }
-        
-        // Small delay before retry to let I2C bus settle
-        vTaskDelay(pdMS_TO_TICKS(20));
-        
-    } while (result != MIFARE_RESULT_OK);
-
     if (result != MIFARE_RESULT_OK) {
-        MIFARE_LOG("Failed to write %s data (block %u)", target_name, target_block);
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Failed to write primary data (block %u)", MIFARE_BLOCK_USER_PRIMARY);
         last_card_write_changed = false;
         return result;
     }
     
-    // CRITICAL: Small delay between writes
-    vTaskDelay(pdMS_TO_TICKS(5));
+    uint32_t backup_write_ms = 0;
     
-    // Write recovery info
-    size_t recovery_size = sizeof(MIFARE_RecoveryInfo_t);
-    memcpy(block_data, &card_data->recovery_info, recovery_size);
-    
-    // Retry loop for recovery info
-    loop_start_tick = xTaskGetTickCount();
-    do {
-        // Check for external abort signals
-        if (g_transaction_manager.card_removal_abort || 
-            g_transaction_manager.card_state == MIFARE_CARD_STATE_ABSENT) {
-            MIFARE_LOG("Write aborted - card removed during retry loop");
-            result = MIFARE_RESULT_CARD_REMOVED;
-            break;
-        }
-
-        result = mifare_write_block_safe(MIFARE_BLOCK_RECOVERY_INFO, block_data);
-        if (result == MIFARE_RESULT_OK) break;
-        if (result == MIFARE_RESULT_CARD_REMOVED) {
-            MIFARE_LOG("Card removed during recovery info write");
-            break;
-        }
+    if (!skip_backup) {
+        // Small delay between writes
+        vTaskDelay(pdMS_TO_TICKS(2));
         
-        // Check local timeout
-        // Increased from 1000ms to 2000ms
-        if (pdTICKS_TO_MS(xTaskGetTickCount() - loop_start_tick) > 2000) {
-             MIFARE_LOG("Write timeout exceeded (2000ms) - persistent I2C errors");
-             result = MIFARE_RESULT_TIMEOUT; // Explicitly set result to timeout
-             break;
+        /* Write User Backup Block (block 6, sector 1) - SAME SECTOR, NO SWITCH! */
+        /* HMAC in the data provides integrity validation - no separate CRC block needed */
+        memcpy(block_data, (uint8_t*)&card_data->user_backup, sizeof(MIFARE_UserData_t));
+        
+        TickType_t backup_write_start = xTaskGetTickCount();
+        result = mifare_write_block_with_retry(MIFARE_BLOCK_USER_BACKUP, block_data, 500, "backup");
+        backup_write_ms = pdTICKS_TO_MS(xTaskGetTickCount() - backup_write_start);
+        
+        if (result != MIFARE_RESULT_OK) {
+            // Backup write failure is not critical - primary is already written
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Backup write failed (non-critical)\r\n");
         }
-        vTaskDelay(pdMS_TO_TICKS(20));
-    } while (result != MIFARE_RESULT_OK);
-
-    if (result != MIFARE_RESULT_OK) {
-        MIFARE_LOG("Failed to write recovery info");
-        last_card_write_changed = false;
-        return result;
     }
     
     mifare_update_write_snapshot(card_data);
@@ -1775,12 +1834,63 @@ MIFARE_Result_t MIFARE_WriteCardData(MIFARE_CardData_t *card_data)
     g_transaction_manager.last_successful_write_tick = xTaskGetTickCount();
     g_transaction_manager.card_first_lost_tick = 0;
     
-    // Advance write cycle counter
-    g_transaction_manager.write_cycle_counter = (g_transaction_manager.write_cycle_counter + 1) & 0x01;
+    uint32_t total_write_ms = pdTICKS_TO_MS(xTaskGetTickCount() - write_start_tick);
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [BENCHMARK] Write: total=%lums, change=%lums, primary=%lums, backup=%lums%s",
+               total_write_ms, change_check_ms, primary_write_ms, backup_write_ms,
+               skip_backup ? " (fast)" : "");
     
-    MIFARE_LOG("Card data written successfully (%s)", 
-               (g_transaction_manager.write_cycle_counter == 0) ? "next: primary" : "next: backup");
     return MIFARE_RESULT_OK;
+}
+
+/**
+ * @brief Write card data with atomic transaction support (writes primary + backup)
+ * @param card_data Pointer to card data structure
+ * @return MIFARE_Result_t Operation result
+ */
+MIFARE_Result_t MIFARE_WriteCardData(MIFARE_CardData_t *card_data)
+{
+    return mifare_write_card_data_internal(card_data, false);
+}
+
+/**
+ * @brief Fast write - only primary block, skip backup (use during active transactions)
+ * @param card_data Pointer to card data structure  
+ * @return MIFARE_Result_t Operation result
+ */
+MIFARE_Result_t MIFARE_WriteCardDataFast(MIFARE_CardData_t *card_data)
+{
+    return mifare_write_card_data_internal(card_data, true);
+}
+
+/**
+ * @brief Read single MIFARE block (public wrapper for decryptcard)
+ * @param block_number Block number to read (0-63)
+ * @param data Buffer to store read data (must be 16 bytes)
+ * @return MIFARE_Result_t Operation result
+ */
+MIFARE_Result_t MIFARE_ReadBlock(uint8_t block_number, uint8_t *data)
+{
+    if (data == NULL) {
+        return MIFARE_RESULT_ERROR;
+    }
+    
+    return mifare_read_block(block_number, data);
+}
+
+/**
+ * @brief Write single MIFARE block (public wrapper for decryptcard)
+ * @param block_number Block number to write (0-63)
+ * @param data Data to write (must be 16 bytes)
+ * @param allow_trailer If true, allow writing sector trailers
+ * @return MIFARE_Result_t Operation result
+ */
+MIFARE_Result_t MIFARE_WriteBlock(uint8_t block_number, const uint8_t *data, bool allow_trailer)
+{
+    if (data == NULL) {
+        return MIFARE_RESULT_ERROR;
+    }
+    
+    return mifare_write_block(block_number, (uint8_t*)data, allow_trailer);
 }
 
 /**
@@ -1835,16 +1945,10 @@ void MIFARE_UpdateStabilityCheck(void)
     // If card is detected but not yet confirmed
     if (g_transaction_manager.card_first_detected_tick != 0 && !g_transaction_manager.card_presence_confirmed) {
         uint32_t duration = pdTICKS_TO_MS(now - g_transaction_manager.card_first_detected_tick);
-        if (duration >= MIFARE_STABILITY_TIMEOUT_MS) {
+        if (duration >= Config_Get()->mifare.stability_timeout_ms) {
             g_transaction_manager.card_presence_confirmed = true;
             g_transaction_manager.card_confirmed_present_tick = now;
-            MIFARE_LOG("Card presence CONFIRMED (stable for %lu ms)", duration);
-            
-            // Update UI state
-            if (!g_transaction_manager.ui_state_card_present) {
-                g_transaction_manager.ui_state_card_present = true;
-                // UI update logic here if needed, or handled by main loop
-            }
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card presence CONFIRMED (stable for %lu ms)", duration);
         }
     }
 }
@@ -1857,55 +1961,60 @@ void MIFARE_ConfirmReadyAfterPolling(void)
 {
     if (g_transaction_manager.card_state == MIFARE_CARD_STATE_NEEDS_POLLING_CYCLE) {
         MIFARE_SetCardState(MIFARE_CARD_STATE_PRESENT);
-        MIFARE_LOG("Card state transitioned to PRESENT after polling cycle");
+        mifare_transition_state(TRANSACTION_STATE_READY);
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card state transitioned to PRESENT/READY after polling cycle\r\n");
     }
 }
 
 /*Atomic Transaction Operations ----------------------------------*/
 
-MIFARE_Result_t MIFARE_BeginTransaction(uint32_t amount_ml)
+MIFARE_Result_t MIFARE_BeginTransaction(void)
 {
     if (g_transaction_manager.transaction_active) {
-        MIFARE_LOG("Transaction already active");
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Transaction already active\r\n");
         return MIFARE_RESULT_BUSY;
     }
 
-    if (g_transaction_manager.current_card.user_primary.balance_ml < amount_ml) {
-        MIFARE_LOG("Insufficient balance");
-        return MIFARE_RESULT_INSUFFICIENT_BALANCE;
+    // Pre-auth: Reselect card to ensure PN532 is ready for writes
+    // This eliminates the first-write reselect failure (~200ms penalty)
+    PN532_CardInfo_t preauth_info;
+    PN532_Status_t preauth_status = PN532_ReadPassiveTargetID(
+        g_transaction_manager.pn532_handle,
+        PN532_CARD_TYPE_106_TYPE_A,
+        &preauth_info
+    );
+    if (preauth_status != PN532_STATUS_CARD_DETECTED) {
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Pre-auth reselect failed - card may be removed\r\n");
+        return MIFARE_RESULT_CARD_REMOVED;
     }
+    last_authenticated_sector = -1;  // Force fresh auth to sector 1
+
+    // Balance checking now done by business logic layer (Dispenser Integration)
     
     // Save previous state to revert on failure
     uint8_t prev_state = g_transaction_manager.current_card.user_primary.transaction_state;
     
-    g_transaction_manager.current_card.user_primary.transaction_state = TRANSACTION_STATE_STARTED;
+    g_transaction_manager.current_card.user_primary.transaction_state = CARD_TRANSACTION_STARTED;
     g_transaction_manager.transaction_active = true;
-    g_transaction_manager.dispense_start_time = mifare_get_timestamp();
-    g_transaction_manager.total_dispensed_this_session = 0;
-    g_transaction_manager.last_fast_balance_update_time = 0;
-    transaction_start_timestamp = g_transaction_manager.dispense_start_time;
     
-    if (pn532_recovery_ready_tick != 0) {
-        TickType_t now = xTaskGetTickCount();
-        if (now < pn532_recovery_ready_tick) {
-            vTaskDelay(pn532_recovery_ready_tick - now);
-        }
-        pn532_recovery_ready_tick = 0;
-    }
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Transaction flag set to ACTIVE - polling suspended\r\n");
     
     MIFARE_Result_t result = MIFARE_WriteCardData(&g_transaction_manager.current_card);
     if (result == MIFARE_RESULT_OK) {
-        mifare_transition_state(DISPENSE_STATE_DISPENSING);
-        MIFARE_LOG("Transaction started for %u mL", amount_ml);
+        mifare_transition_state(TRANSACTION_STATE_READY);
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Transaction started\r\n");
     } else {
-        MIFARE_LOG("Failed to start transaction: %s", MIFARE_GetResultString(result));
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Failed to start transaction: %s", MIFARE_GetResultString(result));
         g_transaction_manager.transaction_active = false;
         
         // Revert in-memory state
         g_transaction_manager.current_card.user_primary.transaction_state = prev_state;
         
-        // Transition to ERROR state to prevent immediate retry loop and force re-validation
-        mifare_transition_state(DISPENSE_STATE_ERROR);
+        // Only transition to error if card wasn't removed (removal already cleaned up state)
+        if (result != MIFARE_RESULT_CARD_REMOVED) {
+            MIFARE_SetErrorState_WriteFailed();
+            LOG_CRITICAL_MIFARE_TRANSACTION_MANAGER("    Reason: %s\r\n", MIFARE_GetResultString(result));
+        }
     }
     
     return result;
@@ -1915,45 +2024,66 @@ MIFARE_Result_t MIFARE_BeginTransaction(uint32_t amount_ml)
 
 /**
  * @brief Initialize a MIFARE card for a new customer
- * @param initial_balance_ml Initial balance to set on the card in milliliters
+ * @param initial_balance_ml Initial balance in milliliters of water
  * @param customer_id Unique customer identifier (can be derived from card serial)
+ * @param force_factory_keys If true, force factory keys even if card has derived keys (for decryptcard)
  * @return MIFARE_Result_t Operation result
  */
-MIFARE_Result_t MIFARE_InitializeNewCustomerCard(uint32_t initial_balance_ml, uint64_t customer_id)
+MIFARE_Result_t MIFARE_InitializeNewCustomerCard(uint32_t initial_balance_ml, uint64_t customer_id, bool force_factory_keys)
 {
-    MIFARE_Result_t result;
+    MIFARE_Result_t result = MIFARE_RESULT_ERROR;
     PN532_CardInfo_t card_info;
     
-    MIFARE_LOG("Initializing new customer card with balance: %u mL, Customer ID: %llu", 
+    // Report to watchdog at start of initialization (long operation)
+    System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+    
+    // Suspend polling task to prevent interference
+    bool prev_transaction_active = g_transaction_manager.transaction_active;
+    g_transaction_manager.transaction_active = true;
+    
+    // Wait for polling task to finish any active cycle (period is 50ms)
+    vTaskDelay(pdMS_TO_TICKS(60));
+    
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Initializing new customer card with balance: %u ml, Customer ID: %llu", 
                initial_balance_ml, customer_id);
     
     // First, detect the card
-    PN532_Status_t status = PN532_DetectCard(&card_info);
+    // If a card is already active/authenticated, InListPassiveTarget (called by DetectCard) might fail.
+    // Release any selected target first to ensure clean detection state.
+    PN532_ReleaseTarget(g_transaction_manager.pn532_handle);
+    
+    // Wait a bit longer after release to ensure card state is reset
+    vTaskDelay(pdMS_TO_TICKS(20));
+    
+    PN532_Status_t status = PN532_DetectCard(g_transaction_manager.pn532_handle, &card_info);
     if (status != PN532_STATUS_CARD_DETECTED) {
-        MIFARE_LOG("No card detected for initialization");
-        return MIFARE_RESULT_ERROR;
+        // Retry once if detection fails (common if card was just released)
+        vTaskDelay(pdMS_TO_TICKS(20));
+        status = PN532_DetectCard(g_transaction_manager.pn532_handle, &card_info);
+        
+        if (status != PN532_STATUS_CARD_DETECTED) {
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: No card detected for initialization\r\n");
+            result = MIFARE_RESULT_ERROR;
+            goto cleanup;
+        }
     }
     
     // Verify it's a MIFARE Classic card
     if (card_info.card_type != PN532_CARD_MIFARE_CLASSIC_1K &&
         card_info.card_type != PN532_CARD_MIFARE_CLASSIC_4K) {
-        MIFARE_LOG("Unsupported card type for initialization: %d", card_info.card_type);
-        return MIFARE_RESULT_ERROR;
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Unsupported card type for initialization: %d", card_info.card_type);
+        result = MIFARE_RESULT_ERROR;
+        goto cleanup;
     }
     
-    // Store card info with size validation
-    if (sizeof(PN532_CardInfo_t) <= sizeof(g_transaction_manager.card_info)) {
-        memcpy(&g_transaction_manager.card_info, &card_info, sizeof(PN532_CardInfo_t));
-    } else {
-        MIFARE_LOG("ERROR: Card info structure size mismatch during initialization");
-        return MIFARE_RESULT_ERROR;
-    }
+    // Store card info
+    memcpy(&g_transaction_manager.card_info, &card_info, sizeof(PN532_CardInfo_t));
     
     // Initialize card data structure
     MIFARE_CardData_t *card_data = &g_transaction_manager.current_card;
     memset(card_data, 0, sizeof(MIFARE_CardData_t));
     
-    uint32_t current_time = mifare_get_timestamp();
+    uint32_t current_time = (uint32_t)xTaskGetTickCount();
     
     // 1. Initialize card header
     card_data->header.magic_bytes = MIFARE_MAGIC_BYTES;
@@ -1964,27 +2094,22 @@ MIFARE_Result_t MIFARE_InitializeNewCustomerCard(uint32_t initial_balance_ml, ui
     card_data->header.header_crc = MIFARE_CALCULATE_CRC16((uint8_t*)&card_data->header, 
                                                           sizeof(MIFARE_CardHeader_t));
     
-    // 2. Initialize primary user data (balance, status, state)
+    // 2. Initialize primary user data (balance_ml, status, state)
     card_data->user_primary.balance_ml = initial_balance_ml;
-    card_data->user_primary.last_topup_amount_ml = (uint16_t)(initial_balance_ml > 65535 ? 65535 : initial_balance_ml);
+    card_data->user_primary.last_topup_ml = initial_balance_ml;  // Set last topup to initial amount
     card_data->user_primary.transaction_counter = 0;
     card_data->user_primary.status_flags = CARD_STATUS_ACTIVE;
-    card_data->user_primary.transaction_state = TRANSACTION_STATE_IDLE;
-    memset(card_data->user_primary.reserved, 0, sizeof(card_data->user_primary.reserved));
+    card_data->user_primary.transaction_state = CARD_TRANSACTION_IDLE;
+    memset(card_data->user_primary.hmac, 0, sizeof(card_data->user_primary.hmac));
     
     // 3. Initialize usage data (lifetime statistics)
-    card_data->usage_data.total_purchased_ml = initial_balance_ml;
-    card_data->usage_data.total_dispensed_ml = 0;
-    card_data->usage_data.reserved1 = 0;
-    card_data->usage_data.reserved2 = 0;
+    card_data->usage_data.total_volume_purchased_ml = initial_balance_ml;
+    card_data->usage_data.total_dispenses_completed = 0;
+    card_data->usage_data.total_volume_dispensed_ml = 0;
+    card_data->usage_data.reserved = 0;
     
-    // 4. Initialize backup user data (identical to primary) with size validation
-    if (sizeof(MIFARE_UserData_t) <= sizeof(card_data->user_backup)) {
-        memcpy(&card_data->user_backup, &card_data->user_primary, sizeof(MIFARE_UserData_t));
-    } else {
-        MIFARE_LOG("ERROR: User data structure size mismatch during initialization");
-        return MIFARE_RESULT_ERROR;
-    }
+    // 4. Initialize backup user data (identical to primary)
+    memcpy(&card_data->user_backup, &card_data->user_primary, sizeof(MIFARE_UserData_t));
     
     // 5. Initialize transaction log
     memset(&card_data->transaction_log, 0, sizeof(MIFARE_TransactionLog_t));
@@ -1994,61 +2119,119 @@ MIFARE_Result_t MIFARE_InitializeNewCustomerCard(uint32_t initial_balance_ml, ui
         (uint8_t*)card_data->transaction_log.records,
         sizeof(MIFARE_TransactionRecord_t) * MIFARE_MAX_TRANSACTIONS);
     
-    // 6. Initialize recovery information
-    card_data->recovery_info.last_update_time = current_time;
-    card_data->recovery_info.primary_data_crc = MIFARE_CALCULATE_CRC16(
-        (uint8_t*)&card_data->user_primary, sizeof(MIFARE_UserData_t));
-    card_data->recovery_info.backup_data_crc = MIFARE_CALCULATE_CRC16(
-        (uint8_t*)&card_data->user_backup, sizeof(MIFARE_UserData_t));
-    card_data->recovery_info.sequence_number = 0;
-    card_data->recovery_info.recovery_attempts = 0;
-    card_data->recovery_info.integrity_flags = 0x0000; // All OK
-    
-    // 5.5. Initialize fast balance cache
-    memset(&card_data->fast_balance_primary, 0, sizeof(MIFARE_FastBalance_t));
-    mifare_fast_balance_update(&card_data->fast_balance_primary, initial_balance_ml);
-    
-    // Copy primary to backup
-    memcpy(&card_data->fast_balance_backup, &card_data->fast_balance_primary, sizeof(MIFARE_FastBalance_t));
-    
     // 6. Mark data as valid
     card_data->data_valid = true;
     card_data->last_read_time = current_time;
     
     // 7. Write the initialized data to the card
-    MIFARE_LOG("Writing initial data structure to card...");
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Writing initial data structure to card...\r\n");
+    
+    // Determine which keys to use for writes:
+    // - If card already has derived keys (auto-reinit scenario), use derived keys
+    // - If card has factory keys (blank card), use factory keys then program derived keys
+    // Test by attempting auth with derived keys on ALL sectors we'll write to
+    // Sectors: 12 (block 48), 13 (block 52), 14 (block 56), 15 (block 60)
+    last_authenticated_sector = -1;  // Clear cache to force fresh auth test
+    
+    uint8_t test_blocks[] = {MIFARE_BLOCK_ACCOUNT_DATA,  // 48 - Sector 12
+                             52,                          // 52 - Sector 13 (recovery info, no named constant)
+                             MIFARE_BLOCK_USAGE_DATA,     // 56 - Sector 14
+                             MIFARE_BLOCK_HEADER};        // 60 - Sector 15
+    bool all_sectors_have_derived_keys = true;
+    
+    // Always detect current keys on card (needed for write authentication)
+    for (uint8_t i = 0; i < 4; i++) {
+        PN532_Status_t auth_test = PN532_MifareAuthenticate(
+            g_transaction_manager.pn532_handle,
+            test_blocks[i],
+            (uint8_t*)g_transaction_manager.card_info.uid,
+            g_transaction_manager.card_info.uid_length,
+            derived_sector_key
+        );
+        
+        if (auth_test != PN532_STATUS_OK) {
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Sector %d (block %d) has factory keys\r\n", 
+                       MIFARE_GET_SECTOR(test_blocks[i]), test_blocks[i]);
+            all_sectors_have_derived_keys = false;
+            break;
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(5));  // Brief delay between auth tests
+        System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+    }
+    
+    if (all_sectors_have_derived_keys) {
+        // Card already has derived keys on all sectors - use them for writes (auto-reinit scenario)
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card has derived keys on all sectors - using them for re-initialization writes\r\n");
+        use_factory_keys_for_writes = false;
+        last_authenticated_sector = -1;  // Clear cache, will re-auth as needed
+    } else {
+        // Card has factory keys on one or more sectors - use them for writes, then program derived keys
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card has factory keys - using them for initialization writes\r\n");
+        use_factory_keys_for_writes = true;
+        last_authenticated_sector = -1;
+        
+        // Re-select card after failed auth attempt
+        vTaskDelay(pdMS_TO_TICKS(50));
+        PN532_CardInfo_t reselect_info;
+        PN532_Status_t reselect_status = PN532_ReadPassiveTargetID(
+            g_transaction_manager.pn532_handle, PN532_CARD_TYPE_106_TYPE_A, &reselect_info);
+        
+        if (reselect_status != PN532_STATUS_CARD_DETECTED) {
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card re-selection failed after auth test - retrying once\r\n");
+            vTaskDelay(pdMS_TO_TICKS(100));
+            reselect_status = PN532_ReadPassiveTargetID(
+                g_transaction_manager.pn532_handle, PN532_CARD_TYPE_106_TYPE_A, &reselect_info);
+            
+            if (reselect_status != PN532_STATUS_CARD_DETECTED) {
+                LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card re-selection failed - card may have been removed\r\n");
+                result = MIFARE_RESULT_CARD_REMOVED;
+                goto cleanup;
+            }
+        }
+    }
     
     // Write header block (authentication handled internally)
-    result = mifare_write_block_safe(MIFARE_BLOCK_HEADER, (uint8_t*)&card_data->header);
+    result = mifare_write_block(MIFARE_BLOCK_HEADER, (uint8_t*)&card_data->header, false);
     if (result != MIFARE_RESULT_OK) {
-        MIFARE_LOG("Failed to write header block");
-        return result;
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Failed to write header block\r\n");
+        use_factory_keys_for_writes = false;  // Restore normal operation
+        goto cleanup;
     }
     vTaskDelay(pdMS_TO_TICKS(15));
+    System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+    System_ReportTaskStatus(SYSTEM_TASK_ID_DISPENSER, true);
     
     // Write primary user data block
-    result = mifare_write_block_safe(MIFARE_BLOCK_USER_PRIMARY, (uint8_t*)&card_data->user_primary);
+    result = mifare_write_block(MIFARE_BLOCK_USER_PRIMARY, (uint8_t*)&card_data->user_primary, false);
     if (result != MIFARE_RESULT_OK) {
-        MIFARE_LOG("Failed to write primary data block");
-        return result;
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Failed to write primary data block\r\n");
+        use_factory_keys_for_writes = false;  // Restore normal operation
+        goto cleanup;
     }
     vTaskDelay(pdMS_TO_TICKS(15));
+    System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+    System_ReportTaskStatus(SYSTEM_TASK_ID_DISPENSER, true);
     
     // Write backup user data block
-    result = mifare_write_block_safe(MIFARE_BLOCK_USER_BACKUP, (uint8_t*)&card_data->user_backup);
+    result = mifare_write_block(MIFARE_BLOCK_USER_BACKUP, (uint8_t*)&card_data->user_backup, false);
     if (result != MIFARE_RESULT_OK) {
-        MIFARE_LOG("Failed to write backup data block");
-        return result;
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Failed to write backup data block\r\n");
+        goto cleanup;
     }
-    vTaskDelay(pdMS_TO_TICKS(15));
+    vTaskDelay(pdMS_TO_TICKS(5));
+    System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+    System_ReportTaskStatus(SYSTEM_TASK_ID_DISPENSER, true);
     
     // Write usage data block
-    result = mifare_write_block_safe(MIFARE_BLOCK_USAGE_DATA, (uint8_t*)&card_data->usage_data);
+    result = mifare_write_block(MIFARE_BLOCK_USAGE_DATA, (uint8_t*)&card_data->usage_data, false);
     if (result != MIFARE_RESULT_OK) {
-        MIFARE_LOG("Failed to write usage data block");
-        return result;
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Failed to write usage data block\r\n");
+        goto cleanup;
     }
-    vTaskDelay(pdMS_TO_TICKS(15));
+    vTaskDelay(pdMS_TO_TICKS(5));
+    System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+    System_ReportTaskStatus(SYSTEM_TASK_ID_DISPENSER, true);
     
     // Write transaction log (may span multiple blocks)
     uint8_t *log_data = (uint8_t*)&card_data->transaction_log;
@@ -2062,146 +2245,322 @@ MIFARE_Result_t MIFARE_InitializeNewCustomerCard(uint32_t initial_balance_ml, ui
             block_num++;
         }
         
-        result = mifare_write_block_safe(block_num, &log_data[i * 16]);
+        result = mifare_write_block(block_num, &log_data[i * 16], false);
         if (result != MIFARE_RESULT_OK) {
-            MIFARE_LOG("Failed to write transaction log block %d", i);
-            return result;
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Failed to write transaction log block %d", i);
+            goto cleanup;
         }
-        vTaskDelay(pdMS_TO_TICKS(15));
+        vTaskDelay(pdMS_TO_TICKS(5));
+        System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+        System_ReportTaskStatus(SYSTEM_TASK_ID_DISPENSER, true);
         
         block_num++;
     }
     
-    // Write recovery information block
-    result = mifare_write_block_safe(MIFARE_BLOCK_RECOVERY_INFO, (uint8_t*)&card_data->recovery_info);
+    // Report status after transaction log writes (~1800ms elapsed)
+    // Force WDT update for both tasks
+    System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+
+    // 8. Initialize and write account data (block 16 - sector 4)
+    // This is done BEFORE sector trailer updates so if sector 4 still has factory keys,
+    // the write uses factory key fallback, and then we update the trailer
+    mifare_encode_account_data(&card_data->account_data, "07970242024", CARD_VALIDITY_NORMAL);
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Writing account data to block %d...\r\n", MIFARE_BLOCK_ACCOUNT_DATA);
+    result = mifare_write_block(MIFARE_BLOCK_ACCOUNT_DATA, card_data->account_data.raw_data, false);
     if (result != MIFARE_RESULT_OK) {
-        MIFARE_LOG("Failed to write recovery info block");
-        return result;
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Failed to write account data block (status=%d)\r\n", result);
+        // Non-fatal - continue with initialization, account data can be written later
+    } else {
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Account data written successfully\r\n");
     }
     vTaskDelay(pdMS_TO_TICKS(15));
+    System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+    System_ReportTaskStatus(SYSTEM_TASK_ID_DISPENSER, true);
 
-    // FIX: Explicitly write Sector 3 Trailer (Block 15) to ensure correct access bits
-    uint8_t default_trailer[16] = {
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Key A
-        0xFF, 0x07, 0x80, 0x69,             // Access Bits
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF  // Key B
-    };
-    
-    MIFARE_LOG("Initializing Sector 3 Trailer (Block 15)...");
-    result = mifare_authenticate_block(15);
-    if (result == MIFARE_RESULT_OK) {
-        PN532_Status_t status = PN532_MifareWriteBlock(15, default_trailer);
-        if (status != PN532_STATUS_OK) {
-            MIFARE_LOG("Failed to write Sector 3 Trailer");
+    // Write sector keys to all sector trailers:
+    // - If config has custom keys AND card has factory keys: Write derived keys
+    // - If force_factory_keys is true: Write factory keys (for decryptcard command)
+    // - If card already has derived keys and NOT force_factory_keys: Skip (already correct)
+    const SystemConfig_t *config = Config_Get();
+    if (force_factory_keys) {
+        // Force factory keys for decryptcard command
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Force factory keys requested - writing factory keys to all sector trailers...\r\n");
+        
+        // Sector trailer format: 6 bytes Key A | 4 bytes Access | 6 bytes Key B
+        uint8_t sector_trailer[16];
+        uint8_t factory_key[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+        memcpy(sector_trailer, factory_key, 6);              // Key A (factory default)
+        sector_trailer[6] = 0xFF;  // Access bits
+        sector_trailer[7] = 0x07;
+        sector_trailer[8] = 0x80;
+        sector_trailer[9] = 0x69;
+        memcpy(&sector_trailer[10], factory_key, 6);         // Key B (factory default)
+        
+        // Write factory keys to sector trailers (allow_trailer_write=true)
+        uint8_t trailer_blocks[] = {51, 55, 59, 63};  // Sectors 12, 13, 14, 15
+        for (uint8_t i = 0; i < 4; i++) {
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Writing factory keys to sector %d trailer (block %d)...\r\n",
+                       MIFARE_GET_SECTOR(trailer_blocks[i]), trailer_blocks[i]);
+            
+            // mifare_write_block will handle authentication and use correct keys (derived or factory)
+            result = mifare_write_block(trailer_blocks[i], sector_trailer, true);
+            
+            if (result != MIFARE_RESULT_OK) {
+                LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Failed to write sector %d trailer: %s\r\n", 
+                           MIFARE_GET_SECTOR(trailer_blocks[i]), MIFARE_GetResultString(result));
+                goto cleanup;
+            }
+            
+            vTaskDelay(pdMS_TO_TICKS(20));
+            System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
         }
+        
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card sector keys converted to factory defaults successfully\r\n");
+        
+        // CRITICAL: Skip verification after force_factory_keys because mifare_read_block()
+        // uses derived keys but card now has factory keys (only sector 4 has factory fallback)
+        // Verification would fail on sector 15 (header block) with authentication error
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Skipping verification (card now has factory keys)\r\n");
+        
+        // Set proper state transitions for successful completion
+        MIFARE_LogTransaction(1, initial_balance_ml / 1000, 0xFF);  // Log in liters
+        last_authenticated_sector = -1;
+        mifare_transition_state(TRANSACTION_STATE_CARD_DETECTED);
+        g_transaction_manager.last_card_update_time = current_time;
+        MIFARE_SetCardState(MIFARE_CARD_STATE_NEEDS_POLLING_CYCLE);
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card initialization completed successfully\r\n");
+        
+        result = MIFARE_RESULT_OK;
+        goto cleanup;
+        
+    } else if (config->mifare.security.use_custom_sector_keys && use_factory_keys_for_writes) {
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Writing derived sector keys to all sector trailers...\r\n");
+        
+        // Sector trailer format: 6 bytes Key A | 4 bytes Access | 6 bytes Key B
+        uint8_t sector_trailer[16];
+        memcpy(sector_trailer, derived_sector_key, 6);       // Key A (derived)
+        sector_trailer[6] = 0xFF;  // Access bits
+        sector_trailer[7] = 0x07;
+        sector_trailer[8] = 0x80;
+        sector_trailer[9] = 0x69;
+        memcpy(&sector_trailer[10], derived_sector_key, 6);  // Key B (same as Key A)
+        
+        // Write to sector trailers: blocks 3, 7, 11, 15
+        // Must use default key for initial authentication (card still has factory keys)
+        uint8_t default_key[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+        MIFARE_Classic_Auth_t auth = {
+            .uid_length = g_transaction_manager.card_info.uid_length
+        };
+        memcpy(auth.key, default_key, 6);  // Authenticate with default key first
+        memcpy(auth.uid, g_transaction_manager.card_info.uid, auth.uid_length);
+        
+        // Application uses sectors 12-15 only (blocks 48-63)
+        // Sector 0-2 may be locked/read-only on genuine cards
+        uint8_t trailer_blocks[] = {51, 55, 59, 63};  // Sectors 12-15
+        for (uint8_t i = 0; i < 4; i++) {
+            uint8_t block = trailer_blocks[i];
+            
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Writing derived keys to sector %d trailer (block %d)...", block/4, block);
+            
+            // Use mifare_write_block with allow_trailer_write=true
+            result = mifare_write_block(block, sector_trailer, true);
+            
+            if (result == MIFARE_RESULT_OK) {
+                LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Sector %d trailer updated with derived keys", block/4);
+            } else {
+                LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Failed to write sector %d trailer: %s", block/4, MIFARE_GetResultString(result));
+                goto cleanup;
+            }
+            
+            vTaskDelay(pdMS_TO_TICKS(15));  // Allow card to commit sector trailer
+            System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+            System_ReportTaskStatus(SYSTEM_TASK_ID_DISPENSER, true);
+        }
+        
+        // Clear auth cache - new keys in effect now
+        last_authenticated_sector = -1;
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: All sector trailers updated with UID-derived keys\r\n");
+        
+        // Use derived keys for remaining writes
+        use_factory_keys_for_writes = false;
+    } else if (!use_factory_keys_for_writes) {
+        // Card already has derived keys on sectors 1-3 (auto-reinit scenario)
+        // BUT check if sector 4 still has factory keys (common on older cards)
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card has derived keys - checking if sector 4 needs update...\r\n");
+        
+        // Feed WDT before sector 4 check operations
+        System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+        System_ReportTaskStatus(SYSTEM_TASK_ID_DISPENSER, true);
+        
+        // Test auth on sector 4 with derived key
+        last_authenticated_sector = -1;  // Force fresh auth
+        PN532_Status_t sector4_test = PN532_MifareAuthenticate(
+            g_transaction_manager.pn532_handle,
+            MIFARE_BLOCK_ACCOUNT_DATA,  // Block 16 (sector 4)
+            (uint8_t*)g_transaction_manager.card_info.uid,
+            g_transaction_manager.card_info.uid_length,
+            derived_sector_key
+        );
+        
+        // Feed WDT after auth test
+        System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+        System_ReportTaskStatus(SYSTEM_TASK_ID_DISPENSER, true);
+        
+        if (sector4_test != PN532_STATUS_OK) {
+            // Sector 4 still has factory keys - update it
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Sector 4 has factory keys - updating trailer to derived keys\r\n");
+            
+            // Re-select card after failed auth
+            vTaskDelay(pdMS_TO_TICKS(50));
+            PN532_CardInfo_t reselect_info;
+            PN532_ReadPassiveTargetID(g_transaction_manager.pn532_handle, PN532_CARD_TYPE_106_TYPE_A, &reselect_info);
+            
+            // Feed WDT after reselect
+            System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+            System_ReportTaskStatus(SYSTEM_TASK_ID_DISPENSER, true);
+            
+            // Prepare sector trailer with derived keys
+            uint8_t sector_trailer[16];
+            memcpy(sector_trailer, derived_sector_key, 6);       // Key A (derived)
+            sector_trailer[6] = 0xFF;  // Access bits
+            sector_trailer[7] = 0x07;
+            sector_trailer[8] = 0x80;
+            sector_trailer[9] = 0x69;
+            memcpy(&sector_trailer[10], derived_sector_key, 6);  // Key B (same as Key A)
+            
+            // Auth with factory key (sector 4 still has them)
+            uint8_t default_key[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+            MIFARE_Classic_Auth_t auth = {
+                .uid_length = g_transaction_manager.card_info.uid_length
+            };
+            memcpy(auth.key, default_key, 6);
+            memcpy(auth.uid, g_transaction_manager.card_info.uid, auth.uid_length);
+            
+            MIFARE_Classic_Status_t auth_status = MIFARE_Classic_Authenticate(
+                g_transaction_manager.pn532_handle, 19, &auth, &last_authenticated_sector);  // Block 19 = sector 4 trailer
+            
+            // Feed WDT after factory key auth
+            System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+            System_ReportTaskStatus(SYSTEM_TASK_ID_DISPENSER, true);
+            
+            if (auth_status == MIFARE_CLASSIC_OK) {
+                PN532_Status_t write_status = PN532_MifareWriteBlock(
+                    g_transaction_manager.pn532_handle, 19, sector_trailer);
+                
+                // Feed WDT after trailer write
+                System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+                System_ReportTaskStatus(SYSTEM_TASK_ID_DISPENSER, true);
+                
+                if (write_status == PN532_STATUS_OK) {
+                    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Sector 4 trailer updated with derived keys\r\n");
+                    last_authenticated_sector = -1;  // Clear cache - new keys in effect
+                    
+                    // Re-write block 16 (account data) now that sector 4 has derived keys
+                    // This ensures HMAC is computed in the correct key context
+                    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Re-writing account data with new sector keys...\r\n");
+                    vTaskDelay(pdMS_TO_TICKS(50));  // Allow trailer to settle
+                    result = mifare_write_block(MIFARE_BLOCK_ACCOUNT_DATA, card_data->account_data.raw_data, false);
+                    
+                    // Feed WDT after account data write
+                    System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+                    System_ReportTaskStatus(SYSTEM_TASK_ID_DISPENSER, true);
+                    
+                    if (result == MIFARE_RESULT_OK) {
+                        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Account data re-written with derived key HMAC\r\n");
+                    } else {
+                        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Failed to re-write account data (status=%d)\r\n", result);
+                    }
+                } else {
+                    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Failed to write sector 4 trailer (status=0x%02X)\r\n", write_status);
+                    // Continue anyway - sector 4 will use factory key fallback
+                }
+            } else {
+                LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Failed to auth sector 4 trailer for update\r\n");
+                // Continue anyway - sector 4 will use factory key fallback
+            }
+            
+            vTaskDelay(pdMS_TO_TICKS(15));
+            System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+            System_ReportTaskStatus(SYSTEM_TASK_ID_DISPENSER, true);
+        } else {
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Sector 4 already has derived keys - skipping\r\n");
+            last_authenticated_sector = 4;  // Cache the successful auth
+        }
+    } else {
+        // Use factory default keys (backward compatible mode)
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Using factory default sector keys (0xFF...) - no trailer updates needed\r\n");
+        // Keep using factory keys for remaining writes
     }
-    vTaskDelay(pdMS_TO_TICKS(15));
 
-    // Write fast balance cache
-    result = mifare_write_block_safe(MIFARE_BLOCK_FAST_BALANCE_PRIMARY, (uint8_t*)&card_data->fast_balance_primary);
-    if (result != MIFARE_RESULT_OK) {
-        MIFARE_LOG("Failed to write fast balance primary block");
-        return result;
-    }
-    vTaskDelay(pdMS_TO_TICKS(15));
+    // Report status after all block writes complete
+    System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
     
-    result = mifare_write_block_safe(MIFARE_BLOCK_FAST_BALANCE_BACKUP, (uint8_t*)&card_data->fast_balance_backup);
-    if (result != MIFARE_RESULT_OK) {
-        MIFARE_LOG("Failed to write fast balance backup block");
-        return result;
-    }
-    
-    // Verify
-    MIFARE_LOG("Verifying written data...");
+    // Verify - skip SD logging for verification read to avoid USB buffer overflow
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Verifying written data...\r\n");
     vTaskDelay(pdMS_TO_TICKS(50)); // Allow card to stabilize after heavy writing
+    skip_sd_logging = true;  // Don't log verification read to SD
     MIFARE_CardData_t verify_data;
     result = MIFARE_ReadCardData(&verify_data);
+    skip_sd_logging = false;
     if (result != MIFARE_RESULT_OK) {
-        MIFARE_LOG("Failed to read back initialized data");
-        return result;
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Failed to read back initialized data\r\n");
+        goto cleanup;
     }
     
     if (verify_data.header.magic_bytes != MIFARE_MAGIC_BYTES ||
         verify_data.header.card_serial != customer_id ||
         verify_data.user_primary.balance_ml != initial_balance_ml) {
-        MIFARE_LOG("Data verification failed after initialization");
-        return MIFARE_RESULT_DATA_MISMATCH;
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Data verification failed after initialization\r\n");
+        result = MIFARE_RESULT_DATA_MISMATCH;
+        goto cleanup;
     }
 
-    MIFARE_LogTransaction(1, initial_balance_ml, 0xFF);
+    MIFARE_LogTransaction(1, initial_balance_ml / 1000, 0xFF);  // Log in liters
     
     last_authenticated_sector = -1;
-    mifare_transition_state(DISPENSE_STATE_CARD_DETECTED);
+    mifare_transition_state(TRANSACTION_STATE_INITIALIZED);
     g_transaction_manager.last_card_update_time = current_time;
-    MIFARE_SetCardState(MIFARE_CARD_STATE_NEEDS_POLLING_CYCLE);
+    MIFARE_SetCardState(MIFARE_CARD_STATE_PRESENT);
     
-    MIFARE_LOG("Card initialization completed successfully");
-    return MIFARE_RESULT_OK;
-}
+    LOG_CRITICAL_MIFARE_TRANSACTION_MANAGER("[✓] Card initialization successful\r\n");
+    result = MIFARE_RESULT_OK;
 
-MIFARE_Result_t MIFARE_TopupCardBalance(uint32_t topup_amount_ml)
-{
-    MIFARE_Result_t result;
+cleanup:
+    // Restore transaction active state
+    g_transaction_manager.transaction_active = prev_transaction_active;
     
-    if (topup_amount_ml == 0) {
-        return MIFARE_RESULT_ERROR;
-    }
+    // If we used factory keys override, ensure it's cleared
+    use_factory_keys_for_writes = false;
     
-    if (MIFARE_GetCardState() != MIFARE_CARD_STATE_PRESENT || !g_transaction_manager.current_card.data_valid) {
-        return MIFARE_RESULT_CARD_REMOVED;
-    }
-    
-    MIFARE_CardData_t *card_data = &g_transaction_manager.current_card;
-    uint32_t old_balance = card_data->user_primary.balance_ml;
-    uint32_t new_balance = old_balance + topup_amount_ml;
-    
-    if (new_balance < old_balance) {
-        return MIFARE_RESULT_ERROR;
-    }
-    
-    result = MIFARE_BeginTransaction(0);
+    // On error, reset card state to prevent stuck-in-reprocessing loop
     if (result != MIFARE_RESULT_OK) {
-        return result;
+        MIFARE_SetErrorState_WriteFailed();
+        LOG_CRITICAL_MIFARE_TRANSACTION_MANAGER("    Context: Card initialization - %s\r\n", MIFARE_GetResultString(result));
+        MIFARE_SetCardState(MIFARE_CARD_STATE_PRESENT);
+        last_authenticated_sector = -1;
     }
     
-    card_data->user_primary.balance_ml = new_balance;
-    card_data->user_primary.last_topup_amount_ml = (uint16_t)(topup_amount_ml > 65535 ? 65535 : topup_amount_ml);
-    card_data->user_primary.transaction_counter++;
-    card_data->usage_data.total_purchased_ml += topup_amount_ml;
-    
-    if (sizeof(MIFARE_UserData_t) <= sizeof(card_data->user_backup)) {
-        memcpy(&card_data->user_backup, &card_data->user_primary, sizeof(MIFARE_UserData_t));
-    }
-    
-    uint32_t current_time = mifare_get_timestamp();
-    card_data->recovery_info.last_update_time = current_time;
-    card_data->recovery_info.primary_data_crc = MIFARE_CALCULATE_CRC16(
-        (uint8_t*)&card_data->user_primary, sizeof(MIFARE_UserData_t));
-    card_data->recovery_info.backup_data_crc = MIFARE_CALCULATE_CRC16(
-        (uint8_t*)&card_data->user_backup, sizeof(MIFARE_UserData_t));
-    card_data->recovery_info.sequence_number++;
-    
-    result = MIFARE_CommitTransaction();
-    if (result != MIFARE_RESULT_OK) {
-        return result;
-    }
-    
-    MIFARE_LogTransaction(1, (uint16_t)(topup_amount_ml > 65535 ? 65535 : topup_amount_ml), 0xFF);
-    
-    return MIFARE_RESULT_OK;
+    return result;
 }
 
 MIFARE_Result_t MIFARE_ValidateCardData(MIFARE_CardData_t *card_data)
 {
     if (card_data == NULL) {
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [VALIDATE] Card data is NULL\r\n");
         return MIFARE_RESULT_ERROR;
     }
     
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [VALIDATE] Checking magic bytes: 0x%08lX (expected: 0x%08lX)", 
+               card_data->header.magic_bytes, MIFARE_MAGIC_BYTES);
     if (card_data->header.magic_bytes != MIFARE_MAGIC_BYTES) {
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [VALIDATE] Magic bytes MISMATCH\r\n");
         return MIFARE_RESULT_CARD_CORRUPTED;
     }
     
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [VALIDATE] Checking format version: %d (expected: %d)", 
+               card_data->header.format_version, MIFARE_FORMAT_VERSION);
     if (card_data->header.format_version != MIFARE_FORMAT_VERSION) {
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [VALIDATE] Format version MISMATCH\r\n");
         return MIFARE_RESULT_CARD_CORRUPTED;
     }
     
@@ -2216,26 +2575,23 @@ MIFARE_Result_t MIFARE_ValidateCardData(MIFARE_CardData_t *card_data)
     // Restore CRC field
     card_data->header.header_crc = read_crc;
     
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [VALIDATE] Header CRC: read=0x%04X, calculated=0x%04X", 
+               read_crc, calculated_header_crc);
     if (read_crc != calculated_header_crc) {
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [VALIDATE] Header CRC MISMATCH\r\n");
         return MIFARE_RESULT_CARD_CORRUPTED;
     }
     
-    uint16_t calculated_primary_crc = MIFARE_CALCULATE_CRC16((uint8_t*)&card_data->user_primary, 
-                                                              sizeof(MIFARE_UserData_t));
-    uint16_t calculated_backup_crc = MIFARE_CALCULATE_CRC16((uint8_t*)&card_data->user_backup, 
-                                                             sizeof(MIFARE_UserData_t));
-    
-    bool primary_valid = (card_data->recovery_info.primary_data_crc == calculated_primary_crc);
-    bool backup_valid = (card_data->recovery_info.backup_data_crc == calculated_backup_crc);
-    
-    if (primary_valid && backup_valid) {
-        return MIFARE_RESULT_OK;
-    } else if (primary_valid || backup_valid) {
+    // User data integrity is validated by HMAC during mifare_read_block()
+    // If we get here, the HMAC was already verified successfully
+    // Compare primary and backup to detect mismatches
+    if (memcmp(&card_data->user_primary, &card_data->user_backup, 12) != 0) {
+        // First 12 bytes differ (balance, topup, counter) - try to recover
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [VALIDATE] Primary/backup mismatch detected\r\n");
         return MIFARE_RESULT_DATA_MISMATCH;
-    } else {
-        return MIFARE_RESULT_CARD_CORRUPTED;
     }
     
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: [VALIDATE] Card data valid - OK\r\n");
     card_data->data_valid = true;
     return MIFARE_RESULT_OK;
 }
@@ -2246,185 +2602,800 @@ MIFARE_Result_t MIFARE_RecoverCardData(MIFARE_CardData_t *card_data)
         return MIFARE_RESULT_ERROR;
     }
     
-    MIFARE_LOG("RecoverCardData: Attempting to recover card data");
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: RecoverCardData: Attempting to recover card data\r\n");
     
-    uint16_t calculated_primary_crc = MIFARE_CALCULATE_CRC16((uint8_t*)&card_data->user_primary, 
-                                                             sizeof(MIFARE_UserData_t));
-    uint16_t calculated_backup_crc = MIFARE_CALCULATE_CRC16((uint8_t*)&card_data->user_backup, 
-                                                             sizeof(MIFARE_UserData_t));
+    // With HMAC validation in mifare_read_block, we know which blocks passed HMAC
+    // For now, prefer primary data and sync to backup
+    // In a more complete implementation, we'd track HMAC validation status per block
     
-    bool primary_valid = (card_data->recovery_info.primary_data_crc == calculated_primary_crc);
-    bool backup_valid = (card_data->recovery_info.backup_data_crc == calculated_backup_crc);
-    
-    MIFARE_UserData_t *good_data = NULL;
-    uint16_t good_crc = 0;
-    
-    if (primary_valid) {
-        good_data = &card_data->user_primary;
-        good_crc = calculated_primary_crc;
-    } else if (backup_valid) {
-        good_data = &card_data->user_backup;
-        good_crc = calculated_backup_crc;
-    } else {
-        card_data->data_valid = false;
-        return MIFARE_RESULT_CARD_CORRUPTED;
-    }
-    
-    memcpy(&card_data->user_primary, good_data, sizeof(MIFARE_UserData_t));
-    memcpy(&card_data->user_backup, good_data, sizeof(MIFARE_UserData_t));
-    
-    card_data->recovery_info.primary_data_crc = good_crc;
-    card_data->recovery_info.backup_data_crc = good_crc;
-    card_data->recovery_info.recovery_attempts++;
-    
+    memcpy(&card_data->user_backup, &card_data->user_primary, sizeof(MIFARE_UserData_t));
     card_data->data_valid = true;
     
     MIFARE_Result_t result;
-    uint8_t block_data[16];
     
-    memset(block_data, 0, sizeof(block_data));
-    memcpy(block_data, &card_data->user_primary, sizeof(MIFARE_UserData_t));
-    result = mifare_write_block_safe(MIFARE_BLOCK_USER_PRIMARY, block_data);
-    if (result != MIFARE_RESULT_OK) return result;
-    
-    vTaskDelay(pdMS_TO_TICKS(15));
-    
-    memset(block_data, 0, sizeof(block_data));
-    memcpy(block_data, &card_data->user_backup, sizeof(MIFARE_UserData_t));
-    result = mifare_write_block_safe(MIFARE_BLOCK_USER_BACKUP, block_data);
-    if (result != MIFARE_RESULT_OK) return result;
-    
-    vTaskDelay(pdMS_TO_TICKS(15));
-    
-    memset(block_data, 0, sizeof(block_data));
-    memcpy(block_data, &card_data->recovery_info, sizeof(MIFARE_RecoveryInfo_t));
-    result = mifare_write_block_safe(MIFARE_BLOCK_RECOVERY_INFO, block_data);
+    // Write recovered backup block (HMAC computed during write)
+    result = mifare_write_block(MIFARE_BLOCK_USER_BACKUP, (uint8_t*)&card_data->user_backup, false);
     if (result != MIFARE_RESULT_OK) return result;
     
     bool phone_is_empty = mifare_is_account_data_empty(&card_data->account_data);
     
     if (phone_is_empty) {
         mifare_encode_account_data(&card_data->account_data, "07970242024", CARD_VALIDITY_NORMAL);
-        result = mifare_write_block_safe(MIFARE_BLOCK_ACCOUNT_DATA, card_data->account_data.raw_data);
+        result = mifare_write_block(MIFARE_BLOCK_ACCOUNT_DATA, card_data->account_data.raw_data, false);
     }
     
     return MIFARE_RESULT_OK;
 }
 
 /* Data Integrity Functions -------------------------------------------------*/
-
-uint16_t mifare_calculate_crc16(uint8_t *data, uint16_t length)
-{
-    uint16_t crc = 0xFFFF;
-    for (uint16_t i = 0; i < length; i++) {
-        crc ^= data[i];
-        for (uint8_t j = 0; j < 8; j++) {
-            if (crc & 0x0001) {
-                crc = (crc >> 1) ^ 0xA001;
-            } else {
-                crc = crc >> 1;
-            }
-        }
-    }
-    return crc;
-}
+/* CRC16 calculation moved to MIFARE_Classic_Driver */
 
 MIFARE_Result_t MIFARE_DetectAndAutoInitializeCard(const PN532_CardInfo_t *card_info, uint32_t default_balance_ml)
 {
     PN532_Status_t status;
     
-    // Check if card is blank (default keys)
-    // Try to authenticate with default key (FF FF FF FF FF FF)
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: DetectAndAutoInitializeCard: Entry\r\n");
+    
+    // Check if USB command handler has a pending CARDINIT command
+    // Only skip auto-init for cardinit (manual initialization) - other commands need the card ready
+    USB_PendingCommandState_t *pending = USB_Command_GetPendingCommand();
+    if (pending != NULL && pending->active && pending->command == USB_PENDING_CMD_CARD_INIT) {
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: cardinit pending - skipping auto-init to allow manual control\r\n");
+        return MIFARE_RESULT_BUSY;  // Card detected but waiting for manual cardinit
+    }
+    
+    // For topup/recover commands, proceed with auto-init so card becomes READY
+    if (pending != NULL && pending->active) {
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: USB command pending (%d) - proceeding with auto-init\r\n", 
+                   pending->command);
+    }
+    
+    // Report WDT status but don't yield - we want fast card read
+    System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+    
+    // Try derived custom keys FIRST (fast path for already-initialized cards)
+    // This avoids 2400ms timeout when card has custom keys
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Attempting derived key authentication on block %d...\r\n", MIFARE_BLOCK_HEADER);
+    status = PN532_MifareAuthenticate(
+        g_transaction_manager.pn532_handle,
+        MIFARE_BLOCK_HEADER,
+        (uint8_t*)card_info->uid,
+        card_info->uid_length,
+        derived_sector_key  // Try custom derived key first
+    );
+    
+    // Report WDT status after potentially long I2C operation
+    System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+    
+    if (status == PN532_STATUS_OK) {
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Derived key auth succeeded - verifying with test read\r\n");
+        
+        // Authentication succeeded - proceed directly to test read
+        // Do NOT re-select card here as it would break the authenticated session
+        uint8_t header_data[16];
+        status = PN532_MifareReadBlock(g_transaction_manager.pn532_handle, MIFARE_BLOCK_HEADER, header_data);
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Test read status: 0x%02X", status);
+        
+        // Yield after test read I2C operation
+        System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+        
+        if (status == PN532_STATUS_OK) {
+            // Successfully read with derived keys - this is an existing initialized card
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Existing initialized card with custom keys detected.\r\n");
+            last_authenticated_sector = MIFARE_GET_SECTOR(MIFARE_BLOCK_HEADER);
+            
+            // Load card data
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Loading card data...\r\n");
+            MIFARE_Result_t read_result = MIFARE_ReadCardData(&g_transaction_manager.current_card);
+            
+            // Check if card is corrupted (CRC or HMAC failure) - trigger auto-reinit if enabled
+            if (read_result == MIFARE_RESULT_CARD_CORRUPTED) {
+                const SystemConfig_t *config = Config_Get();
+                if (config->mifare.auto_reinit_on_corruption) {
+                    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card data corrupted (HMAC/CRC mismatch). Auto-reinit enabled.\r\n");
+                    
+                    // Derive customer ID from UID
+                    uint64_t customer_id = 0;
+                    for (int i = 0; i < card_info->uid_length; i++) {
+                        customer_id = (customer_id << 8) | card_info->uid[i];
+                    }
+                    
+                    // STEP 1: Try to recover balance from SD card log first
+                    uint32_t recovered_balance_ml = 0;
+                    bool sd_recovery_success = SD_Logger_RecoverCardBalance(
+                        card_info->uid, card_info->uid_length, &recovered_balance_ml);
+                    
+                    uint32_t init_balance_ml;
+                    if (sd_recovery_success && recovered_balance_ml > 0) {
+                        // Use recovered balance from SD card
+                        init_balance_ml = recovered_balance_ml;
+                        USB_Log_Printf("MIFARE: Auto-recovery from SD log - balance: %lu ml\r\n\r\n", init_balance_ml);
+                    } else {
+                        // Fall back to default balance from config
+                        init_balance_ml = config->mifare.card_init_default_balance_ml;
+                        USB_Log_Printf("MIFARE: Auto-recovery using default balance: %lu ml\r\n\r\n", init_balance_ml);
+                    }
+                    
+                    return MIFARE_InitializeNewCustomerCard(init_balance_ml, customer_id, false);
+                } else {
+                    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card corrupted but auto-reinit disabled - manual intervention required\r\n");
+                }
+            }
+            
+            return read_result;
+        } else {
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Derived key auth succeeded but read failed - card may be corrupted\r\n");
+            return MIFARE_RESULT_ERROR;
+        }
+    }
+    
+    // Derived keys failed - card may be blank or have factory keys
+    // CRITICAL: After failed auth, PN532 requires re-selecting the card before trying another key
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Derived key auth failed - re-selecting card before trying factory keys...\r\n");
+    
+    // Minimal delay for PN532 to recover from failed auth
+    vTaskDelay(pdMS_TO_TICKS(10));
+    System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+    
+    PN532_CardInfo_t reselect_info;
+    PN532_Status_t reselect_status = PN532_ReadPassiveTargetID(
+        g_transaction_manager.pn532_handle,
+        PN532_CARD_TYPE_106_TYPE_A,
+        &reselect_info
+    );
+    
+    System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+    
+    if (reselect_status != PN532_STATUS_CARD_DETECTED) {
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card re-selection failed after derived key failure\r\n");
+        return MIFARE_RESULT_ERROR;
+    }
+    
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card re-selected, trying factory default keys...\r\n");
     uint8_t default_key[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
     
     // Try to authenticate block MIFARE_BLOCK_HEADER (header)
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Attempting factory key authentication on block %d...", MIFARE_BLOCK_HEADER);
+    
+    // Report status before potentially long I2C operation
+    System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+    
     status = PN532_MifareAuthenticate( 
+                                      g_transaction_manager.pn532_handle,
                                       MIFARE_BLOCK_HEADER, 
                                       (uint8_t*)card_info->uid, 
                                       card_info->uid_length, 
                                       default_key);
+    
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Factory key auth status: 0x%02X", status);
+    System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
                                           
     if (status == PN532_STATUS_OK) {
-        // Authenticated successfully. Now check if it's already initialized.
+        // Authenticated successfully - proceed directly to read
+        // Do NOT re-select card here as it would break the authenticated session
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Factory key auth succeeded - attempting read...\r\n");
+        
         uint8_t header_data[16];
-        status = PN532_MifareReadBlock(MIFARE_BLOCK_HEADER, header_data);
+        status = PN532_MifareReadBlock(g_transaction_manager.pn532_handle, MIFARE_BLOCK_HEADER, header_data);
+        
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Read block status after factory auth: 0x%02X", status);
+        System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
         
         if (status == PN532_STATUS_OK) {
             // Check for Magic Bytes (Little Endian)
             uint32_t magic = (header_data[0]) | (header_data[1] << 8) | (header_data[2] << 16) | (header_data[3] << 24);
             
             if (magic == MIFARE_MAGIC_BYTES) {
-                MIFARE_LOG("Existing initialized card detected. Loading data...");
-                return MIFARE_ReadCardData(&g_transaction_manager.current_card);
+                LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Existing initialized card detected.\r\n");
+                
+                // DISABLED: Auto-upgrade from factory to custom keys
+                // After decryptcard, we want cards to stay with factory keys
+                // Users must run 'cardinit' explicitly to set custom keys
+                #if 0  // DISABLED - no auto-upgrade
+                // Check if we need to upgrade sector keys BEFORE reading card data
+                // (Reading requires authentication with the current keys)
+                const SystemConfig_t *config = Config_Get();
+                if (config->mifare.security.use_custom_sector_keys) {
+                    // Card is using factory default keys (we just authenticated with 0xFF...)
+                    // Config says to use custom keys - upgrade BEFORE reading
+                    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card using factory keys, config requires custom keys - upgrading...\r\n");
+                    
+                    // Report to watchdog before starting upgrade (slow operation)
+                    System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+                    
+                    // Create sector trailer with derived keys
+                    uint8_t sector_trailer[16];
+                    memset(sector_trailer, 0, 16);
+                    
+                    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Derived key to write: %02X%02X%02X%02X%02X%02X",
+                              derived_sector_key[0], derived_sector_key[1], derived_sector_key[2],
+                              derived_sector_key[3], derived_sector_key[4], derived_sector_key[5]);
+                    
+                    // Copy derived Key A (6 bytes)
+                    memcpy(&sector_trailer[0], derived_sector_key, 6);
+                    
+                    // Access bits (4 bytes) - standard configuration
+                    sector_trailer[6] = 0xFF;
+                    sector_trailer[7] = 0x07;
+                    sector_trailer[8] = 0x80;
+                    sector_trailer[9] = 0x69;
+                    
+                    // Copy derived Key B (6 bytes)
+                    memcpy(&sector_trailer[10], derived_sector_key, 6);
+                    
+                    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Sector trailer: KeyA=%02X%02X... Access=%02X%02X%02X%02X KeyB=%02X%02X...",
+                              sector_trailer[0], sector_trailer[1],
+                              sector_trailer[6], sector_trailer[7], sector_trailer[8], sector_trailer[9],
+                              sector_trailer[10], sector_trailer[11]);
+                    
+                    // Write new keys to sector trailers for sectors 12, 13, 14, 15
+                    uint8_t sector_trailer_blocks[] = {51, 55, 59, 63};
+                    bool upgrade_success = true;
+                    
+                    for (uint8_t i = 0; i < 4; i++) {
+                        // Report to watchdog during each sector upgrade
+                        System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+                        
+                        uint8_t block = sector_trailer_blocks[i];
+                        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Upgrading sector %d trailer (block %d)...", i, block);
+                        
+                        // Authenticate with factory default key (still using it)
+                        status = PN532_MifareAuthenticate(
+                            g_transaction_manager.pn532_handle,
+                            block,
+                            (uint8_t*)card_info->uid,
+                            card_info->uid_length,
+                            default_key
+                        );
+                        
+                        if (status != PN532_STATUS_OK) {
+                            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Failed to auth sector %d for upgrade", i);
+                            upgrade_success = false;
+                            break;
+                        }
+                        
+                        // Write new derived keys
+                        status = PN532_MifareWriteBlock(g_transaction_manager.pn532_handle, block, sector_trailer);
+                        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Write sector %d trailer status: 0x%02X", i, status);
+                        if (status != PN532_STATUS_OK) {
+                            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Failed to write sector %d trailer", i);
+                            upgrade_success = false;
+                            break;
+                        }
+                        vTaskDelay(pdMS_TO_TICKS(20));  // Allow card to commit
+                    }
+                    
+                    if (upgrade_success) {
+                        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card sector keys upgraded successfully - now using custom derived keys\r\n");
+                        // Clear authentication cache since keys changed
+                        last_authenticated_sector = -1;
+                        
+                        // Re-authenticate with new derived keys to establish valid session
+                        // This is critical because PN532's auth state is now invalid after key change
+                        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Re-authenticating with new derived keys...\r\n");
+                        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Using key: %02X%02X%02X%02X%02X%02X",
+                                  derived_sector_key[0], derived_sector_key[1], derived_sector_key[2],
+                                  derived_sector_key[3], derived_sector_key[4], derived_sector_key[5]);
+                        status = PN532_MifareAuthenticate(
+                            g_transaction_manager.pn532_handle,
+                            MIFARE_BLOCK_HEADER,  // Block 60
+                            (uint8_t*)card_info->uid,
+                            card_info->uid_length,
+                            derived_sector_key  // Use NEW derived key
+                        );
+                        
+                        if (status != PN532_STATUS_OK) {
+                            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Failed to re-authenticate with new derived keys!\r\n");
+                            return MIFARE_RESULT_ERROR;
+                        }
+                        
+                        // Update cache to reflect successful auth
+                        last_authenticated_sector = MIFARE_GET_SECTOR(MIFARE_BLOCK_HEADER);
+                        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Re-authentication successful - ready for read/write\r\n");
+                    } else {
+                        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Sector key upgrade failed - card may have mixed keys\r\n");
+                        return MIFARE_RESULT_ERROR;
+                    }
+                    
+                    // Final watchdog report after upgrade
+                    System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+                }
+                #endif  // End of disabled auto-upgrade block
+                
+                // Now read card data (will use factory keys since no upgrade)
+                LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Loading card data...\r\n");
+                MIFARE_Result_t read_result = MIFARE_ReadCardData(&g_transaction_manager.current_card);
+                
+                // Check if card is corrupted (CRC or HMAC failure)
+                if (read_result == MIFARE_RESULT_CARD_CORRUPTED) {
+                    const SystemConfig_t *config = Config_Get();
+                    if (config->mifare.auto_reinit_on_corruption) {
+                        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card data corrupted (HMAC/CRC mismatch). Auto-reinit enabled.\r\n");
+                        
+                        // Derive customer ID from UID
+                        uint64_t customer_id = 0;
+                        for (int i = 0; i < card_info->uid_length; i++) {
+                            customer_id = (customer_id << 8) | card_info->uid[i];
+                        }
+                        
+                        // STEP 1: Try to recover balance from SD card log first
+                        uint32_t recovered_balance_ml = 0;
+                        bool sd_recovery_success = SD_Logger_RecoverCardBalance(
+                            card_info->uid, card_info->uid_length, &recovered_balance_ml);
+                        
+                        uint32_t init_balance_ml;
+                        if (sd_recovery_success && recovered_balance_ml > 0) {
+                            // Use recovered balance from SD card
+                            init_balance_ml = recovered_balance_ml;
+                            USB_Log_Printf("MIFARE: Auto-recovery from SD log - balance: %lu ml\r\n\r\n", init_balance_ml);
+                        } else {
+                            // Fall back to default balance from config
+                            init_balance_ml = config->mifare.card_init_default_balance_ml;
+                            USB_Log_Printf("MIFARE: Auto-recovery using default balance: %lu ml\r\n\r\n", init_balance_ml);
+                        }
+                        
+                        return MIFARE_InitializeNewCustomerCard(init_balance_ml, customer_id, false);
+                    } else {
+                        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card corrupted but auto-reinit disabled - manual intervention required\r\n");
+                        return MIFARE_RESULT_CARD_CORRUPTED;
+                    }
+                }
+                
+                return read_result;
             }
         } else {
             // Read failed - do NOT assume it's blank. It might be a communication error.
-            // If we proceed, we might overwrite a valid card.
-            MIFARE_LOG("Failed to read block %d (status 0x%02X). Aborting auto-init to protect card data.", MIFARE_BLOCK_HEADER, status);
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Failed to read block %d (status 0x%02X). Card error or blank card.", MIFARE_BLOCK_HEADER, status);
             return MIFARE_RESULT_ERROR;
         }
 
         // Card accepts default key AND read succeeded AND magic bytes didn't match.
-        // This is likely a blank card (or at least one not formatted by us).
-        MIFARE_LOG("Blank/Unformatted card detected (Magic Bytes mismatch), initializing...");
-        
-        // Initialize with default values
-        // Customer ID derived from UID
-        uint64_t customer_id = 0;
-        for (int i = 0; i < card_info->uid_length; i++) {
-            customer_id = (customer_id << 8) | card_info->uid[i];
-        }
-        
-        return MIFARE_InitializeNewCustomerCard(default_balance_ml, customer_id);
+        // This is a blank/unformatted card - do NOT auto-initialize, wait for manual command
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Blank/Unformatted card detected - manual 'cardinit' required\r\n");
+        USB_Log_Printf("MIFARE: Blank card detected. Use 'cardinit' command to initialize.\r\n");
+        return MIFARE_RESULT_ERROR;
     }
     
+    // Authentication with factory default keys failed
+    // Card likely has custom keys already - try derived keys directly
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Factory key auth failed - card likely has custom keys\r\n");
+    
+    // Clear PN532 state by re-selecting the card after failed auth
+    // The failed auth corrupts PN532's internal state - add delay for recovery
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Re-selecting card to clear PN532 state...\r\n");
+    
+    // Give PN532 time to recover from failed auth before re-selection
+    vTaskDelay(pdMS_TO_TICKS(50));
+    System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
+    
+    PN532_CardInfo_t reselect_info2;
+    PN532_Status_t reselect_status2 = PN532_ReadPassiveTargetID(
+        g_transaction_manager.pn532_handle,
+        PN532_CARD_TYPE_106_TYPE_A,  // MIFARE Classic uses Type A
+        &reselect_info2
+    );
+    
+    if (reselect_status2 != PN532_STATUS_CARD_DETECTED) {
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card re-selection failed after failed factory auth\r\n");
+        return MIFARE_RESULT_ERROR;
+    }
+    
+    // Verify same card
+    if (memcmp(reselect_info2.uid, card_info->uid, card_info->uid_length) != 0) {
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Different card detected after re-selection!\r\n");
+        return MIFARE_RESULT_ERROR;
+    }
+    
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card re-selected successfully, trying derived keys...\r\n");
+    status = PN532_MifareAuthenticate(
+        g_transaction_manager.pn532_handle,
+        MIFARE_BLOCK_HEADER,
+        (uint8_t*)card_info->uid,
+        card_info->uid_length,
+        derived_sector_key  // Try custom derived key
+    );
+    
+    if (status == PN532_STATUS_OK) {
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Auth with derived keys succeeded - verifying with test read\r\n");
+        
+        // Don't update cache yet - let's verify read works first
+        uint8_t header_data[16];
+        status = PN532_MifareReadBlock(g_transaction_manager.pn532_handle, MIFARE_BLOCK_HEADER, header_data);
+        
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Test read status: 0x%02X", status);
+        
+        if (status == PN532_STATUS_OK) {
+            // Read succeeded - update auth cache
+            last_authenticated_sector = MIFARE_GET_SECTOR(MIFARE_BLOCK_HEADER);
+            
+            // Check for Magic Bytes (Little Endian)
+            uint32_t magic = (header_data[0]) | (header_data[1] << 8) | (header_data[2] << 16) | (header_data[3] << 24);
+            
+            if (magic == MIFARE_MAGIC_BYTES) {
+                LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Existing initialized card with custom keys detected.\r\n");
+                
+                // Update auth cache
+                last_authenticated_sector = MIFARE_GET_SECTOR(MIFARE_BLOCK_HEADER);
+                
+                // Read card data directly (already authenticated with correct keys)
+                LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Loading card data...\r\n");
+                MIFARE_Result_t read_result = MIFARE_ReadCardData(&g_transaction_manager.current_card);
+                
+                // Check if card is corrupted (CRC or HMAC failure)
+                if (read_result == MIFARE_RESULT_CARD_CORRUPTED) {
+                    const SystemConfig_t *config = Config_Get();
+                    if (config->mifare.auto_reinit_on_corruption) {
+                        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card data corrupted (HMAC/CRC mismatch). Auto-reinit enabled.\r\n");
+                        
+                        // Derive customer ID from UID
+                        uint64_t customer_id = 0;
+                        for (int i = 0; i < card_info->uid_length; i++) {
+                            customer_id = (customer_id << 8) | card_info->uid[i];
+                        }
+                        
+                        // STEP 1: Try to recover balance from SD card log first
+                        uint32_t recovered_balance_ml = 0;
+                        bool sd_recovery_success = SD_Logger_RecoverCardBalance(
+                            card_info->uid, card_info->uid_length, &recovered_balance_ml);
+                        
+                        uint32_t init_balance_ml;
+                        if (sd_recovery_success && recovered_balance_ml > 0) {
+                            // Use recovered balance from SD card
+                            init_balance_ml = recovered_balance_ml;
+                            USB_Log_Printf("MIFARE: Auto-recovery from SD log - balance: %lu ml\r\n\r\n", init_balance_ml);
+                        } else {
+                            // Fall back to default balance from config
+                            init_balance_ml = config->mifare.card_init_default_balance_ml;
+                            USB_Log_Printf("MIFARE: Auto-recovery using default balance: %lu ml\r\n\r\n", init_balance_ml);
+                        }
+                        
+                        return MIFARE_InitializeNewCustomerCard(init_balance_ml, customer_id, false);
+                    } else {
+                        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card corrupted but auto-reinit disabled - manual intervention required\r\n");
+                        return MIFARE_RESULT_CARD_CORRUPTED;
+                    }
+                }
+                
+                return read_result;
+            } else {
+                LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card has custom keys but invalid magic bytes - cannot auto-init (would destroy data)\r\n");
+                return MIFARE_RESULT_ERROR;
+            }
+        } else {
+            // Read failed but authentication succeeded - card has custom keys but corrupted data
+            // This happens after a partial upgrade (keys changed but data not rewritten)
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Failed to read header with custom keys (status 0x%02X) - forcing reinit", status);
+            
+            // Update auth cache since we successfully authenticated
+            last_authenticated_sector = MIFARE_GET_SECTOR(MIFARE_BLOCK_HEADER);
+            
+            // Derive customer ID from UID
+            uint64_t customer_id = 0;
+            for (int i = 0; i < card_info->uid_length; i++) {
+                customer_id = (customer_id << 8) | card_info->uid[i];
+            }
+            
+            // Force re-initialization with default balance
+            const SystemConfig_t *config = Config_Get();
+            uint32_t init_balance_ml = config->mifare.card_init_default_balance_ml;
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Re-initializing card with balance: %lu ml", (unsigned long)init_balance_ml);
+            return MIFARE_InitializeNewCustomerCard(init_balance_ml, customer_id, false);
+        }
+    }
+    
+    // Neither factory nor derived keys worked
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Authentication failed with both factory and derived keys\r\n");
     return MIFARE_RESULT_ERROR;
 }
 
 /**
  * @brief Get current dispense state
- * @return MIFARE_DispenseState_t Current dispense state
+ * @return MIFARE_TransactionState_t Current transaction state
  */
-MIFARE_DispenseState_t MIFARE_GetDispenseState(void)
+MIFARE_TransactionState_t MIFARE_GetDispenseState(void)
 {
-    return g_transaction_manager.dispense_state;
+    return g_transaction_manager.transaction_state;
 }
 
 /**
- * @brief Get current balance in milliliters
- * @return uint32_t Current balance (in mL)
+ * @brief Get current balance in milliliters from card
+ * @return Current balance in ml, or 0 if card not ready
+ * @deprecated Use MIFARE_GetUserData()->balance_ml instead for direct access
  */
-uint32_t MIFARE_GetBalanceML(void)
+uint32_t MIFARE_GetBalanceMl(void)
 {
-    return g_transaction_manager.current_card.user_primary.balance_ml;
+    MIFARE_UserData_t *user_data = MIFARE_GetUserData();
+    return user_data ? user_data->balance_ml : 0;
+}
+
+/**
+ * @brief Add volume to card (topup)
+ * @param topup_ml Number of milliliters of water to add
+ * @return MIFARE_Result_t Operation result
+ */
+MIFARE_Result_t MIFARE_TopupCardBalance(uint32_t topup_ml)
+{
+    if (!MIFARE_IsCardReady()) {
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card not ready for topup\r\n");
+        return MIFARE_RESULT_ERROR;
+    }
+    
+    if (topup_ml == 0 || topup_ml > 200000) {  // Max 200 liters
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Invalid topup amount: %lu ml (must be 1-200000)", topup_ml);
+        return MIFARE_RESULT_ERROR;
+    }
+    
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Adding %lu ml to card", topup_ml);
+    
+    /* Get current card data */
+    MIFARE_CardData_t *card_data = &g_transaction_manager.current_card;
+    
+    uint32_t old_balance = card_data->user_primary.balance_ml;
+    uint32_t new_balance = old_balance + topup_ml;
+    
+    /* Check for overflow */
+    if (new_balance < old_balance) {
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Balance overflow: %lu + %lu", old_balance, topup_ml);
+        return MIFARE_RESULT_ERROR;
+    }
+    
+    /* Update balance in card data */
+    card_data->user_primary.balance_ml = new_balance;
+    card_data->user_backup.balance_ml = new_balance;
+    card_data->user_primary.last_topup_ml = topup_ml;
+    card_data->user_backup.last_topup_ml = topup_ml;
+    
+    /* Set transaction_active to suspend polling during write */
+    g_transaction_manager.transaction_active = true;
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Topup: Polling suspended for write\r\n");
+    
+    /* Write to card */
+    MIFARE_Result_t result = MIFARE_WriteCardData(card_data);
+    
+    /* Clear transaction_active to resume polling */
+    g_transaction_manager.transaction_active = false;
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Topup: Polling resumed\r\n");
+    
+    if (result == MIFARE_RESULT_OK) {
+        /* Clear any spurious removal timer that started during write */
+        g_transaction_manager.card_first_lost_tick = 0;
+        
+        /* Transition to READY_AFTER_TOPUP state - triggers 8-beep pattern and keeps card balance on screen */
+        mifare_transition_state(TRANSACTION_STATE_READY_AFTER_TOPUP);
+        
+        LOG_CRITICAL_MIFARE_TRANSACTION_MANAGER("[\u2713] Topup successful: %lu + %lu = %lu ml\r\n", 
+                       old_balance, topup_ml, new_balance);
+    } else {
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Failed to write topup to card: %s", MIFARE_GetResultString(result));
+        /* Restore old balance on failure */
+        card_data->user_primary.balance_ml = old_balance;
+        card_data->user_backup.balance_ml = old_balance;
+    }
+    
+    return result;
+}
+
+/**
+ * @brief Get pointer to user data (balance_ml, status, etc.)
+ * @return Pointer to user data structure (read-only for caller), or NULL if not ready
+ */
+MIFARE_UserData_t* MIFARE_GetUserData(void)
+{
+    /* Allow access when card is ready, OR when in post-init/topup states (data is valid but not "ready") */
+    bool card_ready = MIFARE_IsCardReady();
+    bool in_post_init_state = (g_transaction_manager.transaction_state == TRANSACTION_STATE_INITIALIZED ||
+                                g_transaction_manager.transaction_state == TRANSACTION_STATE_READY_AFTER_TOPUP);
+    bool data_valid = g_transaction_manager.current_card.data_valid;
+    
+    if (!card_ready && !in_post_init_state) {
+        return NULL;
+    }
+    
+    /* For post-init states, only return data if it's actually valid */
+    if (in_post_init_state && !data_valid) {
+        return NULL;
+    }
+    
+    return &g_transaction_manager.current_card.user_primary;
+}
+
+/**
+ * @brief Get pointer to usage data (lifetime statistics)
+ * @return Pointer to usage data structure (read-only for caller), or NULL if not ready
+ */
+MIFARE_UsageData_t* MIFARE_GetUsageData(void)
+{
+    if (!MIFARE_IsCardReady()) {
+        return NULL;
+    }
+    return &g_transaction_manager.current_card.usage_data;
+}
+
+/**
+ * @brief Get pointer to account data (phone, validity)
+ * @return Pointer to account data structure (read-only for caller), or NULL if not ready
+ */
+MIFARE_AccountData_t* MIFARE_GetAccountData(void)
+{
+    if (!MIFARE_IsCardReady()) {
+        return NULL;
+    }
+    return &g_transaction_manager.current_card.account_data;
+}
+
+/**
+ * @brief Check if card is ready for operations
+ * @return true if card present, data valid, and in READY state
+ */
+bool MIFARE_IsCardReady(void)
+{
+    bool card_present = (g_transaction_manager.card_state == MIFARE_CARD_STATE_PRESENT);
+    bool data_valid = g_transaction_manager.current_card.data_valid;
+    bool state_ready = (g_transaction_manager.transaction_state == TRANSACTION_STATE_READY ||
+                        g_transaction_manager.transaction_state == TRANSACTION_STATE_READY_AFTER_TOPUP);
+    bool result = card_present && data_valid && state_ready;
+    
+    // Debug log when any condition fails (helps diagnose why card not ready)
+    if (!result) {
+        static uint32_t debug_counter = 0;
+        if (++debug_counter % 500 == 1) {  // Log every 50th call to avoid spam
+            LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: IsCardReady=FALSE (present=%d, valid=%d, ready=%d)\r\n",
+                           card_present, data_valid, state_ready);
+        }
+    }
+    
+    return result;
+}
+
+/**
+ * @brief Get current card info (UID, type, etc)
+ * @param info Pointer to structure to fill
+ * @return true if card info is valid, false otherwise
+ */
+bool MIFARE_GetCurrentCardInfo(PN532_CardInfo_t *info)
+{
+    if (!info) return false;
+    
+    // Only return info if card is present
+    if (g_transaction_manager.card_state == MIFARE_CARD_STATE_ABSENT) {
+        return false;
+    }
+    
+    memcpy(info, &g_transaction_manager.card_info, sizeof(PN532_CardInfo_t));
+    return true;
+}
+
+/**
+ * @brief Set user data (business logic modifies via this)
+ * @param user_data Pointer to new user data
+ */
+void MIFARE_SetUserData(const MIFARE_UserData_t *user_data)
+{
+    if (!user_data) return;
+    
+    // Copy to in-memory structure (primary and backup in sector 1)
+    memcpy(&g_transaction_manager.current_card.user_primary, user_data, sizeof(MIFARE_UserData_t));
+    memcpy(&g_transaction_manager.current_card.user_backup, user_data, sizeof(MIFARE_UserData_t));
+}
+
+/**
+ * @brief Set usage data (business logic modifies via this)
+ * @param usage_data Pointer to new usage data
+ */
+void MIFARE_SetUsageData(const MIFARE_UsageData_t *usage_data)
+{
+    if (!usage_data) return;
+    memcpy(&g_transaction_manager.current_card.usage_data, usage_data, sizeof(MIFARE_UsageData_t));
+}
+
+/**
+ * @brief Get current transaction state
+ * @return Current transaction state
+ */
+MIFARE_TransactionState_t MIFARE_GetTransactionState(void)
+{
+    return g_transaction_manager.transaction_state;
+}
+
+/**
+ * @brief Set error state: card corrupted/blank (needs cardinit)
+ */
+void MIFARE_SetErrorState_CardCorrupted(void)
+{
+    mifare_transition_state(TRANSACTION_STATE_ERROR_CARD_CORRUPTED);
+    MIFARE_SetCardState(MIFARE_CARD_STATE_ERROR);
+    LOG_CRITICAL_MIFARE_TRANSACTION_MANAGER("[✗] Card corrupted/blank. Use 'cardinit' command to initialize.\r\n");
+    LOG_CRITICAL_MIFARE_TRANSACTION_MANAGER("[→] Remove card and re-insert after initialization.\r\n");
+}
+
+/**
+ * @brief Set error state: hardware module failure (PN532, etc)
+ */
+void MIFARE_SetErrorState_ModuleFailure(void)
+{
+    mifare_transition_state(TRANSACTION_STATE_ERROR_MODULE_FAILURE);
+    MIFARE_SetCardState(MIFARE_CARD_STATE_ERROR);
+    LOG_CRITICAL_MIFARE_TRANSACTION_MANAGER("[✗] Hardware module error detected\r\n");
+    LOG_CRITICAL_MIFARE_TRANSACTION_MANAGER("[→] Remove card and re-insert to retry.\r\n");
+}
+
+/**
+ * @brief Set error state: card validation failed
+ */
+void MIFARE_SetErrorState_ValidationFailed(void)
+{
+    mifare_transition_state(TRANSACTION_STATE_ERROR_VALIDATION_FAILED);
+    MIFARE_SetCardState(MIFARE_CARD_STATE_ERROR);
+    LOG_CRITICAL_MIFARE_TRANSACTION_MANAGER("[✗] Card validation failed\r\n");
+    LOG_CRITICAL_MIFARE_TRANSACTION_MANAGER("[→] Remove card and re-insert to retry.\r\n");
+}
+
+/**
+ * @brief Set error state: transaction write failed
+ */
+void MIFARE_SetErrorState_WriteFailed(void)
+{
+    mifare_transition_state(TRANSACTION_STATE_ERROR_WRITE_FAILED);
+    LOG_CRITICAL_MIFARE_TRANSACTION_MANAGER("[✗] Transaction write failed\r\n");
+    LOG_CRITICAL_MIFARE_TRANSACTION_MANAGER("[→] Remove card and re-insert to retry.\r\n");
+}
+
+/**
+ * @brief Set transaction state (public API)
+ * @param new_state New transaction state
+ */
+void MIFARE_SetTransactionState(MIFARE_TransactionState_t new_state)
+{
+    mifare_transition_state(new_state);
+}
+
+/**
+ * @brief Update card data - write in-memory data to physical card
+ * @param fast If true, skip backup write (faster, use during active transactions)
+ * @return MIFARE_Result_t Operation result
+ */
+MIFARE_Result_t MIFARE_UpdateCardData(bool fast)
+{
+    // This function writes the in-memory card data structures to the physical card
+    // Business logic calls this after modifying data via setters
+    
+    if (!MIFARE_IsCardPresent()) {
+        return MIFARE_RESULT_CARD_REMOVED;
+    }
+    
+    if (fast) {
+        return MIFARE_WriteCardDataFast(&g_transaction_manager.current_card);
+    }
+    return MIFARE_WriteCardData(&g_transaction_manager.current_card);
 }
 
 /**
  * @brief Get last top-up amount in milliliters
- * @return uint32_t Last top-up amount (in mL)
+ * @return uint32_t Last top-up amount in ml
  */
-uint32_t MIFARE_GetLastTopupAmountML(void)
+uint32_t MIFARE_GetLastTopupMl(void)
 {
-    return g_transaction_manager.current_card.user_primary.last_topup_amount_ml;
+    MIFARE_UserData_t *user_data = MIFARE_GetUserData();
+    return user_data ? user_data->last_topup_ml : 0;
 }
 
 /**
- * @brief Get total dispensed amount in the current session
- * @return uint32_t Total dispensed amount (in mL)
+ * @brief Get total dispensed amount in the current session (legacy - not used in dispenser)
+ * @return uint32_t Always returns 0 (not applicable for dispenser)
+ * @deprecated Not used in dispenser system
  */
 uint32_t MIFARE_GetTotalDispensedThisSession(void)
 {
-    return g_transaction_manager.total_dispensed_this_session;
+    return 0;  // Not applicable for dispenser system
 }
 
 /**
  * @brief Get card status for UI (returns true if card present and ready)
- * @return bool True if card is present and ready to dispense
+ * @return bool True if card is present and ready
  */
 bool MIFARE_GetCardStatus(void)
 {
-    return (g_transaction_manager.dispense_state == DISPENSE_STATE_READY_TO_DISPENSE ||
-            g_transaction_manager.dispense_state == DISPENSE_STATE_DISPENSING);
+    return MIFARE_IsCardReady();
 }
 
 /**
@@ -2437,21 +3408,23 @@ uint8_t MIFARE_GetCardStatusFlags(void)
 }
 
 /**
- * @brief Get total purchased amount (lifetime)
- * @return uint32_t Total purchased in mL
+ * @brief Get total purchased volume (lifetime)
+ * @return uint32_t Total volume purchased in ml
  */
-uint32_t MIFARE_GetTotalPurchasedML(void)
+uint32_t MIFARE_GetTotalTokensPurchased(void)
 {
-    return g_transaction_manager.current_card.usage_data.total_purchased_ml;
+    MIFARE_UsageData_t *usage_data = MIFARE_GetUsageData();
+    return usage_data ? usage_data->total_volume_purchased_ml : 0;
 }
 
 /**
- * @brief Get total dispensed amount (lifetime)
- * @return uint32_t Total dispensed in mL
+ * @brief Get total dispenses completed (lifetime)
+ * @return uint32_t Total dispense sessions completed
  */
-uint32_t MIFARE_GetTotalDispensedML(void)
+uint32_t MIFARE_GetTotalWashesCompleted(void)
 {
-    return g_transaction_manager.current_card.usage_data.total_dispensed_ml;
+    MIFARE_UsageData_t *usage_data = MIFARE_GetUsageData();
+    return usage_data ? usage_data->total_dispenses_completed : 0;
 }
 
 /**
@@ -2496,8 +3469,8 @@ void MIFARE_LogTransaction(uint8_t type, uint16_t amount_ml, uint8_t dispenser_i
     
     // Update log
     uint8_t index = log->head_index;
-    log->records[index].timestamp = mifare_get_timestamp();
-    log->records[index].amount_ml = amount_ml;
+    log->records[index].timestamp = (uint32_t)xTaskGetTickCount();
+    log->records[index].volume_ml = amount_ml;
     log->records[index].transaction_type = type;
     log->records[index].dispenser_id = dispenser_id;
     
@@ -2510,12 +3483,37 @@ void MIFARE_LogTransaction(uint8_t type, uint16_t amount_ml, uint8_t dispenser_i
     log->log_crc = MIFARE_CALCULATE_CRC16((uint8_t*)log->records, 
                                           sizeof(MIFARE_TransactionRecord_t) * MIFARE_MAX_TRANSACTIONS);
     
-    MIFARE_LOG("Transaction logged: Type=%d, Amount=%u mL", type, amount_ml);
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Transaction logged: Type=%d, Amount=%u mL", type, amount_ml);
 }
 
 
 /*Card Polling Task ----------------------------------------------*/
 static TaskHandle_t mifare_polling_task_handle = NULL;
+
+/**
+ * @brief Get MIFARE polling task handle
+ * @return Task handle or NULL if not created
+ */
+TaskHandle_t task_get_handle_MIFARE_Polling_Task(void)
+{
+    return mifare_polling_task_handle;
+}
+
+/**
+ * @brief Execute pending USB command in MIFARE task context
+ * @details Called by MIFARE polling task when card is stable in CARD_DETECTED state
+ * @param pending Pointer to pending command state
+ */
+static void MIFARE_ExecutePendingUSBCommand(USB_PendingCommandState_t* pending)
+{
+    if (pending == NULL || !pending->active) {
+        return;
+    }
+    
+    // Execute the command via USB handler's execution function
+    // This ensures all MIFARE I/O happens in MIFARE task context
+    USB_Command_ExecutePendingCommand(pending);
+}
 
 /**
  * @brief MIFARE card polling task
@@ -2526,58 +3524,141 @@ static void MIFARE_Polling_Task(void* argument)
     (void)argument;
     
     TickType_t lastWake = xTaskGetTickCount();
-    const TickType_t periodTicks = pdMS_TO_TICKS(100);  // Poll every 100ms
+    const TickType_t periodTicks = pdMS_TO_TICKS(50);  // Poll every 50ms for faster card detection
     
-    MIFARE_LOG("MIFARE polling task started");
+    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: MIFARE polling task started\r\n");
     
     for (;;)
     {
         vTaskDelayUntil(&lastWake, periodTicks);
+        System_ReportTaskStatus(SYSTEM_TASK_ID_MIFARE_POLLING, true);
         
         // Get current states
         MIFARE_CardState_t current_card_state = MIFARE_GetCardState();
-        MIFARE_DispenseState_t current_dispense_state = MIFARE_GetDispenseState();
+        MIFARE_TransactionState_t current_dispense_state = MIFARE_GetTransactionState();
         
-        // Skip polling during active transaction (performance optimization)
-        if (g_transaction_manager.transaction_active) {
+        // Skip polling during active transaction OR active dispense
+        // This prevents I2C bus contention between polling and card writes
+        if (g_transaction_manager.transaction_active || MIFARE_Dispenser_IsDispenseActive()) {
             continue;
         }
         
         // Poll for card
         PN532_CardInfo_t card_info;
-        PN532_Status_t status = PN532_DetectCard(&card_info);
+        PN532_Status_t status = PN532_DetectCard(g_transaction_manager.pn532_handle, &card_info);
         
         if (status == PN532_STATUS_CARD_DETECTED) {
             // Card detected
             if (current_card_state == MIFARE_CARD_STATE_NEEDS_POLLING_CYCLE) {
-                USB_Log_Printf("[SYSTEM POLL] Card confirmed after polling cycle, setting to PRESENT\r\n");
                 MIFARE_ConfirmReadyAfterPolling();
-            } else if (current_card_state == MIFARE_CARD_STATE_PRESENT) {
-                USB_Log_Printf("[SYSTEM POLL] Card still PRESENT (idle polling)\r\n");
-            } else {
-                // New card detected
-                if (current_dispense_state == DISPENSE_STATE_ERROR) {
-                    USB_Log_Printf("SYSTEM: Card detected in error state, attempting recovery\r\n");
-                } else {
-                    USB_Log_Printf("SYSTEM: New card detected, notifying MIFARE manager\r\n");
+            } else if (current_card_state == MIFARE_CARD_STATE_PRESENT && 
+                       current_dispense_state == TRANSACTION_STATE_READY) {
+                // Card is ready - check if USB command is pending and execute it
+                USB_PendingCommandState_t* pending = USB_Command_GetPendingCommand();
+                if (pending != NULL && pending->active) {
+                    // USB command pending - execute it now that card is ready
+                    MIFARE_ExecutePendingUSBCommand(pending);
                 }
+                // No logging for normal ready state to avoid spam
+            } else if (current_dispense_state == TRANSACTION_STATE_ERROR) {
+#if MIFARE_ERROR_STATE_AUTO_RECOVERY_EN
+                // Card present but in ERROR state - attempt recovery
+                LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card present in ERROR state - attempting recovery\r\n");
+                // Reset card state to allow re-initialization
+                MIFARE_SetCardState(MIFARE_CARD_STATE_ABSENT);
+                mifare_transition_state(TRANSACTION_STATE_IDLE);
+                // Re-process as new card
                 MIFARE_ProcessCardDetected(&card_info);
+#else
+                // Check if USB command is pending (manual cardinit/recover)
+                USB_PendingCommandState_t* pending = USB_Command_GetPendingCommand();
+                if (pending != NULL && pending->active) {
+                    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: USB command pending in ERROR state - clearing ERROR to allow command\r\n");
+                    MIFARE_SetCardState(MIFARE_CARD_STATE_ABSENT);
+                    mifare_transition_state(TRANSACTION_STATE_IDLE);
+                    // Re-process as new card so the pending command check in DetectAndAutoInitializeCard can catch it
+                    MIFARE_ProcessCardDetected(&card_info);
+                } else {
+                    // ERROR state recovery disabled - stay in ERROR until card removed or manual command (log once)
+                    static bool error_state_logged = false;
+                    if (!error_state_logged) {
+                        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card present in ERROR state - staying in ERROR (recovery disabled)\r\n");
+                        error_state_logged = true;
+                    }
+                }
+#endif
+            } else if (current_card_state == MIFARE_CARD_STATE_ABSENT) {
+                // Truly new card detected
+                LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: New card detected\r\n");
+                MIFARE_ProcessCardDetected(&card_info);
+            } else if (current_dispense_state == TRANSACTION_STATE_CARD_DETECTED) {
+                // Card in CARD_DETECTED state - check if cardinit pending
+                USB_PendingCommandState_t* pending = USB_Command_GetPendingCommand();
+                if (pending != NULL && pending->active && pending->command == USB_PENDING_CMD_CARD_INIT) {
+                    // cardinit pending - execute it now (card doesn't need to be READY)
+                    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Executing cardinit in CARD_DETECTED state\r\n");
+                    MIFARE_ExecutePendingUSBCommand(pending);
+                } else {
+                    // Not cardinit - shouldn't be in this state, try re-processing
+                    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card in CARD_DETECTED but no cardinit - re-processing\r\n");
+                    MIFARE_ProcessCardDetected(&card_info);
+                }
+            } else if (current_dispense_state == TRANSACTION_STATE_WAITING_FOR_REMOVAL ||
+                       current_dispense_state == TRANSACTION_STATE_INITIALIZED ||
+                       current_dispense_state == TRANSACTION_STATE_READY_AFTER_TOPUP ||
+                       current_dispense_state == TRANSACTION_STATE_ERROR_NO_FLOW ||
+                       current_dispense_state == TRANSACTION_STATE_ERROR_CARD_CORRUPTED ||
+                       current_dispense_state == TRANSACTION_STATE_ERROR_MODULE_FAILURE ||
+                       current_dispense_state == TRANSACTION_STATE_ERROR_VALIDATION_FAILED ||
+                       current_dispense_state == TRANSACTION_STATE_ERROR_WRITE_FAILED) {
+                // Card still present after USB command or error - do nothing, wait for removal
+                // (no logging to avoid spam)
+            } else {
+                // Unexpected state combination - log and skip to avoid loop
+                static uint32_t state_spam_counter = 0;
+                if (++state_spam_counter % 100 == 1) {  // Log every 100th time to avoid spam
+                    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card detected but state mismatch (card=%d, txn=%d) - skipping\r\n",
+                               current_card_state, current_dispense_state);
+                }
             }
         } else {
             // No card detected
-            if (current_card_state == MIFARE_CARD_STATE_PRESENT) {
-                USB_Log_Printf("[SYSTEM POLL] Card REMOVED (detected by polling)\r\n");
-                MIFARE_ProcessCardRemoved();
+            if (current_dispense_state == TRANSACTION_STATE_WAITING_FOR_REMOVAL ||
+                current_dispense_state == TRANSACTION_STATE_INITIALIZED ||
+                current_dispense_state == TRANSACTION_STATE_READY_AFTER_TOPUP ||
+                current_dispense_state == TRANSACTION_STATE_ERROR_NO_FLOW ||
+                current_dispense_state == TRANSACTION_STATE_ERROR_CARD_CORRUPTED ||
+                current_dispense_state == TRANSACTION_STATE_ERROR_MODULE_FAILURE ||
+                current_dispense_state == TRANSACTION_STATE_ERROR_VALIDATION_FAILED ||
+                current_dispense_state == TRANSACTION_STATE_ERROR_WRITE_FAILED) {
+                // USB command completed or error cleared, waiting for physical removal - transition to IDLE
+                LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card removed after USB command/error - transitioning to IDLE\r\n");
+                MIFARE_ForceCardRemoval();  // Clean up state
+            } else if (current_card_state == MIFARE_CARD_STATE_PRESENT) {
+                // Only log on first detection to avoid spam during stability timeout
+                static bool removal_logged = false;
+                if (!removal_logged) {
+                    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Poll - no card detected, starting removal process\r\n");
+                    removal_logged = true;
+                }
+                
+                MIFARE_Result_t removal_result = MIFARE_ProcessCardRemoved();
+                
+                // If removal completed (stability timeout passed), reset log flag
+                if (removal_result == MIFARE_RESULT_OK && MIFARE_GetCardState() != MIFARE_CARD_STATE_PRESENT) {
+                    removal_logged = false;
+                }
             } else if (current_card_state == MIFARE_CARD_STATE_NEEDS_POLLING_CYCLE) {
-                USB_Log_Printf("MIFARE POLL: Card in NEEDS_POLLING_CYCLE but not detected - resetting to ABSENT\r\n");
                 MIFARE_SetCardState(MIFARE_CARD_STATE_ABSENT);
-            } else if (current_card_state == MIFARE_CARD_STATE_ERROR && status != PN532_STATUS_CARD_DETECTED) {
+            } else if ((current_card_state == MIFARE_CARD_STATE_ERROR || current_dispense_state == TRANSACTION_STATE_ERROR) 
+                       && status != PN532_STATUS_CARD_DETECTED) {
                 // Error state but no card - reset after delay
                 static uint32_t error_no_card_counter = 0;
                 error_no_card_counter++;
                 if (error_no_card_counter >= 10) {
-                    USB_Log_Printf("MIFARE POLL: No card in error state, resetting to ABSENT\r\n");
+                    LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Card removed from ERROR state - clearing to IDLE\r\n");
                     MIFARE_SetCardState(MIFARE_CARD_STATE_ABSENT);
+                    mifare_transition_state(TRANSACTION_STATE_IDLE);
                     error_no_card_counter = 0;
                 }
             }
@@ -2598,14 +3679,26 @@ void MIFARE_StartPollingTask(void)
         "MIFARE_Poll",
         2048,  // Stack size in words
         NULL,
-        (tskIDLE_PRIORITY + 2),  // Same priority as System and Dispenser
+        MIFARE_POLLING_TASK_PRIORITY,  // Highest app priority - card writes must complete quickly
         &mifare_polling_task_handle
     );
     
     if (result == pdPASS) {
-        MIFARE_LOG("MIFARE polling task created successfully");
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: MIFARE polling task created successfully\r\n");
     } else {
-        MIFARE_LOG("ERROR: Failed to create MIFARE polling task");
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: ERROR: Failed to create MIFARE polling task\r\n");
+    }
+}
+
+/**
+ * @brief Stop the MIFARE card polling task
+ */
+void MIFARE_StopPollingTask(void)
+{
+    if (mifare_polling_task_handle != NULL) {
+        vTaskDelete(mifare_polling_task_handle);
+        mifare_polling_task_handle = NULL;
+        LOG_DEBUG_MIFARE_TRANSACTION_MANAGER("MIFARE: Polling task stopped\r\n");
     }
 }
 

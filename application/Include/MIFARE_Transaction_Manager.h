@@ -18,72 +18,68 @@
 #include "task.h"
 #include "semphr.h"
 #include "PN532_Driver.h"
+#include "MIFARE_Security.h"
 #include <stdint.h>
 #include <stdbool.h>
 
 /*Defines ------------------------------------------------------------*/
-#define MIFARE_MAGIC_BYTES              0x6D575441UL    // "mWTA" in little endian
-#define MIFARE_FORMAT_VERSION           0x01
+#define MIFARE_MAGIC_BYTES              0x6D575441UL    // "mWTA" in little endian (keep same magic bytes)
+#define MIFARE_FORMAT_VERSION           0x02            // Version 2 for water dispenser system
 #define MIFARE_MAX_TRANSACTIONS         3               // Store last 3 transactions (Fits in 2 blocks: 9 & 10)
 #define MIFARE_CARD_TIMEOUT_MS          2000           // Card must respond within 2s
 #define MIFARE_MAX_RETRIES              3              // Maximum retry attempts
 #define MIFARE_CARD_REMOVAL_FAIL_COUNT  3              // Consecutive failures to infer card removal
-#define MIFARE_FAST_BALANCE_UPDATE_MS   500             // Fast balance cache update interval (500ms) - reduced I2C load
-#define MIFARE_MAIN_DATA_UPDATE_MS      2000            // Main user data update interval (2000ms) - reduced I2C load
-#define MIFARE_STABILITY_TIMEOUT_MS     50              // Card must be stable for 50ms before confirmed present
-#define MIFARE_REMOVAL_STABILITY_MS     1000            // Card must be absent for 1000ms before confirmed removed (prevents false removals)
+#define MIFARE_FAST_BALANCE_UPDATE_MS   100             // Fast balance cache update interval (100ms) - reduced I2C load
+#define MIFARE_MAIN_DATA_UPDATE_MS      500             // Main user data update interval (500ms) - reduced I2C load
+#define MIFARE_STABILITY_TIMEOUT_MS     0               // No stability delay - authenticate immediately for fastest response
+#define MIFARE_REMOVAL_STABILITY_MS     150             // Card must be absent for 150ms before confirmed removed (fast response)
 
-/* MIFARE Classic 1K Block Layout 
+/* MIFARE Classic 1K Block Layout - OPTIMIZED FOR SPEED
  * WARNING: Blocks 3, 7, 11, 15, 19, 23, 27, 31, etc. are SECTOR TRAILERS
  *          containing authentication keys and MUST NOT be written to!
  * 
- * Sector 1 (blocks 4-7):
- *   Block 4: Header
- *   Block 5: User Primary
- *   Block 6: User Backup  
- *   Block 7: SECTOR TRAILER (do not use)
+ * DESIGN: All frequent writes stay in one sector to avoid sector switching (~300ms penalty)
+ *         HMAC (last 4 bytes of user data) provides integrity - no separate CRC needed
+ *         Using HIGH sectors (15, 14, 13) to avoid corruption from previous testing
  * 
- * Sector 2 (blocks 8-11):
- *   Block 8: Usage Data
- *   Block 9: Transaction Log (start)
- *   Block 10: Transaction Log
- *   Block 11: SECTOR TRAILER (do not use)
+ * Sector 15 (blocks 60-63) - FREQUENT ACCESS:
+ *   Block 60: Header (read once at init)
+ *   Block 61: User Primary (balance_ml + HMAC) - written during dispense based on flow
+ *   Block 62: User Backup (identical copy) - written during dispense based on flow
+ *   Block 63: SECTOR TRAILER (do not use)
  * 
- * Sector 3 (blocks 12-15):
- *   Block 12: Recovery Info
- *   Block 13: Fast Balance Primary
- *   Block 14: Fast Balance Backup
- *   Block 15: SECTOR TRAILER (do not use)
+ * Sector 14 (blocks 56-59) - STATISTICS (end of session):
+ *   Block 56: Usage Data (lifetime statistics)
+ *   Block 57: Transaction Log (start)
+ *   Block 58: Transaction Log
+ *   Block 59: SECTOR TRAILER (do not use)
  * 
- * Sector 4 (blocks 16-19):
- *   Block 16: Account Data (phone number, validity)
- *   Block 17: Reserved
- *   Block 18: Reserved
- *   Block 19: SECTOR TRAILER (do not use)
+ * Sector 13 (blocks 52-55) - ACCOUNT DATA (read once):
+ *   Block 52: Account Data (phone number, validity)
+ *   Block 53-54: Reserved
+ *   Block 55: SECTOR TRAILER (do not use)
  */
-#define MIFARE_BLOCK_HEADER             4              // Card header and system info
-#define MIFARE_BLOCK_USER_PRIMARY       5              // Primary user data: balance, status, state (updated every 500ms)
-#define MIFARE_BLOCK_USER_BACKUP        6              // Backup user data
-#define MIFARE_BLOCK_USAGE_DATA         8              // Usage statistics: lifetime totals (MOVED from 7 to avoid sector trailer)
-#define MIFARE_BLOCK_TRANSACTION_LOG    9              // Transaction log start (MOVED from 8)
-#define MIFARE_BLOCK_RECOVERY_INFO      12             // Recovery and integrity data
-#define MIFARE_BLOCK_FAST_BALANCE_PRIMARY   13         // Fast balance cache (updated every 250ms during dispense)
-#define MIFARE_BLOCK_FAST_BALANCE_BACKUP    14         // Fast balance cache backup
-#define MIFARE_BLOCK_ACCOUNT_DATA       16             // Account data: phone number, card validity
+#define MIFARE_BLOCK_HEADER             60             // Card header and system info (Sector 15)
+#define MIFARE_BLOCK_USER_PRIMARY       61             // Primary user data: balance_ml, status, HMAC (Sector 15)
+#define MIFARE_BLOCK_USER_BACKUP        62             // Backup user data (SAME SECTOR - no switch!) (Sector 15)
+#define MIFARE_BLOCK_USAGE_DATA         56             // Usage statistics: lifetime counts (Sector 14)
+#define MIFARE_BLOCK_TRANSACTION_LOG    57             // Transaction log start (Sector 14)
+#define MIFARE_BLOCK_ACCOUNT_DATA       52             // Account data: phone number, validity (Sector 13)
 
-/* Transaction States */
-#define TRANSACTION_STATE_IDLE          0x00
-#define TRANSACTION_STATE_STARTED       0x01
-#define TRANSACTION_STATE_IN_PROGRESS   0x02
-#define TRANSACTION_STATE_COMMIT_READY  0x03
-#define TRANSACTION_STATE_COMMITTED     0x04
-#define TRANSACTION_STATE_ROLLBACK      0xFF
+/* Transaction States (stored on card in user_primary.transaction_state) */
+#define CARD_TRANSACTION_IDLE          0x00
+#define CARD_TRANSACTION_STARTED       0x01
+#define CARD_TRANSACTION_DISPENSING    0x02
+#define CARD_TRANSACTION_COMMIT_READY  0x03
+#define CARD_TRANSACTION_COMMITTED     0x04
+#define CARD_TRANSACTION_ROLLBACK      0xFF
 
 /* Card Status Flags */
 #define CARD_STATUS_ACTIVE              0x01
 #define CARD_STATUS_SUSPENDED           0x02
 #define CARD_STATUS_MAINTENANCE         0x04
 #define CARD_STATUS_LOW_BALANCE         0x08
+#define CARD_STATUS_PENDING_TRANSACTION 0x10  // Volume deduction in progress - used for crash recovery
 #define CARD_STATUS_CORRUPTED           0x80
 
 /*Typedefs -----------------------------------------------------------*/
@@ -112,30 +108,33 @@ typedef struct __attribute__((packed)) {
 
 /**
  * @brief User account data - Current balance and card state
- * Note: Size must be <= 16 bytes to fit in a single MIFARE Classic block
- * Stored in Block 5 (primary) and Block 6 (backup)
- * Updated: Supports 1000L capacity with uint32_t balance_ml
+ * Note: Size must be exactly 16 bytes to fit in a single MIFARE Classic block
+ * Stored in Block 5 (primary) and Block 6 (backup) - BOTH IN SECTOR 1!
+ * Car Wash System: balance_ml = milliliters of water remaining
+ * 
+ * INTEGRITY: First 12 bytes are data, last 4 bytes become HMAC after encryption.
+ *            HMAC validates data integrity - no separate CRC block needed!
  */
 typedef struct __attribute__((packed)) {
-    uint32_t balance_ml;           // Current balance in milliliters (max ~4 billion mL = 4 million L)
-    uint16_t last_topup_amount_ml; // Last topup amount (max 65,535 mL = 65.5L per topup)
-    uint16_t transaction_counter;  // Incremented on each transaction
-    uint8_t status_flags;          // Card status bits
-    uint8_t transaction_state;     // Current transaction state
-    uint8_t reserved[6];           // Reserved for future use
-    // Total size: 4+2+2+1+1+6 = 16 bytes (perfect fit!)
+    uint32_t balance_ml;           // Current water balance in milliliters (bytes 0-3)
+    uint32_t last_topup_ml;        // Last topup amount in milliliters (bytes 4-7)
+    uint16_t transaction_counter;  // Incremented on each transaction (bytes 8-9)
+    uint8_t status_flags;          // Card status bits (byte 10)
+    uint8_t transaction_state;     // Current transaction state (byte 11)
+    uint8_t hmac[4];               // HMAC-SHA256 truncated (bytes 12-15) - set by encryption
+    // Total size: 4+4+2+1+1+4 = 16 bytes (perfect fit!)
 } MIFARE_UserData_t;
 
 /**
- * @brief Usage statistics - Lifetime totals and counters
+ * @brief Usage statistics - Lifetime wash totals and counters
  * Note: Size must be <= 16 bytes to fit in a single MIFARE Classic block
- * Stored in Block 7 (usage tracking)
+ * Stored in Block 8 (usage tracking)
  */
 typedef struct __attribute__((packed)) {
-    uint32_t total_purchased_ml;   // Total water purchased (lifetime, max ~4 billion mL)
-    uint32_t total_dispensed_ml;   // Total water dispensed (lifetime, max ~4 billion mL)
-    uint32_t reserved1;            // Reserved for future statistics
-    uint32_t reserved2;            // Reserved for future statistics
+    uint32_t total_volume_purchased_ml; // Total volume purchased (lifetime in ml)
+    uint32_t total_dispenses_completed; // Total dispense sessions completed (lifetime)
+    uint32_t total_volume_dispensed_ml; // Total volume dispensed (lifetime in ml)
+    uint32_t reserved;                  // Reserved for future statistics
     // Total size: 4+4+4+4 = 16 bytes (perfect fit!)
 } MIFARE_UsageData_t;
 
@@ -144,9 +143,9 @@ typedef struct __attribute__((packed)) {
  */
 typedef struct __attribute__((packed)) {
     uint32_t timestamp;            // Unix timestamp
-    uint16_t amount_ml;           // Amount in milliliters
-    uint8_t transaction_type;     // 1=Purchase, 2=Dispense, 3=Refund
-    uint8_t dispenser_id;         // Which dispenser was used
+    uint16_t volume_ml;            // Volume dispensed in ml (max 65535 ml = 65.5 liters)
+    uint8_t transaction_type;      // 1=Topup, 2=Dispense Started, 3=Dispense Completed, 4=Refund
+    uint8_t dispenser_id;          // Which dispenser unit was used
 } MIFARE_TransactionRecord_t;
 
 /**
@@ -172,18 +171,17 @@ typedef struct __attribute__((packed)) {
 } MIFARE_RecoveryInfo_t;
 
 /**
- * @brief Fast balance cache - Updated every 250ms during dispensing
- * Reduces write traffic to large user data blocks (which are updated every 500ms)
+ * @brief Balance cache - Quick access to current balance
  * Size: 16 bytes (fits in one MIFARE Classic block)
  */
 typedef struct __attribute__((packed)) {
-    uint32_t balance_ml;           // Current balance (4 bytes) - supports up to ~4 billion mL = 4 million L
+    uint32_t balance_ml;           // Current balance in milliliters (4 bytes)
     uint16_t sequence_number;      // Incremental counter (2 bytes) - used to detect newer data
     uint16_t reserved1;            // Reserved for alignment (2 bytes)
     uint32_t timestamp;            // Last update time in ms (4 bytes)
     uint32_t crc32;                // CRC32 for integrity check (4 bytes)
     // Total: 16 bytes (full MIFARE block)
-} MIFARE_FastBalance_t;
+} MIFARE_TokenCache_t;
 
 /**
  * @brief Card validity status enumeration
@@ -222,56 +220,57 @@ typedef struct __attribute__((packed)) {
  */
 typedef struct {
     MIFARE_CardHeader_t header;
-    MIFARE_UserData_t user_primary;        // Block 5: Current balance, status, state
+    MIFARE_UserData_t user_primary;        // Block 5: Current token count, status, state
     MIFARE_UserData_t user_backup;         // Block 6: Backup of user data
-    MIFARE_UsageData_t usage_data;         // Block 8: Lifetime usage statistics
+    MIFARE_UsageData_t usage_data;         // Block 8: Lifetime wash statistics
     MIFARE_TransactionLog_t transaction_log;
     MIFARE_RecoveryInfo_t recovery_info;
-    MIFARE_FastBalance_t fast_balance_primary;
-    MIFARE_FastBalance_t fast_balance_backup;
+    MIFARE_TokenCache_t token_cache_primary;
+    MIFARE_TokenCache_t token_cache_backup;
     MIFARE_AccountData_t account_data;     // Block 16: Account info (phone, validity)
     bool data_valid;
     uint32_t last_read_time;
 } MIFARE_CardData_t;
 
 /**
- * @brief Dispensing session state
+ * @brief Generic transaction/card I/O state (application agnostic)
  */
 typedef enum {
-    DISPENSE_STATE_IDLE,
-    DISPENSE_STATE_CARD_DETECTED,
-    DISPENSE_STATE_AUTHENTICATING,
-    DISPENSE_STATE_READING_DATA,
-    DISPENSE_STATE_VALIDATING,
-    DISPENSE_STATE_READY_TO_DISPENSE,
-    DISPENSE_STATE_DISPENSING,
-    DISPENSE_STATE_UPDATING_CARD,
-    DISPENSE_STATE_FINALIZING,
-    DISPENSE_STATE_ERROR,
-    DISPENSE_STATE_CARD_REMOVED,
-    DISPENSE_STATE_CARD_REMOVED_DURING_DISPENSING
-} MIFARE_DispenseState_t;
+    TRANSACTION_STATE_IDLE,
+    TRANSACTION_STATE_CARD_DETECTED,
+    TRANSACTION_STATE_AUTHENTICATING,
+    TRANSACTION_STATE_READING_DATA,
+    TRANSACTION_STATE_VALIDATING,
+    TRANSACTION_STATE_READY,                    // Normal ready - auto-dispense allowed
+    TRANSACTION_STATE_READY_AFTER_TOPUP,       // After USB topup - show balance, trigger 8-beep pattern, no auto-dispense
+    TRANSACTION_STATE_INITIALIZED,             // After cardinit - show balance, trigger 8-beep pattern, no auto-dispense
+    TRANSACTION_STATE_WRITING_DATA,
+    TRANSACTION_STATE_FINALIZING,
+    TRANSACTION_STATE_ERROR,
+    TRANSACTION_STATE_ERROR_NO_FLOW,           // Dispense error: no flow detected
+    TRANSACTION_STATE_ERROR_CARD_CORRUPTED,    // Card corrupted/blank - needs init
+    TRANSACTION_STATE_ERROR_MODULE_FAILURE,    // Hardware module failure (PN532, etc)
+    TRANSACTION_STATE_ERROR_VALIDATION_FAILED, // Card validation failed
+    TRANSACTION_STATE_ERROR_WRITE_FAILED,      // Transaction write failed
+    TRANSACTION_STATE_CARD_REMOVED,
+    TRANSACTION_STATE_WAITING_FOR_REMOVAL      // Legacy/generic removal state (avoid using)
+} MIFARE_TransactionState_t;
 
 /**
  * @brief Transaction manager handle
  */
 typedef struct {
     MIFARE_CardData_t current_card;
-    MIFARE_DispenseState_t dispense_state;
+    MIFARE_TransactionState_t transaction_state;
     MIFARE_CardState_t card_state;
     PN532_CardInfo_t card_info;
-    // PN532_Handle_t *pn532_handle; // Removed: Driver now manages handle internally
+    PN532_Handle_t *pn532_handle;  // PN532 driver handle
     SemaphoreHandle_t transaction_mutex;
-    uint32_t dispense_start_time;
-    uint32_t total_dispensed_this_session;
     uint32_t last_card_update_time;
-    uint32_t last_fast_balance_update_time;  // Track fast balance cache updates (20ms interval)
     bool transaction_active;
     uint8_t consecutive_errors;
     MIFARE_UserData_t last_written_user_data;
-    MIFARE_RecoveryInfo_t last_written_recovery_info;
     bool has_last_written_snapshot;
-    volatile bool card_removal_abort;  // Flag to immediately abort all operations when card removed mid-operation
     TickType_t pn532_recovery_until_tick;  // Tick count until PN532 is considered recovered after failed write
     
     // Stability layer - shield user from transient RF failures
@@ -281,7 +280,6 @@ typedef struct {
     TickType_t card_confirmed_present_tick;    // When card presence was confirmed (stable for 1s)
     TickType_t card_first_lost_tick;           // When card first failed to read (not yet confirmed removed)
     bool card_presence_confirmed;              // True if card has been stable for 1s
-    bool ui_state_card_present;                // What we've told the UI (only changes after confirmation)
     
     // Write failure tracking - only treat as card removal if writes fail continuously for >500ms
     TickType_t write_failure_first_tick;       // When write failures started (0 = no active failure period)
@@ -289,6 +287,9 @@ typedef struct {
     
     // Alternating write pattern - reduces I2C traffic and wear by 40%
     uint8_t write_cycle_counter;               // Alternates between 0 (write primary) and 1 (write backup)
+    
+    // Security context - encryption/authentication
+    MIFARE_SecurityContext_t security_context;  // Per-card security context
 } MIFARE_TransactionManager_t;
 
 /**
@@ -312,83 +313,93 @@ typedef enum {
 
 /*Macros -------------------------------------------------------------*/
 #define MIFARE_CRC16_POLY               0x1021
-#define MIFARE_CALCULATE_CRC16(data, len) mifare_calculate_crc16((uint8_t*)(data), len)
-
-/*Extern Variables ---------------------------------------------------*/
-extern MIFARE_TransactionManager_t g_transaction_manager;
+#define MIFARE_CALCULATE_CRC16(data, len) MIFARE_Classic_CalculateCRC16((const uint8_t*)(data), len)
 
 /*Function Prototypes ------------------------------------------------*/
 
 /* Core Transaction Manager Functions */
 MIFARE_Result_t MIFARE_TransactionManager_Init(void);
-MIFARE_Result_t MIFARE_TransactionManager_DeInit(void);
 MIFARE_Result_t MIFARE_ProcessCardDetected(PN532_CardInfo_t *card_info);
 MIFARE_Result_t MIFARE_ProcessCardRemoved(void);
+MIFARE_Result_t MIFARE_ForceCardRemoval(void);  /* Force immediate removal (skip stability check) */
 void MIFARE_NotifyPN532Reset(void);  /* Called after PN532 reset to set recovery cooldown */
 
 /* Card Data Operations */
 MIFARE_Result_t MIFARE_ReadCardData(MIFARE_CardData_t *card_data);
 MIFARE_Result_t MIFARE_WriteCardData(MIFARE_CardData_t *card_data);
+MIFARE_Result_t MIFARE_WriteCardDataFast(MIFARE_CardData_t *card_data);  /* Primary only, skip backup (faster) */
 MIFARE_Result_t MIFARE_ValidateCardData(MIFARE_CardData_t *card_data);
 MIFARE_Result_t MIFARE_RecoverCardData(MIFARE_CardData_t *card_data);
 
+/* Low-Level Block Operations (for decryptcard and advanced operations) */
+MIFARE_Result_t MIFARE_ReadBlock(uint8_t block_number, uint8_t *data);   /* Read single block (16 bytes) with decryption */
+MIFARE_Result_t MIFARE_WriteBlock(uint8_t block_number, const uint8_t *data, bool allow_trailer);  /* Write single block (16 bytes) */
+
 /* Card Initialization */
-MIFARE_Result_t MIFARE_InitializeNewCustomerCard(uint32_t initial_balance_ml, uint64_t customer_id);
+MIFARE_Result_t MIFARE_InitializeNewCustomerCard(uint32_t initial_balance_ml, uint64_t customer_id, bool force_factory_keys);
 MIFARE_Result_t MIFARE_DetectAndAutoInitializeCard(const PN532_CardInfo_t *card_info, uint32_t default_balance_ml);
 
-/* Balance Management */
-MIFARE_Result_t MIFARE_TopupCardBalance(uint32_t topup_amount_ml);
+/* Balance Management (milliliters of water) */
+MIFARE_Result_t MIFARE_TopupCardBalance(uint32_t topup_ml);
 
-/* Atomic Transaction Operations */
-MIFARE_Result_t MIFARE_BeginTransaction(uint32_t amount_ml);
-MIFARE_Result_t MIFARE_UpdateTransactionProgress(uint32_t dispensed_ml, float flow_rate_lpm);
+/* Atomic Transaction Operations - Generic card write operations */
+MIFARE_Result_t MIFARE_BeginTransaction(void);      // Start atomic transaction
+MIFARE_Result_t MIFARE_UpdateCardData(bool fast);   // Write current card data (fast=true skips backup)
 MIFARE_Result_t MIFARE_CommitTransaction(void);
 MIFARE_Result_t MIFARE_RollbackTransaction(void);
 void mifare_recover_and_reinit_pn532(void);
 
-/* Dispensing State Management */
-MIFARE_Result_t MIFARE_StartDispensing(uint16_t requested_amount_ml);
-MIFARE_Result_t MIFARE_UpdateDispensing(uint16_t dispensed_ml);
-MIFARE_Result_t MIFARE_StopDispensing(void);
-MIFARE_DispenseState_t MIFARE_GetDispenseState(void);
+/* Transaction State Management */
+MIFARE_TransactionState_t MIFARE_GetTransactionState(void);
+void MIFARE_SetTransactionState(MIFARE_TransactionState_t new_state);
+
+/* State Transition Helpers - Use these instead of direct SetTransactionState */
+void MIFARE_SetErrorState_CardCorrupted(void);     // Card blank/corrupted, needs cardinit
+void MIFARE_SetErrorState_ModuleFailure(void);     // Hardware module failure (PN532, etc)
+void MIFARE_SetErrorState_ValidationFailed(void);  // Card validation failed
+void MIFARE_SetErrorState_WriteFailed(void);       // Transaction write failed
+
+uint32_t MIFARE_GetBalanceMl(void);  // Get current card balance in milliliters
+uint32_t MIFARE_GetLastTopupMl(void);  // Get last topup amount in milliliters
 bool MIFARE_IsCardPresent(void);            /* STATE-BASED CHECK ONLY - use MIFARE_VerifyCardPresence() for hardware check */
 bool MIFARE_IsCardPresenceConfirmed(void);  /* Returns true only if card stable for 1s */
+bool MIFARE_IsWriteInProgress(void);        /* Returns true if write operation in progress (for polling skip) */
 void MIFARE_UpdateStabilityCheck(void);      // Update stability timer (call periodically)
 MIFARE_CardState_t MIFARE_GetCardState(void);
 void MIFARE_SetCardState(MIFARE_CardState_t new_state);
 void MIFARE_ConfirmReadyAfterPolling(void);
+MIFARE_Result_t MIFARE_UpdateTransactionProgress(uint32_t additional_ml, float flow_rate_lpm);  // Update ongoing transaction
 
 
 /* Card Monitoring and Safety */
 MIFARE_Result_t MIFARE_VerifyCardPresence(void);  /* UNIFIED FUNCTION - Use this for ALL card presence checks */
-MIFARE_Result_t MIFARE_HandleCardRemovalDuringDispense(void);
 
 /* Data Integrity Functions */
 uint16_t mifare_calculate_crc16(uint8_t *data, uint16_t length);
-bool mifare_verify_data_integrity(MIFARE_CardData_t *card_data);
-MIFARE_Result_t mifare_create_backup(MIFARE_CardData_t *card_data);
-MIFARE_Result_t mifare_restore_from_backup(MIFARE_CardData_t *card_data);
 
 /* Utility Functions */
 const char* MIFARE_GetResultString(MIFARE_Result_t result);
-const char* MIFARE_GetStateString(MIFARE_DispenseState_t state);
+const char* MIFARE_GetTransactionStateString(MIFARE_TransactionState_t state);
+const char* MIFARE_GetCardStateString(MIFARE_CardState_t state);
 
-/* UI Getter Functions - UI polls these instead of receiving events */
-uint32_t MIFARE_GetBalanceML(void);
-uint32_t MIFARE_GetLastTopupAmountML(void);
-uint32_t MIFARE_GetTotalDispensedThisSession(void);
-bool MIFARE_GetCardStatus(void);             /* Returns true if card is present and ready */
-uint8_t MIFARE_GetCardStatusFlags(void);     /* Returns card status flags byte */
-uint32_t MIFARE_GetTotalPurchasedML(void);   /* Lifetime purchased amount */
-uint32_t MIFARE_GetTotalDispensedML(void);   /* Lifetime dispensed amount */
+/* Card Data Getter Functions - Simple accessors, no business logic */
+MIFARE_UserData_t* MIFARE_GetUserData(void);           /* Get pointer to user data (balance_ml, etc) */
+MIFARE_UsageData_t* MIFARE_GetUsageData(void);         /* Get pointer to usage data */
+MIFARE_AccountData_t* MIFARE_GetAccountData(void);     /* Get pointer to account data */
+bool MIFARE_IsCardReady(void);                         /* Returns true if card is present and ready */
+uint8_t MIFARE_GetCardStatusFlags(void);               /* Returns card status flags byte */
 bool MIFARE_GetCustomerPhoneNumber(char *phone_buffer, size_t buffer_size);  /* Get phone number from card */
+bool MIFARE_GetCurrentCardInfo(PN532_CardInfo_t *info); /* Get current card info (UID, type, etc) */
+
+/* Card Data Setter Functions - Business logic layer uses these to update card data */
+void MIFARE_SetUserData(const MIFARE_UserData_t *user_data);
+void MIFARE_SetUsageData(const MIFARE_UsageData_t *usage_data);
 
 /* Debug and Logging Functions */
-void MIFARE_PrintCardData(MIFARE_CardData_t *card_data);
-void MIFARE_PrintTransactionLog(MIFARE_TransactionLog_t *log);
-void MIFARE_LogTransaction(uint8_t type, uint16_t amount_ml, uint8_t dispenser_id);
+void MIFARE_LogTransaction(uint8_t type, uint16_t wash_duration_min, uint8_t wash_bay_id);
 
 /* Card Polling Task */
 void MIFARE_StartPollingTask(void);
+void MIFARE_StopPollingTask(void);
 
 #endif /* APPLICATION_INCLUDE_MIFARE_TRANSACTION_MANAGER_H_ */

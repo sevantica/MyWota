@@ -44,20 +44,23 @@ target_include_directories(freertos_config INTERFACE
 )
 
 # Set the path to lv_conf.h for LVGL (must be set BEFORE adding LVGL)
-set(LV_CONF_PATH ${CMAKE_CURRENT_SOURCE_DIR}/../application/User_Interface/miWota/lv_conf.h)
+set(LV_CONF_PATH ${CMAKE_CURRENT_SOURCE_DIR}/../application/User_Interface/MyWota/lv_conf.h)
 
 # Disable building LVGL examples and demos to save memory and build time
 set(LV_CONF_BUILD_DISABLE_EXAMPLES 1)
 set(LV_CONF_BUILD_DISABLE_DEMOS 1)
 
 # Add the application LVGL library BEFORE drivers (drivers needs to link against it)
-add_subdirectory(../application/User_Interface/miWota/lvgl ${CMAKE_CURRENT_BINARY_DIR}/app_lvgl)
+add_subdirectory(../application/User_Interface/MyWota/lvgl ${CMAKE_CURRENT_BINARY_DIR}/app_lvgl)
 
 # Set additional include directories for drivers library (needed for Hardware_Access.h, lv_conf.h, etc.)
 set(PARENT_INCLUDE_DIRS 
     ${CMAKE_CURRENT_SOURCE_DIR}/../application/Include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../application/User_Interface/miWota
+    ${CMAKE_CURRENT_SOURCE_DIR}/../application/User_Interface/MyWota
 )
+
+# Set path to tusb_config.h for drivers library
+set(TUSB_CONFIG_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
 # Add the custom drivers library (includes FreeRTOS via FetchContent)
 add_subdirectory(../../../Common/sevantica_drivers ${CMAKE_CURRENT_BINARY_DIR}/drivers)
@@ -105,46 +108,57 @@ endif()
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/freertos_config
-    ../application/User_Interface/miWota  # Add this for lv_conf.h
-    ../application/User_Interface/miWota/lvgl/src
-    ../application/User_Interface/miWota/lvgl/src/drivers
+    ../application/User_Interface/MyWota  # Add this for lv_conf.h
+    ../application/User_Interface/MyWota/lvgl/src
+    ../application/User_Interface/MyWota/lvgl/src/drivers
     ../application/Include
     ../../../Common/sevantica_drivers/Include
-    ../application/User_Interface/miWota/ui
-    ../application/User_Interface/miWota/ui/screens
-    ../application/User_Interface/miWota/ui/images
-    ../application/User_Interface/miWota/ui/components
+    ../application/User_Interface/MyWota/ui
+    ../application/User_Interface/MyWota/ui/screens
+    ../application/User_Interface/MyWota/ui/images
+    ../application/User_Interface/MyWota/ui/components
 
     ${CMAKE_CURRENT_SOURCE_DIR}/screens
 )
 
 # Add UI library after LVGL
-add_subdirectory(../application/User_Interface/miWota/ui ${CMAKE_CURRENT_BINARY_DIR}/app_ui)
+add_subdirectory(../application/User_Interface/MyWota/ui ${CMAKE_CURRENT_BINARY_DIR}/app_ui)
 
-# Collect source files carefully to avoid duplicates
-file(GLOB MAIN_SOURCES
-    "main.c"
+# Main source file
+set(MAIN_SOURCES
+    main.c
+    usb_descriptors.c
 )
 
-# Add application sources
-file(GLOB APP_SOURCES
-    "../application/Source/*.c"
-)
-
-# Add local screen sources (if any)
-file(GLOB LOCAL_SCREEN_SOURCES  
-    "screens/*.c"
+# Application source files (explicit list - no GLOB)
+set(APP_SOURCES
+    ../application/Source/MyWota_ui_driver.c
+    ../application/Source/Dispenser_Controller.c
+    ../application/Source/Firmware_Version.c
+    ../application/Source/Hardware_Access.c
+    ../application/Source/IO_Expander_Control.c
+    ../application/Source/MIFARE_Transaction_Manager.c
+    ../application/Source/RS485_Task.c
+    ../application/Source/RTC_Manager.c
+    ../application/Source/RTC_Task.c
+    ../application/Source/SD_Logger_Task.c
+    ../application/Source/System.c
+    ../application/Source/System_Config.c
+    ../application/Source/USB_Command_Handler.c
 )
 
 # Combine all local sources (drivers now handled by library)
-set(ALL_LOCAL_SOURCES ${MAIN_SOURCES} ${APP_SOURCES} ${LOCAL_SCREEN_SOURCES})
+set(ALL_LOCAL_SOURCES ${MAIN_SOURCES} ${APP_SOURCES})
 
 # Create the executable
 add_executable(UI_PICO_PORT ${ALL_LOCAL_SOURCES})
 
+# Use custom linker script for bootloader-aware build (app at 0x10008000)
+pico_set_linker_script(UI_PICO_PORT ${CMAKE_CURRENT_SOURCE_DIR}/memmap_app.ld)
+
 # Link libraries
 target_link_libraries(UI_PICO_PORT
-    ui    # Add UI library from ../application/User_Interface/miWota/ui
+    ui    # Add UI library from ../application/User_Interface/MyWota/ui
     lvgl  # Add LVGL library
     Drivers  # Add custom drivers library
     pico_runtime
@@ -159,7 +173,9 @@ target_link_libraries(UI_PICO_PORT
     pico_malloc
     pico_mem_ops
     pico_printf
-    pico_stdio_usb  # USB stdio for Pico SDK
+    pico_stdio_uart  # UART stdio only (USB handled by TinyUSB)
+    tinyusb_device   # TinyUSB device stack for CDC+MSC composite
+    tinyusb_board    # TinyUSB board support
     hardware_base
     hardware_claim
     hardware_sync
@@ -189,7 +205,13 @@ target_include_directories(lvgl PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/freertos_config
     ${FREERTOS_KERNEL_PATH}/include
     ${FREERTOS_KERNEL_PATH}/portable/GCC/RP2040/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../application/User_Interface/miWota  # Add path for lv_conf.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/../application/User_Interface/MyWota  # Add path for lv_conf.h
+)
+
+# Add FatFs include path as SYSTEM to LVGL for LV_USE_FS_FATFS support
+target_include_directories(lvgl SYSTEM PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../Common/sevantica_drivers/FatFs
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../Common/sevantica_drivers/Include
 )
 
 # Also need to link LVGL with FreeRTOS-Kernel and Pico SDK for headers
@@ -203,7 +225,7 @@ target_link_libraries(lvgl PUBLIC
 # Explicitly add the pico.h include directory to LVGL and lv_conf.h
 target_include_directories(lvgl PUBLIC
     ${PICO_SDK_PATH}/src/common/pico_base_headers/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../application/User_Interface/miWota  # Add path for lv_conf.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/../application/User_Interface/MyWota  # Add path for lv_conf.h
 )
 
 # Add include directories for UI_PICO_PORT
@@ -212,8 +234,19 @@ target_include_directories(UI_PICO_PORT PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/freertos_config
 )
 
-# Enable UART output and USB stdio (letting Pico SDK handle USB properly)
-pico_enable_stdio_usb(UI_PICO_PORT 1)
+# Add tusb_config.h location for TinyUSB
+target_include_directories(UI_PICO_PORT PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tusb_config.h
+)
+
+# Define that we're using TinyUSB device mode (for conditional compilation)
+target_compile_definitions(UI_PICO_PORT PRIVATE
+    LIB_TINYUSB_DEVICE=1
+    CFG_TUSB_MCU=OPT_MCU_RP2040
+)
+
+# Enable UART output only (USB CDC handled by TinyUSB)
+pico_enable_stdio_usb(UI_PICO_PORT 0)
 pico_enable_stdio_uart(UI_PICO_PORT 1)
 
 # Create map/bin/hex/uf2 files automatically after each build

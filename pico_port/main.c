@@ -4,9 +4,10 @@
 #include "../application/Include/Hardware_Access.h"
 #include "USB_Logging.h"
 #include "../application/Include/System.h"
-#include "pico/stdio.h"
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
+#include "hardware/watchdog.h"
+#include "tusb.h"
 
 // Hard fault register structure
 typedef struct {
@@ -38,10 +39,13 @@ void print_memory_stats(void)
 // Entry point
 int main()
 {
-    // Initialize stdio (USB and UART) FIRST before anything else
-    stdio_init_all();
+    // Initialize UART for early debug (USB requires FreeRTOS task)
+    stdio_uart_init();
     
-    // Small delay to allow USB to enumerate
+    // Initialize TinyUSB stack
+    tusb_init();
+    
+    // Small delay to allow USB to start
     sleep_ms(1000);
     
     // Initialize SD CS pin HIGH (inactive) to prevent SPI bus conflicts
@@ -92,6 +96,9 @@ void vApplicationMallocFailedHook( void )
 
 void vApplicationStackOverflowHook( TaskHandle_t pxTask, char *pcTaskName )
 {
+    // CRITICAL: Disable hardware watchdog so we can see the fault
+    watchdog_disable();
+    
     // Try to print the task name if possible
     printf("\n=== STACK OVERFLOW DETECTED ===\n");
     printf("Task Handle: 0x%p\n", pxTask);
@@ -132,6 +139,9 @@ void HardFault_Handler_C(HardFaultStackFrame_t *stack_frame)
     // Disable interrupts to prevent further issues
     taskDISABLE_INTERRUPTS();
     
+    // CRITICAL: Disable hardware watchdog so we can see the fault
+    watchdog_disable();
+    
     // Light up the LED to indicate hard fault
     const uint LED_PIN = PICO_DEFAULT_LED_PIN;
     gpio_init(LED_PIN);
@@ -165,25 +175,25 @@ void HardFault_Handler_C(HardFaultStackFrame_t *stack_frame)
         // SOS pattern: ... --- ...
         for (int i = 0; i < 3; i++) {
             gpio_put(LED_PIN, 1);
-            sleep_ms(200);
+            busy_wait_ms(200);
             gpio_put(LED_PIN, 0);
-            sleep_ms(200);
+            busy_wait_ms(200);
         }
-        sleep_ms(500);
+        busy_wait_ms(500);
         for (int i = 0; i < 3; i++) {
             gpio_put(LED_PIN, 1);
-            sleep_ms(600);
+            busy_wait_ms(600);
             gpio_put(LED_PIN, 0);
-            sleep_ms(200);
+            busy_wait_ms(200);
         }
-        sleep_ms(500);
+        busy_wait_ms(500);
         for (int i = 0; i < 3; i++) {
             gpio_put(LED_PIN, 1);
-            sleep_ms(200);
+            busy_wait_ms(200);
             gpio_put(LED_PIN, 0);
-            sleep_ms(200);
+            busy_wait_ms(200);
         }
-        sleep_ms(2000);
+        busy_wait_ms(2000);
     }
 }
 
