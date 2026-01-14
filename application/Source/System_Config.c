@@ -106,13 +106,15 @@ void Config_InitDefaults(void)
     /* System defaults */
     g_system_config.system.test_mode_enabled = false;
     g_system_config.system.log_level = 3;  /* Debug level */
-    strncpy(g_system_config.system.device_id, "MYWOTA-001", sizeof(g_system_config.system.device_id) - 1);
+    strncpy(g_system_config.system.device_id, "BIGYELLOW-001", sizeof(g_system_config.system.device_id) - 1);
+    g_system_config.system.device_id[sizeof(g_system_config.system.device_id) - 1] = '\0';
     strncpy(g_system_config.system.site_id, "SITE-001", sizeof(g_system_config.system.site_id) - 1);
+    g_system_config.system.site_id[sizeof(g_system_config.system.site_id) - 1] = '\0';
     
-    /* Module enable defaults - all enabled */
+    /* Module enable defaults */
     g_system_config.modules.lcd_display_enabled = true;
     g_system_config.modules.mifare_polling_enabled = true;
-    g_system_config.modules.dispenser_enabled = true;
+    g_system_config.modules.carwash_enabled = true;
     g_system_config.modules.buzzer_enabled = true;
     g_system_config.modules.io_expander_enabled = true;
     g_system_config.modules.rs485_enabled = true;
@@ -130,17 +132,15 @@ void Config_InitDefaults(void)
     /* Default MIFARE key: FF FF FF FF FF FF */
     memset(g_system_config.mifare.auth_key, 0xFF, 6);
     /* Card initialization defaults */
-    g_system_config.mifare.card_init_default_balance_ml = 20000;  /* 20 liters default */
-    g_system_config.mifare.auto_reinit_on_corruption = false;     /* Disable auto-recovery */
+    g_system_config.mifare.card_init_default_tokens = 10;  /* 10 tokens default */
+    g_system_config.mifare.auto_reinit_on_corruption = true;      /* Enable auto-recovery */
     strncpy(g_system_config.mifare.card_init_phone_number, "07970242024", sizeof(g_system_config.mifare.card_init_phone_number) - 1);
     g_system_config.mifare.card_init_phone_number[sizeof(g_system_config.mifare.card_init_phone_number) - 1] = '\0';
     g_system_config.mifare.card_init_validity = 2;  /* CARD_VALIDITY_NORMAL */
-    strncpy(g_system_config.mifare.no_card_user_id, "MyWota", sizeof(g_system_config.mifare.no_card_user_id) - 1);
+    strncpy(g_system_config.mifare.no_card_user_id, "BigYellow", sizeof(g_system_config.mifare.no_card_user_id) - 1);
     g_system_config.mifare.no_card_user_id[sizeof(g_system_config.mifare.no_card_user_id) - 1] = '\0';
-    g_system_config.mifare.post_reset_cooldown_ms = 1200; /* PN532 reset delay */
-    g_system_config.mifare.auto_recovery_enabled = false;  /* Disabled by default */
     
-    /* MIFARE Security defaults */
+    /* MIFARE Security defaults (nested inside mifare struct) */
     g_system_config.mifare.security.encryption_enabled = true;  /* Enable encryption by default */
     g_system_config.mifare.security.pbkdf2_iterations = 1000;  /* 1k iterations - safe for RP2040 WDT */
     g_system_config.mifare.security.use_custom_sector_keys = true;  /* Use UID-derived keys by default */
@@ -171,10 +171,14 @@ void Config_InitDefaults(void)
     g_system_config.ui.screen_switch_delay_ms = 4000;
     g_system_config.ui.ui_hide_delay_ms = 5000;
     g_system_config.ui.led_flash_interval_ms = 500;
-    g_system_config.ui.data_poll_interval_ms = 100;  /* 10Hz data updates (was 20ms = 50Hz) */
+    g_system_config.ui.data_poll_interval_ms = 50;  /* 20Hz data updates for smoother response */
+    g_system_config.ui.lvgl_task_period_ms = 20;  /* LVGL refresh rate (20ms for complex UI) */
+    g_system_config.ui.lcd_reset_delay_ms = 500;  /* LCD reset delay (default 500ms) */
+    g_system_config.ui.screen_brightness_percent = 100;  /* Full brightness */
+    
     strncpy(g_system_config.ui.init_customer_id, "Welcome", sizeof(g_system_config.ui.init_customer_id) - 1);
     g_system_config.ui.init_customer_id[sizeof(g_system_config.ui.init_customer_id) - 1] = '\0';
-    strncpy(g_system_config.ui.no_card_customer_id, "MyWota", sizeof(g_system_config.ui.no_card_customer_id) - 1);
+    strncpy(g_system_config.ui.no_card_customer_id, "Big Yellow", sizeof(g_system_config.ui.no_card_customer_id) - 1);
     g_system_config.ui.no_card_customer_id[sizeof(g_system_config.ui.no_card_customer_id) - 1] = '\0';
     
     /* Background color defaults (from SquareLine design) */
@@ -183,73 +187,104 @@ void Config_InitDefaults(void)
     g_system_config.ui.bg_main_stop = 50;             /* Gradient start position */
     g_system_config.ui.bg_grad_stop = 180;            /* Gradient end position */
     g_system_config.ui.title_bar_color = 0x00A000;    /* Green title bar */
-    g_system_config.ui.lvgl_task_period_ms = 5;       /* 5ms LVGL refresh (200Hz) */
-    g_system_config.ui.lcd_reset_delay_ms = 500;      /* 500ms LCD reset delay */
-    g_system_config.ui.screen_brightness_percent = 100; /* 100% brightness */
     
-    /* UI State: IDLE (no card present) */
+    /* UI State: IDLE (no card present) - dimmed appearance */
     g_system_config.ui.states[UI_STATE_IDLE].show_customer_id = true;
+    g_system_config.ui.states[UI_STATE_IDLE].image_brightness_active = 255;   /* Full brightness */
+    g_system_config.ui.states[UI_STATE_IDLE].image_brightness_inactive = 77;  /* 30% opacity */
+    g_system_config.ui.states[UI_STATE_IDLE].ring_opacity_active = 255;       /* Full opacity */
+    g_system_config.ui.states[UI_STATE_IDLE].ring_opacity_inactive = 77;      /* 30% opacity */
+    g_system_config.ui.states[UI_STATE_IDLE].ring_color_vacuum_active = 0xFF0000;     /* Red */
+    g_system_config.ui.states[UI_STATE_IDLE].ring_color_vacuum_inactive = 0x4D0000;   /* Dark red */
+    g_system_config.ui.states[UI_STATE_IDLE].ring_color_brush_active = 0x00FF00;      /* Green */
+    g_system_config.ui.states[UI_STATE_IDLE].ring_color_brush_inactive = 0x004D00;    /* Dark green */
+    g_system_config.ui.states[UI_STATE_IDLE].ring_color_pressure_active = 0x0000FF;   /* Blue */
+    g_system_config.ui.states[UI_STATE_IDLE].ring_color_pressure_inactive = 0x00004D; /* Dark blue */
     
-    /* UI State: CARD_INITIALIZING */
+    /* UI State: CARD_INITIALIZING - same as idle */
     g_system_config.ui.states[UI_STATE_CARD_INITIALIZING].show_customer_id = true;
+    g_system_config.ui.states[UI_STATE_CARD_INITIALIZING].image_brightness_active = 255;
+    g_system_config.ui.states[UI_STATE_CARD_INITIALIZING].image_brightness_inactive = 77;
+    g_system_config.ui.states[UI_STATE_CARD_INITIALIZING].ring_opacity_active = 255;
+    g_system_config.ui.states[UI_STATE_CARD_INITIALIZING].ring_opacity_inactive = 77;
+    g_system_config.ui.states[UI_STATE_CARD_INITIALIZING].ring_color_vacuum_active = 0xFF0000;
+    g_system_config.ui.states[UI_STATE_CARD_INITIALIZING].ring_color_vacuum_inactive = 0x4D0000;
+    g_system_config.ui.states[UI_STATE_CARD_INITIALIZING].ring_color_brush_active = 0x00FF00;
+    g_system_config.ui.states[UI_STATE_CARD_INITIALIZING].ring_color_brush_inactive = 0x004D00;
+    g_system_config.ui.states[UI_STATE_CARD_INITIALIZING].ring_color_pressure_active = 0x0000FF;
+    g_system_config.ui.states[UI_STATE_CARD_INITIALIZING].ring_color_pressure_inactive = 0x00004D;
     
-    /* UI State: CARD_READY */
+    /* UI State: CARD_READY - normal appearance */
     g_system_config.ui.states[UI_STATE_CARD_READY].show_customer_id = true;
+    g_system_config.ui.states[UI_STATE_CARD_READY].image_brightness_active = 255;
+    g_system_config.ui.states[UI_STATE_CARD_READY].image_brightness_inactive = 77;
+    g_system_config.ui.states[UI_STATE_CARD_READY].ring_opacity_active = 255;
+    g_system_config.ui.states[UI_STATE_CARD_READY].ring_opacity_inactive = 77;
+    g_system_config.ui.states[UI_STATE_CARD_READY].ring_color_vacuum_active = 0xFF0000;
+    g_system_config.ui.states[UI_STATE_CARD_READY].ring_color_vacuum_inactive = 0x4D0000;
+    g_system_config.ui.states[UI_STATE_CARD_READY].ring_color_brush_active = 0x00FF00;
+    g_system_config.ui.states[UI_STATE_CARD_READY].ring_color_brush_inactive = 0x004D00;
+    g_system_config.ui.states[UI_STATE_CARD_READY].ring_color_pressure_active = 0x0000FF;
+    g_system_config.ui.states[UI_STATE_CARD_READY].ring_color_pressure_inactive = 0x00004D;
     
-    /* UI State: DISPENSING */
+    /* UI State: DISPENSING - bright/active appearance */
     g_system_config.ui.states[UI_STATE_DISPENSING].show_customer_id = true;
+    g_system_config.ui.states[UI_STATE_DISPENSING].image_brightness_active = 255;
+    g_system_config.ui.states[UI_STATE_DISPENSING].image_brightness_inactive = 128;  /* 50% for dispensing */
+    g_system_config.ui.states[UI_STATE_DISPENSING].ring_opacity_active = 255;
+    g_system_config.ui.states[UI_STATE_DISPENSING].ring_opacity_inactive = 128;      /* 50% for dispensing */
+    g_system_config.ui.states[UI_STATE_DISPENSING].ring_color_vacuum_active = 0xFF0000;
+    g_system_config.ui.states[UI_STATE_DISPENSING].ring_color_vacuum_inactive = 0x800000;   /* Medium red */
+    g_system_config.ui.states[UI_STATE_DISPENSING].ring_color_brush_active = 0x00FF00;
+    g_system_config.ui.states[UI_STATE_DISPENSING].ring_color_brush_inactive = 0x008000;    /* Medium green */
+    g_system_config.ui.states[UI_STATE_DISPENSING].ring_color_pressure_active = 0x0000FF;
+    g_system_config.ui.states[UI_STATE_DISPENSING].ring_color_pressure_inactive = 0x000080; /* Medium blue */
     
-    /* UI State: ERROR */
+    /* UI State: ERROR - muted/error appearance */
     g_system_config.ui.states[UI_STATE_ERROR].show_customer_id = true;
+    g_system_config.ui.states[UI_STATE_ERROR].image_brightness_active = 200;
+    g_system_config.ui.states[UI_STATE_ERROR].image_brightness_inactive = 50;
+    g_system_config.ui.states[UI_STATE_ERROR].ring_opacity_active = 200;
+    g_system_config.ui.states[UI_STATE_ERROR].ring_opacity_inactive = 50;
+    g_system_config.ui.states[UI_STATE_ERROR].ring_color_vacuum_active = 0xFF4040;    /* Light red */
+    g_system_config.ui.states[UI_STATE_ERROR].ring_color_vacuum_inactive = 0x400000;
+    g_system_config.ui.states[UI_STATE_ERROR].ring_color_brush_active = 0x40FF40;     /* Light green */
+    g_system_config.ui.states[UI_STATE_ERROR].ring_color_brush_inactive = 0x004000;
+    g_system_config.ui.states[UI_STATE_ERROR].ring_color_pressure_active = 0x4040FF;  /* Light blue */
+    g_system_config.ui.states[UI_STATE_ERROR].ring_color_pressure_inactive = 0x000040;
     
-    /* Dispenser defaults */
-    g_system_config.dispenser.dispense_duration_seconds = 1200;  /* 20 minutes */
-    g_system_config.dispenser.card_removal_delay_ms = 1000;  /* 1 second */
-    g_system_config.dispenser.deduction_interval_ms = 100;  /* Balance update every 100ms */
-    g_system_config.dispenser.card_write_interval_ms = 200; /* Card write every 200ms */
-    
-    /* I/O Expander defaults */
-    g_system_config.io_expander.poll_rate_ms = 50;          /* 50ms polling (20Hz) */
-    g_system_config.io_expander.button_debounce_count = 3;  /* 3 samples for debounce */
-    
-    /* RS485 defaults */
-    g_system_config.rs485.slave_address = 0x01;             /* Device address 1 */
-    g_system_config.rs485.baudrate = 115200;                /* 115200 baud */
-    g_system_config.rs485.frame_timeout_ms = 100;           /* 100ms frame timeout */
-    g_system_config.rs485.fw_update_timeout_ms = 60000;     /* 60s firmware update timeout */
-    
-    /* Hardware bus defaults */
-    g_system_config.hardware_bus.spi0_baudrate = 62500000;  /* 62.5 MHz SPI */
-    g_system_config.hardware_bus.i2c0_baudrate = 400000;    /* 400 kHz I2C */
-    g_system_config.hardware_bus.i2c1_baudrate = 400000;    /* 400 kHz I2C */
-    g_system_config.hardware_bus.i2c_timeout_us = 50000;    /* 50ms I2C timeout */
-    
-    /* Flow sensor defaults */
-    g_system_config.flow_sensor.pulses_per_liter = 450;     /* YS-S201 calibration */
-    g_system_config.flow_sensor.calculation_period_ms = 1000; /* 1 second */
-    g_system_config.flow_sensor.pulse_timeout_ms = 5000;    /* 5 second timeout */
-    g_system_config.flow_sensor.debounce_time_us = 500;     /* 500us debounce */
+    /* Car wash defaults */
+    g_system_config.carwash.wash_duration_seconds = 1200;  /* 20 minutes */
+    g_system_config.carwash.card_removal_delay_ms = 1000;  /* 1 second */
+    g_system_config.carwash.loyalty_enabled = true;        /* Enable loyalty by default */
+    g_system_config.carwash.loyalty_threshold = 5;         /* 5 washes = 1 free wash */
+    g_system_config.carwash.loyalty_reward = 1;            /* 1 free wash per threshold */
     
     /* Buzzer defaults */
-    g_system_config.buzzer.enabled = true;                  /* Buzzer enabled */
-    g_system_config.buzzer.default_duration_ms = 200;       /* 200ms default beep */
-    g_system_config.buzzer.double_beep_on_ms = 50;          /* 50ms double beep on */
-    g_system_config.buzzer.double_beep_off_ms = 50;         /* 50ms double beep off */
-    g_system_config.buzzer.card_init_beep_interval_ms = 500; /* 500ms card init beep interval */
-    g_system_config.buzzer.removal_pattern_on_ms = 50;      /* 50ms removal pattern on */
-    g_system_config.buzzer.removal_pattern_off_ms = 50;     /* 50ms removal pattern off */
-    g_system_config.buzzer.removal_pattern_count = 8;       /* 8 beeps for removal pattern */
-    g_system_config.buzzer.removal_pattern_repeat_ms = 3000; /* Repeat pattern every 3 seconds */
+    g_system_config.buzzer.enabled = true;
+    g_system_config.buzzer.default_duration_ms = 200;
+    g_system_config.buzzer.double_beep_on_ms = 50;
+    g_system_config.buzzer.double_beep_off_ms = 50;
+    g_system_config.buzzer.card_init_beep_interval_ms = 500;
+    g_system_config.buzzer.removal_pattern_on_ms = 50;
+    g_system_config.buzzer.removal_pattern_off_ms = 50;
+    g_system_config.buzzer.removal_pattern_count = 5;       /* 5 fast beeps */
+    g_system_config.buzzer.removal_pattern_repeat_ms = 1000; /* Repeat every 1s */
     
     /* SD Logger defaults */
-    g_system_config.sd_logger.init_retry_delay_ms = 5000;   /* 5 second init retry */
-    g_system_config.sd_logger.mount_retry_delay_ms = 2000;  /* 2 second mount retry */
-    g_system_config.sd_logger.max_retry_count = 1;          /* 1 retry attempt */
+    g_system_config.sd_logger.init_retry_delay_ms = 5000;
+    g_system_config.sd_logger.mount_retry_delay_ms = 2000;
+    g_system_config.sd_logger.max_retry_count = 1;
     
-    /* RTC defaults */
-    g_system_config.rtc.save_interval_ms = 1000;            /* Save RTC every second */
+    /* I/O Expander defaults */
+    g_system_config.io_expander.poll_rate_ms = 50;
+    g_system_config.io_expander.button_debounce_count = 3;
     
-    /* Note: MIFARE security is configured in g_system_config.mifare.security (initialized above) */
+    /* Hardware Bus defaults */
+    g_system_config.hardware_bus.spi0_baudrate = 62500000;  /* 62.5 MHz */
+    g_system_config.hardware_bus.i2c0_baudrate = 400000;     /* 400 kHz */
+    g_system_config.hardware_bus.i2c1_baudrate = 400000;     /* 400 kHz */
+    g_system_config.hardware_bus.i2c_timeout_us = 50000;     /* 50ms */
     
     /* Calculate CRC */
     g_system_config.crc32 = Config_CalculateCRC32(&g_system_config);
@@ -555,19 +590,45 @@ static bool parse_ui_state_param(const char* key, const char* value, UI_State_t 
         cfg->show_customer_id = (atoi(value) != 0);
         (*params_found)++;
         return true;
-    }
-    /* Legacy parameters - ignore for backward compatibility */
-    else if (strcmp(key, "image_brightness_active") == 0 ||
-             strcmp(key, "image_brightness_inactive") == 0 ||
-             strcmp(key, "ring_opacity_active") == 0 ||
-             strcmp(key, "ring_opacity_inactive") == 0 ||
-             strcmp(key, "ring_color_vacuum_active") == 0 ||
-             strcmp(key, "ring_color_vacuum_inactive") == 0 ||
-             strcmp(key, "ring_color_brush_active") == 0 ||
-             strcmp(key, "ring_color_brush_inactive") == 0 ||
-             strcmp(key, "ring_color_pressure_active") == 0 ||
-             strcmp(key, "ring_color_pressure_inactive") == 0) {
-        /* Silently ignore legacy params - don't increment counter */
+    } else if (strcmp(key, "image_brightness_active") == 0) {
+        cfg->image_brightness_active = (uint8_t)atoi(value);
+        (*params_found)++;
+        return true;
+    } else if (strcmp(key, "image_brightness_inactive") == 0) {
+        cfg->image_brightness_inactive = (uint8_t)atoi(value);
+        (*params_found)++;
+        return true;
+    } else if (strcmp(key, "ring_opacity_active") == 0) {
+        cfg->ring_opacity_active = (uint8_t)atoi(value);
+        (*params_found)++;
+        return true;
+    } else if (strcmp(key, "ring_opacity_inactive") == 0) {
+        cfg->ring_opacity_inactive = (uint8_t)atoi(value);
+        (*params_found)++;
+        return true;
+    } else if (strcmp(key, "ring_color_vacuum_active") == 0) {
+        cfg->ring_color_vacuum_active = (uint32_t)strtoul(value, NULL, 16);
+        (*params_found)++;
+        return true;
+    } else if (strcmp(key, "ring_color_vacuum_inactive") == 0) {
+        cfg->ring_color_vacuum_inactive = (uint32_t)strtoul(value, NULL, 16);
+        (*params_found)++;
+        return true;
+    } else if (strcmp(key, "ring_color_brush_active") == 0) {
+        cfg->ring_color_brush_active = (uint32_t)strtoul(value, NULL, 16);
+        (*params_found)++;
+        return true;
+    } else if (strcmp(key, "ring_color_brush_inactive") == 0) {
+        cfg->ring_color_brush_inactive = (uint32_t)strtoul(value, NULL, 16);
+        (*params_found)++;
+        return true;
+    } else if (strcmp(key, "ring_color_pressure_active") == 0) {
+        cfg->ring_color_pressure_active = (uint32_t)strtoul(value, NULL, 16);
+        (*params_found)++;
+        return true;
+    } else if (strcmp(key, "ring_color_pressure_inactive") == 0) {
+        cfg->ring_color_pressure_inactive = (uint32_t)strtoul(value, NULL, 16);
+        (*params_found)++;
         return true;
     }
     
@@ -589,7 +650,6 @@ static Config_Result_t config_parse_file(FIL *file)
     
     /* Initialize with defaults first */
     Config_InitDefaults();
-    LOG_DEBUG_CONFIG("[CONFIG] Defaults initialized, starting parse loop...\r\n");
     
     /* Assume we'll find all parameters (set to false when any key is found) */
     /* This will be set to true if we load successfully but used defaults for anything */
@@ -633,8 +693,8 @@ static Config_Result_t config_parse_file(FIL *file)
                     g_system_config.mifare.auth_key[i] = (uint8_t)strtol(hex, NULL, 16);
                 }
                 params_found++;
-            } else if (strcmp(k, "mifare.card_init_default_balance_ml") == 0) {
-                g_system_config.mifare.card_init_default_balance_ml = (uint32_t)atoi(v);
+            } else if (strcmp(k, "mifare.card_init_default_tokens") == 0) {
+                g_system_config.mifare.card_init_default_tokens = (uint32_t)atoi(v);
                 params_found++;
             } else if (strcmp(k, "mifare.auto_reinit_on_corruption") == 0) {
                 g_system_config.mifare.auto_reinit_on_corruption = (atoi(v) != 0);
@@ -744,11 +804,6 @@ static Config_Result_t config_parse_file(FIL *file)
             } else if (strcmp(k, "ui.title_bar_color") == 0) {
                 g_system_config.ui.title_bar_color = (uint32_t)strtoul(v, NULL, 16);
                 params_found++;
-            } else if (strcmp(k, "ui.screen_brightness_percent") == 0) {
-                uint8_t brightness = (uint8_t)atoi(v);
-                if (brightness > 100) brightness = 100;  /* Clamp to 0-100 */
-                g_system_config.ui.screen_brightness_percent = brightness;
-                params_found++;
             }
             /* UI state-specific parameters (format: ui.<state>.<param>) */
             else if (strncmp(k, "ui.", 3) == 0) {
@@ -784,76 +839,49 @@ static Config_Result_t config_parse_file(FIL *file)
                 strncpy(g_system_config.system.site_id, v, sizeof(g_system_config.system.site_id) - 1);
                 params_found++;
             }
-            /* Dispenser settings */
-            else if (strcmp(k, "dispenser.dispense_duration_seconds") == 0) {
-                g_system_config.dispenser.dispense_duration_seconds = (uint32_t)atoi(v);
+            /* Module enable/disable settings */
+            else if (strcmp(k, "modules.lcd_display_enabled") == 0) {
+                g_system_config.modules.lcd_display_enabled = (atoi(v) != 0);
                 params_found++;
-            } else if (strcmp(k, "dispenser.card_removal_delay_ms") == 0) {
-                g_system_config.dispenser.card_removal_delay_ms = (uint32_t)atoi(v);
+            } else if (strcmp(k, "modules.mifare_polling_enabled") == 0) {
+                g_system_config.modules.mifare_polling_enabled = (atoi(v) != 0);
                 params_found++;
-            } else if (strcmp(k, "dispenser.deduction_interval_ms") == 0) {
-                g_system_config.dispenser.deduction_interval_ms = (uint32_t)atoi(v);
+            } else if (strcmp(k, "modules.carwash_enabled") == 0) {
+                g_system_config.modules.carwash_enabled = (atoi(v) != 0);
                 params_found++;
-            } else if (strcmp(k, "dispenser.card_write_interval_ms") == 0) {
-                g_system_config.dispenser.card_write_interval_ms = (uint32_t)atoi(v);
+            } else if (strcmp(k, "modules.buzzer_enabled") == 0) {
+                g_system_config.modules.buzzer_enabled = (atoi(v) != 0);
                 params_found++;
-            }
-            /* MIFARE timing settings (merged into main MIFARE config) */
-            else if (strcmp(k, "mifare.post_reset_cooldown_ms") == 0 || strcmp(k, "mifare_timing.post_reset_cooldown_ms") == 0) {
-                g_system_config.mifare.post_reset_cooldown_ms = (uint32_t)atoi(v);
-                params_found++;
-            } else if (strcmp(k, "mifare.auto_recovery_enabled") == 0 || strcmp(k, "mifare_timing.auto_recovery_enabled") == 0) {
-                g_system_config.mifare.auto_recovery_enabled = (atoi(v) != 0);
+            } else if (strcmp(k, "modules.io_expander_enabled") == 0) {
+                g_system_config.modules.io_expander_enabled = (atoi(v) != 0);
                 params_found++;
             }
-            /* I/O Expander settings */
-            else if (strcmp(k, "io_expander.poll_rate_ms") == 0) {
-                g_system_config.io_expander.poll_rate_ms = (uint32_t)atoi(v);
+            /* Additional UI settings */
+            else if (strcmp(k, "ui.lvgl_task_period_ms") == 0) {
+                g_system_config.ui.lvgl_task_period_ms = (uint32_t)atoi(v);
                 params_found++;
-            } else if (strcmp(k, "io_expander.button_debounce_count") == 0) {
-                g_system_config.io_expander.button_debounce_count = (uint8_t)atoi(v);
+            } else if (strcmp(k, "ui.lcd_reset_delay_ms") == 0) {
+                g_system_config.ui.lcd_reset_delay_ms = (uint32_t)atoi(v);
                 params_found++;
-            }
-            /* RS485 settings */
-            else if (strcmp(k, "rs485.slave_address") == 0) {
-                g_system_config.rs485.slave_address = (uint8_t)atoi(v);
-                params_found++;
-            } else if (strcmp(k, "rs485.baudrate") == 0) {
-                g_system_config.rs485.baudrate = (uint32_t)atoi(v);
-                params_found++;
-            } else if (strcmp(k, "rs485.frame_timeout_ms") == 0) {
-                g_system_config.rs485.frame_timeout_ms = (uint32_t)atoi(v);
-                params_found++;
-            } else if (strcmp(k, "rs485.fw_update_timeout_ms") == 0) {
-                g_system_config.rs485.fw_update_timeout_ms = (uint32_t)atoi(v);
+            } else if (strcmp(k, "ui.screen_brightness_percent") == 0) {
+                g_system_config.ui.screen_brightness_percent = (uint8_t)atoi(v);
                 params_found++;
             }
-            /* Hardware bus settings */
-            else if (strcmp(k, "hardware_bus.spi0_baudrate") == 0) {
-                g_system_config.hardware_bus.spi0_baudrate = (uint32_t)atoi(v);
+            /* Car wash settings */
+            else if (strcmp(k, "carwash.wash_duration_seconds") == 0) {
+                g_system_config.carwash.wash_duration_seconds = (uint32_t)atoi(v);
                 params_found++;
-            } else if (strcmp(k, "hardware_bus.i2c0_baudrate") == 0) {
-                g_system_config.hardware_bus.i2c0_baudrate = (uint32_t)atoi(v);
+            } else if (strcmp(k, "carwash.card_removal_delay_ms") == 0) {
+                g_system_config.carwash.card_removal_delay_ms = (uint32_t)atoi(v);
                 params_found++;
-            } else if (strcmp(k, "hardware_bus.i2c1_baudrate") == 0) {
-                g_system_config.hardware_bus.i2c1_baudrate = (uint32_t)atoi(v);
+            } else if (strcmp(k, "carwash.loyalty_enabled") == 0) {
+                g_system_config.carwash.loyalty_enabled = (atoi(v) != 0);
                 params_found++;
-            } else if (strcmp(k, "hardware_bus.i2c_timeout_us") == 0) {
-                g_system_config.hardware_bus.i2c_timeout_us = (uint32_t)atoi(v);
+            } else if (strcmp(k, "carwash.loyalty_threshold") == 0) {
+                g_system_config.carwash.loyalty_threshold = (uint32_t)strtoul(v, NULL, 10);
                 params_found++;
-            }
-            /* Flow sensor settings */
-            else if (strcmp(k, "flow_sensor.pulses_per_liter") == 0) {
-                g_system_config.flow_sensor.pulses_per_liter = (uint16_t)atoi(v);
-                params_found++;
-            } else if (strcmp(k, "flow_sensor.calculation_period_ms") == 0) {
-                g_system_config.flow_sensor.calculation_period_ms = (uint32_t)atoi(v);
-                params_found++;
-            } else if (strcmp(k, "flow_sensor.pulse_timeout_ms") == 0) {
-                g_system_config.flow_sensor.pulse_timeout_ms = (uint32_t)atoi(v);
-                params_found++;
-            } else if (strcmp(k, "flow_sensor.debounce_time_us") == 0) {
-                g_system_config.flow_sensor.debounce_time_us = (uint16_t)atoi(v);
+            } else if (strcmp(k, "carwash.loyalty_reward") == 0) {
+                g_system_config.carwash.loyalty_reward = (uint32_t)strtoul(v, NULL, 10);
                 params_found++;
             }
             /* Buzzer settings */
@@ -896,67 +924,51 @@ static Config_Result_t config_parse_file(FIL *file)
                 g_system_config.sd_logger.max_retry_count = (uint8_t)atoi(v);
                 params_found++;
             }
-            /* RTC settings */
-            else if (strcmp(k, "rtc.save_interval_ms") == 0) {
-                g_system_config.rtc.save_interval_ms = (uint32_t)atoi(v);
+            /* I/O Expander settings */
+            else if (strcmp(k, "io_expander.poll_rate_ms") == 0) {
+                g_system_config.io_expander.poll_rate_ms = (uint32_t)atoi(v);
+                params_found++;
+            } else if (strcmp(k, "io_expander.button_debounce_count") == 0) {
+                g_system_config.io_expander.button_debounce_count = (uint8_t)atoi(v);
                 params_found++;
             }
-            /* UI timing settings (merged into main UI config) */
-            else if (strcmp(k, "ui.lvgl_task_period_ms") == 0 || strcmp(k, "ui_timing.lvgl_task_period_ms") == 0) {
-                g_system_config.ui.lvgl_task_period_ms = (uint32_t)atoi(v);
+            /* Hardware Bus settings */
+            else if (strcmp(k, "hardware_bus.spi0_baudrate") == 0) {
+                g_system_config.hardware_bus.spi0_baudrate = (uint32_t)atoi(v);
                 params_found++;
-            } else if (strcmp(k, "ui.lcd_reset_delay_ms") == 0 || strcmp(k, "ui_timing.lcd_reset_delay_ms") == 0) {
-                g_system_config.ui.lcd_reset_delay_ms = (uint32_t)atoi(v);
+            } else if (strcmp(k, "hardware_bus.i2c0_baudrate") == 0) {
+                g_system_config.hardware_bus.i2c0_baudrate = (uint32_t)atoi(v);
                 params_found++;
-            }
-            /* Module enable settings */
-            else if (strcmp(k, "modules.lcd_display_enabled") == 0) {
-                g_system_config.modules.lcd_display_enabled = (atoi(v) != 0);
+            } else if (strcmp(k, "hardware_bus.i2c1_baudrate") == 0) {
+                g_system_config.hardware_bus.i2c1_baudrate = (uint32_t)atoi(v);
                 params_found++;
-            } else if (strcmp(k, "modules.mifare_polling_enabled") == 0) {
-                g_system_config.modules.mifare_polling_enabled = (atoi(v) != 0);
-                params_found++;
-            } else if (strcmp(k, "modules.dispenser_enabled") == 0) {
-                g_system_config.modules.dispenser_enabled = (atoi(v) != 0);
-                params_found++;
-            } else if (strcmp(k, "modules.buzzer_enabled") == 0) {
-                g_system_config.modules.buzzer_enabled = (atoi(v) != 0);
-                params_found++;
-            } else if (strcmp(k, "modules.io_expander_enabled") == 0) {
-                g_system_config.modules.io_expander_enabled = (atoi(v) != 0);
-                params_found++;
-            } else if (strcmp(k, "modules.rs485_enabled") == 0) {
-                g_system_config.modules.rs485_enabled = (atoi(v) != 0);
+            } else if (strcmp(k, "hardware_bus.i2c_timeout_us") == 0) {
+                g_system_config.hardware_bus.i2c_timeout_us = (uint32_t)atoi(v);
                 params_found++;
             }
         }
     }
     
-    /* Check if we found all expected parameters
-     * MIFARE basic: 11 params (card_timeout_ms, max_retries, card_removal_fail_count,
-     *   stability_timeout_ms, removal_stability_ms, auth_key, card_init_default_tokens,
-     *   auto_reinit_on_corruption, card_init_phone_number, card_init_validity, no_card_user_id)
+    /* Check if we found all expected parameters (v6)
+     * MIFARE basic: 11 params
      * MIFARE Security: 14 params
-     * MIFARE Timing: 2 params (post_reset_cooldown_ms, auto_recovery_enabled)
-     * System: 4 params (test_mode_enabled, log_level, device_id, site_id)
-     * Dispenser: 4 params (dispense_duration_seconds, card_removal_delay_ms, deduction_interval_ms, card_write_interval_ms)
-     * I/O Expander: 2 params (poll_rate_ms, button_debounce_count)
-     * RS485: 4 params (slave_address, baudrate, frame_timeout_ms, fw_update_timeout_ms)
-     * Hardware Bus: 4 params (spi0_baudrate, i2c0_baudrate, i2c1_baudrate, i2c_timeout_us)
-     * Flow Sensor: 4 params (pulses_per_liter, calculation_period_ms, pulse_timeout_ms, debounce_time_us)
-     * Buzzer: 4 params (enabled, default_duration_ms, double_beep_on_ms, double_beep_off_ms)
-     * SD Logger: 3 params (init_retry_delay_ms, mount_retry_delay_ms, max_retry_count)
-     * RTC: 1 param (save_interval_ms)
-     * UI Timing: 2 params (lvgl_task_period_ms, lcd_reset_delay_ms)
-     * Modules: 6 params (lcd_display, mifare_polling, dispenser, buzzer, io_expander, rs485)
-     * UI global: 7 params + 5 background colors + 1 brightness = 13 params
-     * UI states: 5 states * 1 param each = 5 params (show_customer_id only - dead params removed in V8)
-     * Total: 11 + 14 + 2 + 4 + 4 + 2 + 4 + 4 + 4 + 4 + 3 + 1 + 2 + 6 + 13 + 5 = 83 params
+     * System: 4 params
+     * Modules: 5 params (lcd_display_enabled, mifare_polling_enabled, carwash_enabled,
+     *   buzzer_enabled, io_expander_enabled)
+     * UI global: 12 params (7 original + 5 background colors)
+     * UI infrastructure: 3 params (lvgl_task_period_ms, lcd_reset_delay_ms, screen_brightness_percent)
+     * UI states: 5 states * 1 param each = 5 params
+     * Car wash: 2 params
+     * Buzzer: 9 params
+     * SD Logger: 3 params
+     * I/O Expander: 2 params
+     * Hardware Bus: 4 params
+     * Total: 11 + 14 + 4 + 5 + 12 + 3 + 5 + 2 + 9 + 3 + 2 + 4 = 74 params
      */
-    const uint32_t EXPECTED_PARAMS_V8 = 88;  // Added 5 buzzer beep pattern parameters
-    if (params_found < EXPECTED_PARAMS_V8) {
+    const uint32_t EXPECTED_PARAMS_V6 = 74;
+    if (params_found < EXPECTED_PARAMS_V6) {
         LOG_DEBUG_CONFIG("[CONFIG] Found %lu/%lu parameters - some missing, will use defaults\r\n", 
-                        params_found, EXPECTED_PARAMS_V8);
+                        params_found, EXPECTED_PARAMS_V6);
         config_params_missing = true;
     } else {
         LOG_DEBUG_CONFIG("[CONFIG] All %lu parameters found\r\n", params_found);
@@ -990,7 +1002,7 @@ static Config_Result_t config_write_file(FIL *file)
     
     /* Write header */
     LOG_DEBUG_CONFIG("[CONFIG] Writing header...\r\n");
-    f_puts("# MyWota System Configuration\r\n", file);
+    f_puts("# BigYellow System Configuration\r\n", file);
     f_puts("# Auto-generated - edit with care\r\n", file);
     snprintf(buf, sizeof(buf), "# Version: %d\r\n\r\n", CONFIG_VERSION);
     f_puts(buf, file);
@@ -1012,7 +1024,7 @@ static Config_Result_t config_write_file(FIL *file)
              g_system_config.mifare.auth_key[2], g_system_config.mifare.auth_key[3],
              g_system_config.mifare.auth_key[4], g_system_config.mifare.auth_key[5]);
     f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "mifare.card_init_default_balance_ml=%lu\r\n", g_system_config.mifare.card_init_default_balance_ml);
+    snprintf(buf, sizeof(buf), "mifare.card_init_default_tokens=%lu\r\n", g_system_config.mifare.card_init_default_tokens);
     f_puts(buf, file);
     snprintf(buf, sizeof(buf), "mifare.auto_reinit_on_corruption=%d\r\n", g_system_config.mifare.auto_reinit_on_corruption ? 1 : 0);
     f_puts(buf, file);
@@ -1053,9 +1065,7 @@ static Config_Result_t config_write_file(FIL *file)
     f_puts(buf, file);
     snprintf(buf, sizeof(buf), "ui.bg_grad_stop=%u\r\n", g_system_config.ui.bg_grad_stop);
     f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "ui.title_bar_color=%06lX\r\n", g_system_config.ui.title_bar_color);
-    f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "ui.screen_brightness_percent=%u\r\n\r\n", g_system_config.ui.screen_brightness_percent);
+    snprintf(buf, sizeof(buf), "ui.title_bar_color=%06lX\r\n\r\n", g_system_config.ui.title_bar_color);
     f_puts(buf, file);
     
     /* UI State Configurations */
@@ -1066,7 +1076,27 @@ static Config_Result_t config_write_file(FIL *file)
         snprintf(buf, sizeof(buf), "# UI State: %s\r\n", state_name);
         f_puts(buf, file);
         
-        snprintf(buf, sizeof(buf), "ui.%s.show_customer_id=%d\r\n\r\n", state_name, cfg->show_customer_id ? 1 : 0);
+        snprintf(buf, sizeof(buf), "ui.%s.show_customer_id=%d\r\n", state_name, cfg->show_customer_id ? 1 : 0);
+        f_puts(buf, file);
+        snprintf(buf, sizeof(buf), "ui.%s.image_brightness_active=%u\r\n", state_name, cfg->image_brightness_active);
+        f_puts(buf, file);
+        snprintf(buf, sizeof(buf), "ui.%s.image_brightness_inactive=%u\r\n", state_name, cfg->image_brightness_inactive);
+        f_puts(buf, file);
+        snprintf(buf, sizeof(buf), "ui.%s.ring_opacity_active=%u\r\n", state_name, cfg->ring_opacity_active);
+        f_puts(buf, file);
+        snprintf(buf, sizeof(buf), "ui.%s.ring_opacity_inactive=%u\r\n", state_name, cfg->ring_opacity_inactive);
+        f_puts(buf, file);
+        snprintf(buf, sizeof(buf), "ui.%s.ring_color_vacuum_active=%06lX\r\n", state_name, cfg->ring_color_vacuum_active);
+        f_puts(buf, file);
+        snprintf(buf, sizeof(buf), "ui.%s.ring_color_vacuum_inactive=%06lX\r\n", state_name, cfg->ring_color_vacuum_inactive);
+        f_puts(buf, file);
+        snprintf(buf, sizeof(buf), "ui.%s.ring_color_brush_active=%06lX\r\n", state_name, cfg->ring_color_brush_active);
+        f_puts(buf, file);
+        snprintf(buf, sizeof(buf), "ui.%s.ring_color_brush_inactive=%06lX\r\n", state_name, cfg->ring_color_brush_inactive);
+        f_puts(buf, file);
+        snprintf(buf, sizeof(buf), "ui.%s.ring_color_pressure_active=%06lX\r\n", state_name, cfg->ring_color_pressure_active);
+        f_puts(buf, file);
+        snprintf(buf, sizeof(buf), "ui.%s.ring_color_pressure_inactive=%06lX\r\n\r\n", state_name, cfg->ring_color_pressure_inactive);
         f_puts(buf, file);
     }
     
@@ -1081,62 +1111,39 @@ static Config_Result_t config_write_file(FIL *file)
     snprintf(buf, sizeof(buf), "system.site_id=%s\r\n\r\n", g_system_config.system.site_id);
     f_puts(buf, file);
     
-    /* Dispenser settings */
-    f_puts("# === Dispenser Configuration ===\r\n", file);
-    snprintf(buf, sizeof(buf), "dispenser.dispense_duration_seconds=%lu\r\n", g_system_config.dispenser.dispense_duration_seconds);
+    /* Module enable/disable settings */
+    f_puts("# === Module Enable/Disable ===\r\n", file);
+    snprintf(buf, sizeof(buf), "modules.lcd_display_enabled=%d\r\n", g_system_config.modules.lcd_display_enabled ? 1 : 0);
     f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "dispenser.card_removal_delay_ms=%lu\r\n", g_system_config.dispenser.card_removal_delay_ms);
+    snprintf(buf, sizeof(buf), "modules.mifare_polling_enabled=%d\r\n", g_system_config.modules.mifare_polling_enabled ? 1 : 0);
     f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "dispenser.deduction_interval_ms=%lu\r\n", g_system_config.dispenser.deduction_interval_ms);
+    snprintf(buf, sizeof(buf), "modules.carwash_enabled=%d\r\n", g_system_config.modules.carwash_enabled ? 1 : 0);
     f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "dispenser.card_write_interval_ms=%lu\r\n\r\n", g_system_config.dispenser.card_write_interval_ms);
+    snprintf(buf, sizeof(buf), "modules.buzzer_enabled=%d\r\n", g_system_config.modules.buzzer_enabled ? 1 : 0);
     f_puts(buf, file);
-    
-    /* MIFARE Timing settings (part of MIFARE config) */
-    f_puts("# MIFARE Timing\r\n", file);
-    snprintf(buf, sizeof(buf), "mifare.post_reset_cooldown_ms=%lu\r\n", g_system_config.mifare.post_reset_cooldown_ms);
-    f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "mifare.auto_recovery_enabled=%d\r\n\r\n", g_system_config.mifare.auto_recovery_enabled ? 1 : 0);
+    snprintf(buf, sizeof(buf), "modules.io_expander_enabled=%d\r\n\r\n", g_system_config.modules.io_expander_enabled ? 1 : 0);
     f_puts(buf, file);
     
-    /* I/O Expander settings */
-    f_puts("# === I/O Expander Configuration ===\r\n", file);
-    snprintf(buf, sizeof(buf), "io_expander.poll_rate_ms=%lu\r\n", g_system_config.io_expander.poll_rate_ms);
+    /* Additional UI infrastructure settings */
+    f_puts("# === UI Infrastructure ===\r\n", file);
+    snprintf(buf, sizeof(buf), "ui.lvgl_task_period_ms=%lu\r\n", g_system_config.ui.lvgl_task_period_ms);
     f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "io_expander.button_debounce_count=%u\r\n\r\n", g_system_config.io_expander.button_debounce_count);
+    snprintf(buf, sizeof(buf), "ui.lcd_reset_delay_ms=%lu\r\n", g_system_config.ui.lcd_reset_delay_ms);
     f_puts(buf, file);
-    
-    /* RS485 settings */
-    f_puts("# === RS485 Communication Configuration ===\r\n", file);
-    snprintf(buf, sizeof(buf), "rs485.slave_address=%u\r\n", g_system_config.rs485.slave_address);
-    f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "rs485.baudrate=%lu\r\n", g_system_config.rs485.baudrate);
-    f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "rs485.frame_timeout_ms=%lu\r\n", g_system_config.rs485.frame_timeout_ms);
-    f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "rs485.fw_update_timeout_ms=%lu\r\n\r\n", g_system_config.rs485.fw_update_timeout_ms);
+    snprintf(buf, sizeof(buf), "ui.screen_brightness_percent=%u\r\n\r\n", g_system_config.ui.screen_brightness_percent);
     f_puts(buf, file);
     
-    /* Hardware Bus settings */
-    f_puts("# === Hardware Bus Configuration ===\r\n", file);
-    snprintf(buf, sizeof(buf), "hardware_bus.spi0_baudrate=%lu\r\n", g_system_config.hardware_bus.spi0_baudrate);
+    /* Car wash settings */
+    f_puts("# === Car Wash Configuration ===\r\n", file);
+    snprintf(buf, sizeof(buf), "carwash.wash_duration_seconds=%lu\r\n", g_system_config.carwash.wash_duration_seconds);
     f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "hardware_bus.i2c0_baudrate=%lu\r\n", g_system_config.hardware_bus.i2c0_baudrate);
+    snprintf(buf, sizeof(buf), "carwash.card_removal_delay_ms=%lu\r\n", g_system_config.carwash.card_removal_delay_ms);
     f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "hardware_bus.i2c1_baudrate=%lu\r\n", g_system_config.hardware_bus.i2c1_baudrate);
+    snprintf(buf, sizeof(buf), "carwash.loyalty_enabled=%d\r\n", g_system_config.carwash.loyalty_enabled ? 1 : 0);
     f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "hardware_bus.i2c_timeout_us=%lu\r\n\r\n", g_system_config.hardware_bus.i2c_timeout_us);
+    snprintf(buf, sizeof(buf), "carwash.loyalty_threshold=%lu\r\n", g_system_config.carwash.loyalty_threshold);
     f_puts(buf, file);
-    
-    /* Flow Sensor settings */
-    f_puts("# === Flow Sensor Configuration ===\r\n", file);
-    snprintf(buf, sizeof(buf), "flow_sensor.pulses_per_liter=%u\r\n", g_system_config.flow_sensor.pulses_per_liter);
-    f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "flow_sensor.calculation_period_ms=%lu\r\n", g_system_config.flow_sensor.calculation_period_ms);
-    f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "flow_sensor.pulse_timeout_ms=%lu\r\n", g_system_config.flow_sensor.pulse_timeout_ms);
-    f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "flow_sensor.debounce_time_us=%u\r\n\r\n", g_system_config.flow_sensor.debounce_time_us);
+    snprintf(buf, sizeof(buf), "carwash.loyalty_reward=%lu\r\n\r\n", g_system_config.carwash.loyalty_reward);
     f_puts(buf, file);
     
     /* Buzzer settings */
@@ -1169,100 +1176,23 @@ static Config_Result_t config_write_file(FIL *file)
     snprintf(buf, sizeof(buf), "sd_logger.max_retry_count=%u\r\n\r\n", g_system_config.sd_logger.max_retry_count);
     f_puts(buf, file);
     
-    /* RTC settings */
-    f_puts("# === RTC Configuration ===\r\n", file);
-    snprintf(buf, sizeof(buf), "rtc.save_interval_ms=%lu\r\n\r\n", g_system_config.rtc.save_interval_ms);
+    /* I/O Expander settings */
+    f_puts("# === I/O Expander Configuration ===\r\n", file);
+    snprintf(buf, sizeof(buf), "io_expander.poll_rate_ms=%lu\r\n", g_system_config.io_expander.poll_rate_ms);
+    f_puts(buf, file);
+    snprintf(buf, sizeof(buf), "io_expander.button_debounce_count=%u\r\n\r\n", g_system_config.io_expander.button_debounce_count);
     f_puts(buf, file);
     
-    /* UI Timing settings (part of UI config) */
-    f_puts("# UI Timing\r\n", file);
-    snprintf(buf, sizeof(buf), "ui.lvgl_task_period_ms=%lu\r\n", g_system_config.ui.lvgl_task_period_ms);
+    /* Hardware Bus settings */
+    f_puts("# === Hardware Bus Configuration ===\r\n", file);
+    snprintf(buf, sizeof(buf), "hardware_bus.spi0_baudrate=%lu\r\n", g_system_config.hardware_bus.spi0_baudrate);
     f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "ui.lcd_reset_delay_ms=%lu\r\n\r\n", g_system_config.ui.lcd_reset_delay_ms);
+    snprintf(buf, sizeof(buf), "hardware_bus.i2c0_baudrate=%lu\r\n", g_system_config.hardware_bus.i2c0_baudrate);
     f_puts(buf, file);
-    
-    /* Module enable settings */
-    f_puts("# === Module Enable Configuration ===\r\n", file);
-    f_puts("# Set to 0 to disable module at boot, 1 to enable\r\n", file);
-    f_puts("# Modules can be started/stopped at runtime via USB commands\r\n", file);
-    snprintf(buf, sizeof(buf), "modules.lcd_display_enabled=%d\r\n", g_system_config.modules.lcd_display_enabled ? 1 : 0);
+    snprintf(buf, sizeof(buf), "hardware_bus.i2c1_baudrate=%lu\r\n", g_system_config.hardware_bus.i2c1_baudrate);
     f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "modules.mifare_polling_enabled=%d\r\n", g_system_config.modules.mifare_polling_enabled ? 1 : 0);
+    snprintf(buf, sizeof(buf), "hardware_bus.i2c_timeout_us=%lu\r\n\r\n", g_system_config.hardware_bus.i2c_timeout_us);
     f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "modules.dispenser_enabled=%d\r\n", g_system_config.modules.dispenser_enabled ? 1 : 0);
-    f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "modules.buzzer_enabled=%d\r\n", g_system_config.modules.buzzer_enabled ? 1 : 0);
-    f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "modules.io_expander_enabled=%d\r\n", g_system_config.modules.io_expander_enabled ? 1 : 0);
-    f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "modules.rs485_enabled=%d\r\n\r\n", g_system_config.modules.rs485_enabled ? 1 : 0);
-    f_puts(buf, file);
-    
-    /* Feed watchdog before security section */
-    watchdog_update();
-    
-    /* MIFARE Security settings */
-    f_puts("# === MIFARE Security Configuration ===\r\n", file);
-    snprintf(buf, sizeof(buf), "mifare.security.encryption_enabled=%d\r\n", g_system_config.mifare.security.encryption_enabled ? 1 : 0);
-    f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "mifare.security.pbkdf2_iterations=%lu\r\n", g_system_config.mifare.security.pbkdf2_iterations);
-    f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "mifare.security.use_custom_sector_keys=%d\r\n", g_system_config.mifare.security.use_custom_sector_keys ? 1 : 0);
-    f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "mifare.security.enable_hmac_auth=%d\r\n", g_system_config.mifare.security.enable_hmac_auth ? 1 : 0);
-    f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "mifare.security.enable_replay_protection=%d\r\n", g_system_config.mifare.security.enable_replay_protection ? 1 : 0);
-    f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "mifare.security.enable_challenge_response=%d\r\n", g_system_config.mifare.security.enable_challenge_response ? 1 : 0);
-    f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "mifare.security.max_timestamp_drift_sec=%lu\r\n", g_system_config.mifare.security.max_timestamp_drift_sec);
-    f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "mifare.security.failed_challenge_lockout=%u\r\n", g_system_config.mifare.security.failed_challenge_lockout);
-    f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "mifare.security.encrypt_user_data=%d\r\n", g_system_config.mifare.security.encrypt_user_data ? 1 : 0);
-    f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "mifare.security.encrypt_transactions=%d\r\n", g_system_config.mifare.security.encrypt_transactions ? 1 : 0);
-    f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "mifare.security.encrypt_token_cache=%d\r\n", g_system_config.mifare.security.encrypt_token_cache ? 1 : 0);
-    f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "mifare.security.encrypt_account_data=%d\r\n\r\n", g_system_config.mifare.security.encrypt_account_data ? 1 : 0);
-    f_puts(buf, file);
-    
-    /* Security keys (hex format) */
-    f_puts("# Security Keys (32 bytes hex, no 0x prefix)\r\n", file);
-    f_puts("mifare.security.master_key=", file);
-    for (int i = 0; i < 32; i++) {
-        snprintf(buf, sizeof(buf), "%02X", g_system_config.mifare.security.master_key[i]);
-        f_puts(buf, file);
-    }
-    f_puts("\r\n", file);
-    
-    f_puts("mifare.security.hmac_key=", file);
-    for (int i = 0; i < 32; i++) {
-        snprintf(buf, sizeof(buf), "%02X", g_system_config.mifare.security.hmac_key[i]);
-        f_puts(buf, file);
-    }
-    f_puts("\r\n\r\n", file);
-    
-    /* Custom sector keys (if enabled) */
-    if (g_system_config.mifare.security.use_custom_sector_keys) {
-        f_puts("# Custom Sector Keys (6 bytes hex each)\r\n", file);
-        for (int s = 0; s < 4; s++) {
-            snprintf(buf, sizeof(buf), "mifare.security.sector_key_%d_a=%02X%02X%02X%02X%02X%02X\r\n",
-                     s + 1,
-                     g_system_config.mifare.security.sector_keys_a[s][0], g_system_config.mifare.security.sector_keys_a[s][1],
-                     g_system_config.mifare.security.sector_keys_a[s][2], g_system_config.mifare.security.sector_keys_a[s][3],
-                     g_system_config.mifare.security.sector_keys_a[s][4], g_system_config.mifare.security.sector_keys_a[s][5]);
-            f_puts(buf, file);
-            snprintf(buf, sizeof(buf), "mifare.security.sector_key_%d_b=%02X%02X%02X%02X%02X%02X\r\n",
-                     s + 1,
-                     g_system_config.mifare.security.sector_keys_b[s][0], g_system_config.mifare.security.sector_keys_b[s][1],
-                     g_system_config.mifare.security.sector_keys_b[s][2], g_system_config.mifare.security.sector_keys_b[s][3],
-                     g_system_config.mifare.security.sector_keys_b[s][4], g_system_config.mifare.security.sector_keys_b[s][5]);
-            f_puts(buf, file);
-        }
-        f_puts("\r\n", file);
-    }
     
     /* Write footer with CRC */
     snprintf(buf, sizeof(buf), "# CRC32: 0x%08lX\r\n", g_system_config.crc32);
@@ -1590,7 +1520,7 @@ void Config_PrintToUSB(void)
     USB_Log_Printf("mifare.auth_key=%02X%02X%02X%02X%02X%02X\r\n",
                   cfg->mifare.auth_key[0], cfg->mifare.auth_key[1], cfg->mifare.auth_key[2],
                   cfg->mifare.auth_key[3], cfg->mifare.auth_key[4], cfg->mifare.auth_key[5]);
-    USB_Log_Printf("mifare.card_init_default_balance_ml=%lu\r\n", cfg->mifare.card_init_default_balance_ml);
+    USB_Log_Printf("mifare.card_init_default_tokens=%lu\r\n", cfg->mifare.card_init_default_tokens);
     USB_Log_Printf("mifare.auto_reinit_on_corruption=%u\r\n", cfg->mifare.auto_reinit_on_corruption ? 1 : 0);
     USB_Log_Printf("mifare.card_init_phone_number=%s\r\n", cfg->mifare.card_init_phone_number);
     USB_Log_Printf("mifare.card_init_validity=%u\r\n", cfg->mifare.card_init_validity);
@@ -1623,6 +1553,16 @@ void Config_PrintToUSB(void)
         USB_Log_Printf("\r\n");
         USB_Log_Printf("  [UI State: %s]\r\n", state_name);
         USB_Log_Printf("  ui.%s.show_customer_id=%u\r\n", state_name, state_cfg->show_customer_id ? 1 : 0);
+        USB_Log_Printf("  ui.%s.image_brightness_active=%u\r\n", state_name, state_cfg->image_brightness_active);
+        USB_Log_Printf("  ui.%s.image_brightness_inactive=%u\r\n", state_name, state_cfg->image_brightness_inactive);
+        USB_Log_Printf("  ui.%s.ring_opacity_active=%u\r\n", state_name, state_cfg->ring_opacity_active);
+        USB_Log_Printf("  ui.%s.ring_opacity_inactive=%u\r\n", state_name, state_cfg->ring_opacity_inactive);
+        USB_Log_Printf("  ui.%s.ring_color_vacuum_active=%06lX\r\n", state_name, state_cfg->ring_color_vacuum_active);
+        USB_Log_Printf("  ui.%s.ring_color_vacuum_inactive=%06lX\r\n", state_name, state_cfg->ring_color_vacuum_inactive);
+        USB_Log_Printf("  ui.%s.ring_color_brush_active=%06lX\r\n", state_name, state_cfg->ring_color_brush_active);
+        USB_Log_Printf("  ui.%s.ring_color_brush_inactive=%06lX\r\n", state_name, state_cfg->ring_color_brush_inactive);
+        USB_Log_Printf("  ui.%s.ring_color_pressure_active=%06lX\r\n", state_name, state_cfg->ring_color_pressure_active);
+        USB_Log_Printf("  ui.%s.ring_color_pressure_inactive=%06lX\r\n", state_name, state_cfg->ring_color_pressure_inactive);
     }
     
     USB_Log_Printf("\r\n--- System Configuration ---\r\n");
@@ -1631,17 +1571,21 @@ void Config_PrintToUSB(void)
     USB_Log_Printf("system.device_id=%s\r\n", cfg->system.device_id);
     USB_Log_Printf("system.site_id=%s\r\n", cfg->system.site_id);
     
-    USB_Log_Printf("\r\n--- Dispenser Configuration ---\r\n");
-    USB_Log_Printf("dispenser.dispense_duration_seconds=%lu\r\n", cfg->dispenser.dispense_duration_seconds);
-    USB_Log_Printf("dispenser.card_removal_delay_ms=%lu\r\n", cfg->dispenser.card_removal_delay_ms);
-    
-    USB_Log_Printf("\r\n--- Module Enable Configuration ---\r\n");
+    USB_Log_Printf("\r\n--- Module Enable/Disable ---\r\n");
     USB_Log_Printf("modules.lcd_display_enabled=%u\r\n", cfg->modules.lcd_display_enabled ? 1 : 0);
     USB_Log_Printf("modules.mifare_polling_enabled=%u\r\n", cfg->modules.mifare_polling_enabled ? 1 : 0);
-    USB_Log_Printf("modules.dispenser_enabled=%u\r\n", cfg->modules.dispenser_enabled ? 1 : 0);
+    USB_Log_Printf("modules.carwash_enabled=%u\r\n", cfg->modules.carwash_enabled ? 1 : 0);
     USB_Log_Printf("modules.buzzer_enabled=%u\r\n", cfg->modules.buzzer_enabled ? 1 : 0);
     USB_Log_Printf("modules.io_expander_enabled=%u\r\n", cfg->modules.io_expander_enabled ? 1 : 0);
-    USB_Log_Printf("modules.rs485_enabled=%u\r\n", cfg->modules.rs485_enabled ? 1 : 0);
+    
+    USB_Log_Printf("\r\n--- UI Infrastructure ---\r\n");
+    USB_Log_Printf("ui.lvgl_task_period_ms=%lu\r\n", cfg->ui.lvgl_task_period_ms);
+    USB_Log_Printf("ui.lcd_reset_delay_ms=%lu\r\n", cfg->ui.lcd_reset_delay_ms);
+    USB_Log_Printf("ui.screen_brightness_percent=%u\r\n", cfg->ui.screen_brightness_percent);
+    
+    USB_Log_Printf("\r\n--- Car Wash Configuration ---\r\n");
+    USB_Log_Printf("carwash.wash_duration_seconds=%lu\r\n", cfg->carwash.wash_duration_seconds);
+    USB_Log_Printf("carwash.card_removal_delay_ms=%lu\r\n", cfg->carwash.card_removal_delay_ms);
     
     USB_Log_Printf("\r\n--- Buzzer Configuration ---\r\n");
     USB_Log_Printf("buzzer.enabled=%u\r\n", cfg->buzzer.enabled ? 1 : 0);
@@ -1653,6 +1597,21 @@ void Config_PrintToUSB(void)
     USB_Log_Printf("buzzer.removal_pattern_off_ms=%u\r\n", cfg->buzzer.removal_pattern_off_ms);
     USB_Log_Printf("buzzer.removal_pattern_count=%u\r\n", cfg->buzzer.removal_pattern_count);
     USB_Log_Printf("buzzer.removal_pattern_repeat_ms=%u\r\n", cfg->buzzer.removal_pattern_repeat_ms);
+    
+    USB_Log_Printf("\r\n--- SD Logger Configuration ---\r\n");
+    USB_Log_Printf("sd_logger.init_retry_delay_ms=%lu\r\n", cfg->sd_logger.init_retry_delay_ms);
+    USB_Log_Printf("sd_logger.mount_retry_delay_ms=%lu\r\n", cfg->sd_logger.mount_retry_delay_ms);
+    USB_Log_Printf("sd_logger.max_retry_count=%u\r\n", cfg->sd_logger.max_retry_count);
+    
+    USB_Log_Printf("\r\n--- I/O Expander Configuration ---\r\n");
+    USB_Log_Printf("io_expander.poll_rate_ms=%lu\r\n", cfg->io_expander.poll_rate_ms);
+    USB_Log_Printf("io_expander.button_debounce_count=%u\r\n", cfg->io_expander.button_debounce_count);
+    
+    USB_Log_Printf("\r\n--- Hardware Bus Configuration ---\r\n");
+    USB_Log_Printf("hardware_bus.spi0_baudrate=%lu\r\n", cfg->hardware_bus.spi0_baudrate);
+    USB_Log_Printf("hardware_bus.i2c0_baudrate=%lu\r\n", cfg->hardware_bus.i2c0_baudrate);
+    USB_Log_Printf("hardware_bus.i2c1_baudrate=%lu\r\n", cfg->hardware_bus.i2c1_baudrate);
+    USB_Log_Printf("hardware_bus.i2c_timeout_us=%lu\r\n", cfg->hardware_bus.i2c_timeout_us);
     
     USB_Log_Printf("\r\n--- MIFARE Security Configuration ---\r\n");
     USB_Log_Printf("mifare.security.encryption_enabled=%u\r\n", cfg->mifare.security.encryption_enabled ? 1 : 0);
@@ -1680,26 +1639,34 @@ void Config_PrintToUSB(void)
 
 /**
  * @brief Reset cryptographic keys to factory defaults
- * @return Config_Result_t Result of operation
+ * @return Config_Result_t Result of reset operation
  */
 Config_Result_t Config_ResetKeysToFactory(void)
 {
-    /* Reset all security keys to factory defaults */
-    g_system_config.mifare.security.encryption_enabled = 0;
-    g_system_config.mifare.security.use_custom_sector_keys = 0;
+    // Reset master key to default pattern
+    for (int i = 0; i < 32; i++) {
+        g_system_config.mifare.security.master_key[i] = (uint8_t)(0xA5 + i);
+    }
     
-    /* Zero out master and HMAC keys */
-    memset(g_system_config.mifare.security.master_key, 0x00, 32);
-    memset(g_system_config.mifare.security.hmac_key, 0x00, 32);
+    // Reset HMAC key to default pattern
+    for (int i = 0; i < 32; i++) {
+        g_system_config.mifare.security.hmac_key[i] = (uint8_t)(0x5A + i);
+    }
     
-    /* Reset all sector keys to factory default (0xFF) */
+    // Reset sector keys to factory defaults (0xFF...)
     for (int i = 0; i < 4; i++) {
         memset(g_system_config.mifare.security.sector_keys_a[i], 0xFF, 6);
         memset(g_system_config.mifare.security.sector_keys_b[i], 0xFF, 6);
     }
     
-    /* Update CRC */
+    // Recalculate CRC
     g_system_config.crc32 = Config_CalculateCRC32(&g_system_config);
+    
+    // Save to both SD and flash
+    Config_SaveToSD();
+    Config_SaveToFlash();
+    
+    LOG_CRITICAL_CONFIG("[CONFIG] Cryptographic keys reset to factory defaults\r\n");
     
     return CONFIG_OK;
 }

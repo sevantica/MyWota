@@ -19,210 +19,208 @@
 #include "Application_Interface.h"
 
 /*Defines ------------------------------------------------------------*/
-#define DISPENSE_BAY_CONTROL_PIN            15      // GPIO pin for dispense bay control (from Hardware_Access.h)
-#define DISPENSE_DURATION_SECONDS           (20 * 60)  // 20 minutes in seconds
+#define WASH_BAY_CONTROL_PIN            15      // GPIO pin for wash bay control (from Hardware_Access.h)
+#define WASH_DURATION_SECONDS           (20 * 60)  // 20 minutes in seconds
 
-/* Water dispenser uses a single valve - no option buttons needed */
+/* Wash Option Button Input Pins (from IO Expander) */
+#define WASH_BUTTON_VACUUM_CLEANER      0       // IO0_0 - Active LOW
+#define WASH_BUTTON_WASH_BRUSH          1       // IO0_1 - Active LOW
+#define WASH_BUTTON_PRESSURE_WASHER     2       // IO0_2 - Active LOW
+
+/* Wash Option Output Control Pins (from IO Expander) */
+#define WASH_OUTPUT_VACUUM_CLEANER      9       // IO1_1 - Relay sense 1
+#define WASH_OUTPUT_WASH_BRUSH          10      // IO1_2 - Relay sense 2
+#define WASH_OUTPUT_PRESSURE_WASHER     14      // IO1_6 - Repurposed Spare Input 1
 
 /*Typedefs -----------------------------------------------------------*/
 
 /**
- * @brief Valve state for water dispenser
+ * @brief Wash option types
  */
 typedef enum {
-    VALVE_CLOSED = 0,
-    VALVE_OPEN
-} ValveState_t;
+    WASH_OPTION_NONE = 0,
+    WASH_OPTION_VACUUM_CLEANER,
+    WASH_OPTION_WASH_BRUSH,
+    WASH_OPTION_PRESSURE_WASHER
+} WashOption_t;
 
 /**
- * @brief Dispense timer state structure (managed by Dispenser Integration layer)
+ * @brief Wash timer state structure (managed by CarWash Integration layer)
  * This is NOT stored on the card - it's runtime state only
- * 
- * NEW BEHAVIOR: Card must remain present during dispense
- * - Dispense auto-starts when card is scanned (if balance > 0)
- * - Time is deducted continuously from card while dispensing
- * - Dispense stops immediately when card is removed
  */
 typedef struct {
-    uint32_t dispense_start_time;          // System tick when dispense started (0 = no active dispense)
-    uint32_t last_deduction_time;      // System tick of last balance deduction
-    bool dispense_active;                  // true if dispense in progress
-    uint8_t dispense_bay_id;               // Which dispense bay is in use
-    ValveState_t valve_state;              // Current valve state (open/closed)
-    uint32_t balance_deducted_ml;      // Total ml deducted this session (for logging)
-} Dispenser_TimerState_t;
+    uint32_t wash_start_time;          // System tick when wash started (0 = no active wash)
+    uint32_t wash_duration_seconds;    // Configured wash duration (default 1200 = 20 minutes)
+    bool wash_active;                  // true if wash in progress
+    uint32_t tokens_used_this_session; // Tokens consumed in current session
+    uint8_t wash_bay_id;               // Which wash bay is in use
+    bool auto_start_triggered;         // Prevents multiple auto-starts for same card
+    WashOption_t selected_option;      // Selected wash option (vacuum/brush/pressure)
+    uint32_t card_ready_time;          // System tick when card became ready (for 1s delay)
+    uint32_t card_removed_time;        // System tick when card was removed (for 1s wash start delay)
+    bool token_deducted;               // Token has been deducted, waiting for removal
+} CarWash_TimerState_t;
 
 /**
- * @brief Dispenser state machine states
+ * @brief Car wash state machine states
  */
 typedef enum {
-    DISPENSER_IDLE,                            /* No card present */
-    DISPENSER_DISPENSE_IN_PROGRESS,            /* Card present and dispensing (deducting time) */
-    DISPENSER_WAITING_FOR_REMOVAL              /* Dispense stopped, waiting for card to be removed */
-} DispenserState_t;
+    CARWASH_IDLE,
+    CARWASH_CARD_READY,
+    CARWASH_TOKEN_DEDUCTED_WAITING_REMOVAL,  /* Token deducted, waiting for card removal */
+    CARWASH_WAITING_TO_START,                /* Card removed, waiting 1s before starting wash */
+    CARWASH_WASH_IN_PROGRESS
+} CarWashState_t;
 
 /**
- * @brief Dispenser operation results
+ * @brief Car wash operation results
  */
 typedef enum {
-    DISPENSER_RESULT_OK = 0,
-    DISPENSER_RESULT_ERROR,
-    DISPENSER_RESULT_NO_CARD,
-    DISPENSER_RESULT_CARD_NOT_READY,
-    DISPENSER_RESULT_INSUFFICIENT_BALANCE,
-    DISPENSER_RESULT_BUSY,
-    DISPENSER_RESULT_CARD_ERROR,
-    DISPENSER_RESULT_CARD_REMOVED,
-    DISPENSER_RESULT_TIMER_ERROR,
-    DISPENSER_RESULT_COMPLETE,
-    DISPENSER_RESULT_TIMER_EXPIRED
-} DispenserResult_t;
+    CARWASH_RESULT_OK = 0,
+    CARWASH_RESULT_ERROR,
+    CARWASH_RESULT_NO_CARD,
+    CARWASH_RESULT_CARD_NOT_READY,
+    CARWASH_RESULT_INSUFFICIENT_TOKENS,
+    CARWASH_RESULT_BUSY,
+    CARWASH_RESULT_CARD_ERROR,
+    CARWASH_RESULT_CARD_REMOVED,
+    CARWASH_RESULT_TIMER_ERROR,
+    CARWASH_RESULT_COMPLETE,
+    CARWASH_RESULT_TIMER_EXPIRED
+} CarWashResult_t;
 
 /**
- * @brief Dispenser status structure
+ * @brief Car wash status structure
  */
 typedef struct {
-    uint8_t state;                      // Current dispense state
-    bool dispense_active;               // Dispense in progress
-    uint32_t remaining_ml;              // Water remaining on card in milliliters
+    uint8_t state;                      // Current wash state
+    bool wash_active;                   // Wash in progress
+    uint32_t remaining_seconds;         // Time remaining in current wash
     bool card_present;                  // Card presence status
-    uint32_t balance_ml;                // Card balance in milliliters
-    uint8_t dispense_bay_id;            // Which dispense bay is in use
-    uint32_t elapsed_ms;                // Time elapsed since dispense started (this session)
-    ValveState_t valve_state;           // Current valve state
-} DispenserStatus_t;
-
+    uint32_t token_count;               // Card token count
+    uint8_t wash_bay_id;                // Which wash bay is in use
+    uint32_t elapsed_seconds;           // Time elapsed since wash started
+    WashOption_t selected_option;       // Selected wash option
+} CarWashStatus_t;
 
 /*Function Prototypes ------------------------------------------------*/
 
 /**
- * @brief Initialize the dispenser integration system
- * @return DispenserResult_t Initialization result
+ * @brief Initialize the car wash integration system
+ * @return CarWashResult_t Initialization result
  */
-DispenserResult_t MIFARE_Dispenser_Init(void);
+CarWashResult_t MIFARE_CarWash_Init(void);
 
 /**
- * @brief Request dispense (scans card, deducts token, starts timer)
- * @return DispenserResult_t Request result
+ * @brief Request car wash (scans card, deducts token, starts timer)
+ * @return CarWashResult_t Request result
  * @note This function polls MIFARE_Transaction_Manager for card data,
- *       modifies token count, and manages the dispense timer
+ *       modifies token count, and manages the wash timer
  */
-DispenserResult_t MIFARE_Dispenser_StartDispense(void);
+CarWashResult_t MIFARE_CarWash_StartWash(void);
 
 /**
- * @brief Get current dispense status
+ * @brief Get current wash status
  * @param status Pointer to status structure
- * @return DispenserResult_t Query result
+ * @return CarWashResult_t Query result
  */
-DispenserResult_t MIFARE_Dispenser_GetStatus(DispenserStatus_t *status);
+CarWashResult_t MIFARE_CarWash_GetStatus(CarWashStatus_t *status);
 
 /**
- * @brief Emergency stop dispense
- * @return DispenserResult_t Stop result
+ * @brief Emergency stop wash
+ * @return CarWashResult_t Stop result
  */
-DispenserResult_t MIFARE_Dispenser_EmergencyStop(void);
+CarWashResult_t MIFARE_CarWash_EmergencyStop(void);
 
 /**
- * @brief Check if dispense is currently active
- * @return bool true if dispense in progress
+ * @brief Check if wash is currently active
+ * @return bool true if wash in progress
  */
-bool MIFARE_Dispenser_IsDispenseActive(void);
+bool MIFARE_CarWash_IsWashActive(void);
 
 /**
- * @brief Initialize a new customer card with specified balance
- * @param initial_balance_ml Initial water volume in milliliters
+ * @brief Initialize a new customer card with specified tokens
+ * @param initial_tokens Initial number of tokens to add to the card
  * @param customer_id Unique customer identifier (0 to auto-generate from card serial)
- * @return DispenserResult_t Operation result
+ * @return CarWashResult_t Operation result
  * @note This polls transaction manager, modifies user data, and writes to card
  */
-DispenserResult_t MIFARE_Dispenser_InitializeNewCustomer(uint32_t initial_balance_ml, uint64_t customer_id);
+CarWashResult_t MIFARE_CarWash_InitializeNewCustomer(uint32_t initial_tokens, uint64_t customer_id);
 
 /**
- * @brief Add water volume to an existing customer card (top-up)
- * @param topup_ml Number of milliliters of water to add
- * @return DispenserResult_t Operation result
- * @note This polls transaction manager, increments balance, and writes to card
+ * @brief Add tokens to an existing customer card (top-up)
+ * @param topup_tokens Number of tokens to add to the card
+ * @return CarWashResult_t Operation result
+ * @note This polls transaction manager, increments token count, and writes to card
  */
-DispenserResult_t MIFARE_Dispenser_TopupCard(uint32_t topup_ml);
+CarWashResult_t MIFARE_CarWash_TopupCard(uint32_t topup_tokens);
 
 /**
- * @brief Dispenser polling task - manages dispense timer and card updates
+ * @brief Car wash polling task - manages wash timer and card updates
  * @note This task polls MIFARE_Transaction_Manager for card data,
- *       manages the 20-minute dispense timer, and updates the card
+ *       manages the 20-minute wash timer, and updates the card
  */
-void MIFARE_Dispenser_Task(void* argument);
+void MIFARE_CarWash_Task(void* argument);
 
 /**
- * @brief Start the dispenser polling task
+ * @brief Start the car wash polling task
  */
-void Task_Start_Dispenser_Task(void);
-
-/**
- * @brief Stop the dispenser polling task
- */
-void Task_Stop_Dispenser_Task(void);
+void Task_Start_CarWash_Task(void);
 
 /* UI Helper Functions - Business logic layer exposes these for UI to poll */
-uint32_t Dispenser_GetBalanceMl(void);            // Get current balance in milliliters from card
-uint32_t Dispenser_GetDispenseVolumeRemainingMl(void);  // Get remaining dispense volume in milliliters (same as balance when dispensing)
-bool Dispenser_IsDispenseActive(void);            // Returns true if dispense is active
-uint32_t Dispenser_GetDispensedAmountML(void);    // Get amount dispensed in current session (ml)
-uint32_t Dispenser_GetTotalDispensesCompleted(void); // Lifetime dispenses
-uint32_t Dispenser_GetTotalVolumePurchasedMl(void); // Lifetime volume purchased in ml
-ValveState_t Dispenser_GetValveState(void);       // Get current valve state (OPEN/CLOSED)
-float Dispenser_GetFlowRateLPM(void);             // Get current flow rate in liters per minute
+uint32_t CarWash_GetTokenCount(void);           // Get current token count from card
+uint32_t CarWash_GetWashTimeRemaining(void);    // Get remaining wash time in seconds
+bool CarWash_IsWashActive(void);                // Returns true if wash is active
+uint32_t CarWash_GetTotalWashesCompleted(void); // Lifetime washes
+uint32_t CarWash_GetTotalTokensPurchased(void); // Lifetime tokens purchased
+WashOption_t CarWash_GetSelectedOption(void);   // Get currently selected wash option
+
+/* Compatibility stub for shared Buzzer_Driver */
+uint32_t Dispenser_GetDispensedAmountML(void);  // Stub - car wash doesn't dispense water
 
 /**
- * @brief Manually start dispense without card (for testing/debugging)
- * @param duration_ml Dispense volume allowance in milliliters (0 = use 20 liters)
- * @return DispenserResult_t Operation result
+ * @brief Manually start wash without card (for testing/debugging)
+ * @param option Wash option to activate (or WASH_OPTION_NONE to auto-select)
+ * @param duration_seconds Wash duration in seconds (0 = use default)
+ * @return CarWashResult_t Operation result
  */
-DispenserResult_t MIFARE_Dispenser_ManualStart(uint32_t duration_ml);
+CarWashResult_t MIFARE_CarWash_ManualStart(WashOption_t option, uint32_t duration_seconds);
 
 /**
- * @brief Wait for card validation and dispense up to specified limit
- * @param max_volume_ml Maximum volume to dispense in milliliters
- * @return DispenserResult_t Operation result
- * @note Waits for card to be scanned and validated, then opens valve and dispenses
- *       like normal card operation but stops at max_volume_ml limit.
+ * @brief Manually stop wash (alias for EmergencyStop)
+ * @return CarWashResult_t Operation result
  */
-DispenserResult_t MIFARE_Dispenser_WaitAndDispense(uint32_t max_volume_ml);
-
-/**
- * @brief Manually stop dispense (alias for EmergencyStop)
- * @return DispenserResult_t Operation result
- */
-DispenserResult_t MIFARE_Dispenser_ManualStop(void);
+CarWashResult_t MIFARE_CarWash_ManualStop(void);
 
 /**
  * @brief Update UI with current card token count
  * @details Updates the cardRemaining UI element with the current token count
  */
-void MIFARE_Dispenser_UpdateUI(void);
+void MIFARE_CarWash_UpdateUI(void);
 
 /**
  * @brief Reset test mode tokens to 10 (for testing)
  * @details Available only when TEST_MODE_ENABLED is defined
  */
-void MIFARE_Dispenser_ResetTestMode(void);
+void MIFARE_CarWash_ResetTestMode(void);
 
 /**
  * @brief Get test mode status (for debugging)
  * @details Available only when TEST_MODE_ENABLED is defined
  */
-void MIFARE_Dispenser_GetTestModeStatus(void);
+void MIFARE_CarWash_GetTestModeStatus(void);
 
 /**
- * @brief Get the application interface for dispenser
- * @return Pointer to the dispenser application instance
+ * @brief Get the application interface for car wash
+ * @return Pointer to the car wash application instance
  */
-const Application_Instance_t* Dispenser_GetApplicationInterface(void);
+const Application_Instance_t* CarWash_GetApplicationInterface(void);
 
 /**
- * @brief Convert DispenserResult_t to Application_Result_t
- * @param result Dispenser result
+ * @brief Convert CarWashResult_t to Application_Result_t
+ * @param result Car wash result
  * @return Equivalent application result
  */
-Application_Result_t Dispenser_ConvertResult(DispenserResult_t result);
+Application_Result_t CarWash_ConvertResult(CarWashResult_t result);
 
 #endif /* APPLICATION_INCLUDE_DISPENSER_CONTROLLER_H_ */

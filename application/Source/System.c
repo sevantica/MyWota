@@ -23,8 +23,8 @@
 #include "task.h"
 #include "queue.h"
 #include "semphr.h"
-#include "Task_Heartbeat.h"
-#include "task_stack_config.h"
+#include "Heartbeat_Task.h"
+#include "Task_Stack_Config.h"
 #include "USB_CDC_Task.h"
 #include "USB_Logging.h"
 #include "USB_Command_Handler.h"
@@ -34,16 +34,24 @@
 /* Private includes ----------------------------------------------------------*/
 #include "System.h"
 #include "System_Config.h"
+#include "Firmware_Version.h"
 #include "PN532_Driver.h"
-#include "MIFARE_Transaction_Manager.h"
+#include "MIFARE_Volume_Adapter.h"  // Token adapter in this project
+#include "MIFARE_Transaction_Core.h"  // Core for task management functions
 #include "Dispenser_Controller.h"
 #include "Hardware_Access.h"
 #include "IO_Expander_Control.h"
 #include "CAT9555_Driver.h"
 #include "Buzzer_Driver.h"
 #include "SD_Logger_Task.h"
+#include "SD_Logger_Format_Adapter.h"
 #include "RTC_Task.h"
+#include "RTC_Persistence_Adapter.h"
 #include "RS485_Task.h"
+#include "RS485_Command_Adapter.h"
+#include "MyWota_Hardware_Adapter.h"
+#include "MyWota_Config_Adapter.h"
+#include "MyWota_IO_Expander_Adapter.h"
 #include "Log_Strings.h"
 #include "hardware/watchdog.h"
 #include <stdio.h>
@@ -85,7 +93,7 @@ typedef enum {
     TASK_ID_USB_CDC,
     TASK_ID_USB_COMMAND_HANDLER,
     TASK_ID_LCD_DISPLAY,
-    TASK_ID_DISPENSER,
+    TASK_ID_CARWASH,
     TASK_ID_BUZZER_POLLING,
     TASK_ID_MIFARE_POLLING,
     TASK_ID_IO_EXPANDER,
@@ -134,7 +142,7 @@ static Task_WDT_Status_t s_task_wdt_status[TASK_ID_COUNT] = {
     {"USB_CDC",       TASK_STATUS_UNKNOWN, 0},
     {"USB_Command",   TASK_STATUS_UNKNOWN, 0},
     {"LCD_Display",   TASK_STATUS_UNKNOWN, 0},
-    {"Dispenser",     TASK_STATUS_UNKNOWN, 0},
+    {"CarWash",       TASK_STATUS_UNKNOWN, 0},
     {"Buzzer",        TASK_STATUS_UNKNOWN, 0},
     {"MIFARE",        TASK_STATUS_UNKNOWN, 0},
     {"IO_Expander",   TASK_STATUS_UNKNOWN, 0},
@@ -143,30 +151,29 @@ static Task_WDT_Status_t s_task_wdt_status[TASK_ID_COUNT] = {
 };
 static SemaphoreHandle_t s_wdt_status_mutex = NULL;
 static bool s_watchdog_enabled = false;
-static bool s_mifare_polling_enabled = false;
-static bool s_buzzer_polling_enabled = false;
 
-/* Module runtime state tracking */
+/* Module Runtime Control State Tracking */
 static Module_State_t s_module_states[MODULE_COUNT] = {
-    MODULE_STATE_STOPPED,  /* MODULE_LCD_DISPLAY */
-    MODULE_STATE_STOPPED,  /* MODULE_MIFARE_POLLING */
-    MODULE_STATE_STOPPED,  /* MODULE_DISPENSER */
-    MODULE_STATE_STOPPED,  /* MODULE_BUZZER */
-    MODULE_STATE_STOPPED,  /* MODULE_IO_EXPANDER */
-    MODULE_STATE_STOPPED   /* MODULE_RS485 */
+    MODULE_STATE_STOPPED,  /* LCD_DISPLAY */
+    MODULE_STATE_STOPPED,  /* MIFARE_POLLING */
+    MODULE_STATE_STOPPED,  /* CARWASH */
+    MODULE_STATE_STOPPED,  /* BUZZER */
+    MODULE_STATE_STOPPED,  /* IO_EXPANDER */
+    MODULE_STATE_STOPPED   /* RS485 */
 };
 
 static const char* s_module_names[MODULE_COUNT] = {
-    "LCD",
-    "MIFARE",
-    "DISPENSER",
-    "BUZZER",
-    "IO_EXP",
+    "LCD_Display",
+    "MIFARE_Polling",
+    "CarWash",
+    "Buzzer",
+    "IO_Expander",
     "RS485"
 };
 
 /* External task starter functions */
 extern void Task_Start_SD_Logger_Task(void);
+extern TaskHandle_t task_get_handle_MIFARE_Polling_Task(void);
 
 /* Private function prototypes ------------------------------------------------*/
 static void System_Task(void* argument);
@@ -182,6 +189,17 @@ static void system_init(void);
 static void system_init(void)
 {
     LOG_CRITICAL_SYSTEM("\r\n=== System Initialization ===\r\n");
+    
+    /* Print firmware version first */
+    FW_PrintVersionInfo();
+    
+    /* Register MyWota hardware configuration (pin mappings) */
+    MyWota_Hardware_Adapter_Init();
+    LOG_CRITICAL_SYSTEM("[✓] MyWota Hardware Adapter initialized\r\n");
+    
+    /* Register MyWota configuration schema */
+    MyWota_Config_Adapter_Init();
+    LOG_CRITICAL_SYSTEM("[✓] MyWota Config Adapter initialized\r\n");
 
     /* Hardware Layer */
     Init_Hardware_Layer();
@@ -197,6 +215,10 @@ static void system_init(void)
     /* Load Configuration */
     if (SD_Logger_IsReady()) {
         LOG_CRITICAL_SYSTEM("[✓] SD Logger mounted - config loaded from SD card\r\n");
+        
+        /* Register BigYellow-specific log formatters */
+        SD_Logger_Format_Adapter_Init();
+        LOG_CRITICAL_SYSTEM("[✓] SD Logger Format Adapter initialized\r\n");
         
         /* Initialize ID-based log strings from SD card */
         if (Log_Strings_Init()) {
@@ -225,6 +247,11 @@ static void system_init(void)
     /* RTC Task - Start immediately after SD mount completes (success or failure)
      * SD is CRITICAL for RTC to load saved time. System task blocks above ensures
      * SD initialization is complete before RTC task starts. */
+    
+    /* Register BigYellow-specific RTC persistence (SD card) */
+    RTC_Persistence_Adapter_Init();
+    LOG_CRITICAL_SYSTEM("[✓] RTC Persistence Adapter initialized (SD Card)\r\n");
+    
     Task_Start_RTC_Task();
     LOG_CRITICAL_SYSTEM("[→] RTC Task started (SD init complete)\r\n");
 
@@ -259,6 +286,10 @@ static void system_init(void)
     
     /* I/O Expander Control (high-level abstraction layer) */
     IO_Expander_Control_Init();
+    
+    /* Register MyWota IO Expander pin mapping */
+    MyWota_IO_Expander_Adapter_Init();
+    LOG_CRITICAL_SYSTEM("[✓] IO Expander Adapter initialized\r\n");
     
     /* I/O Expander Control Task (polls all pins) - check hardware and config */
     if (cat_status == CAT9555_OK && cfg->modules.io_expander_enabled) {
@@ -295,10 +326,15 @@ static void system_init(void)
      * with NFC initialization. LCD should not depend on NFC subsystem. */
     if (cfg->modules.lcd_display_enabled) {
         Task_Start_LCD_Display_Driver_Task();
-        s_module_states[MODULE_LCD_DISPLAY] = MODULE_STATE_RUNNING;
-        LOG_CRITICAL_SYSTEM("[→] LCD Display Task started\r\n");
+        if (task_get_handle_LCD_Display_Driver_Task() != NULL) {
+            s_module_states[MODULE_LCD_DISPLAY] = MODULE_STATE_RUNNING;
+            LOG_CRITICAL_SYSTEM("[→] LCD Display Task started\r\n");
+        } else {
+            s_module_states[MODULE_LCD_DISPLAY] = MODULE_STATE_ERROR;
+            LOG_CRITICAL_SYSTEM("[✗] LCD Display Task FAILED to start (OOM?)\r\n");
+        }
     } else {
-        LOG_CRITICAL_SYSTEM("[!] LCD Display Task DISABLED by config\r\n");
+        LOG_CRITICAL_SYSTEM("[!] LCD Display DISABLED by config\r\n");
     }
     
     /* PN532 NFC Driver - Can fail without blocking LCD */
@@ -317,48 +353,47 @@ static void system_init(void)
         LOG_CRITICAL_SYSTEM("[✓] PN532 Driver initialized\r\n");
     }
 
-    /* MIFARE Transaction Manager */
-    MIFARE_TransactionManager_Init();
-    LOG_CRITICAL_SYSTEM("[✓] MIFARE Manager initialized\r\n");
+    /* MIFARE Volume Adapter (MyWota - volume-based) */
+    MIFARE_Volume_Adapter_Init();
+    LOG_CRITICAL_SYSTEM("[✓] MIFARE Volume Adapter initialized\r\n");
     
-    /* Dispenser Integration */
-    MIFARE_Dispenser_Init();
+    /* Car Wash Integration */
+    MIFARE_CarWash_Init();
     
     /* MIFARE Polling Task - check both hardware and config */
     if (pn532_status == PN532_STATUS_OK && cfg->modules.mifare_polling_enabled) {
         MIFARE_StartPollingTask();
-        s_mifare_polling_enabled = true;
-        s_module_states[MODULE_MIFARE_POLLING] = MODULE_STATE_RUNNING;
-        LOG_CRITICAL_SYSTEM("[→] MIFARE Polling Task started\r\n");
+        if (task_get_handle_MIFARE_Polling_Task() != NULL) {
+            s_module_states[MODULE_MIFARE_POLLING] = MODULE_STATE_RUNNING;
+            LOG_CRITICAL_SYSTEM("[→] MIFARE Polling Task started\r\n");
+        } else {
+            s_module_states[MODULE_MIFARE_POLLING] = MODULE_STATE_ERROR;
+            LOG_CRITICAL_SYSTEM("[✗] MIFARE Polling Task FAILED to start (OOM?)\r\n");
+        }
     } else if (!cfg->modules.mifare_polling_enabled) {
-        s_mifare_polling_enabled = false;
         LOG_CRITICAL_SYSTEM("[!] MIFARE Polling Task DISABLED by config\r\n");
     } else {
-        s_mifare_polling_enabled = false;
         s_module_states[MODULE_MIFARE_POLLING] = MODULE_STATE_ERROR;
         LOG_CRITICAL_SYSTEM("[✗] MIFARE Polling Task FAILED - PN532 initialization error\r\n");
     }
     
-    /* Dispenser Integration Task - check config */
-    if (cfg->modules.dispenser_enabled) {
-        Task_Start_Dispenser_Task();
-        s_module_states[MODULE_DISPENSER] = MODULE_STATE_RUNNING;
-        LOG_CRITICAL_SYSTEM("[→] Dispenser Task started\r\n");
+    /* Car Wash Integration Task */
+    if (cfg->modules.carwash_enabled) {
+        Task_Start_CarWash_Task();
+        s_module_states[MODULE_CARWASH] = MODULE_STATE_RUNNING;
+        LOG_CRITICAL_SYSTEM("[→] Car Wash Task started\r\n");
     } else {
-        LOG_CRITICAL_SYSTEM("[!] Dispenser Task DISABLED by config\r\n");
+        LOG_CRITICAL_SYSTEM("[!] Car Wash Task DISABLED by config\r\n");
     }
 
     /* Buzzer Polling Task - check both hardware and config */
     if (buzzer_status == BUZZER_OK && cfg->modules.buzzer_enabled) {
         Buzzer_StartPollingTask(buzzer_handle);
-        s_buzzer_polling_enabled = true;
         s_module_states[MODULE_BUZZER] = MODULE_STATE_RUNNING;
         LOG_CRITICAL_SYSTEM("[→] Buzzer Polling Task started\r\n");
     } else if (!cfg->modules.buzzer_enabled) {
-        s_buzzer_polling_enabled = false;
         LOG_CRITICAL_SYSTEM("[!] Buzzer Polling Task DISABLED by config\r\n");
     } else {
-        s_buzzer_polling_enabled = false;
         s_module_states[MODULE_BUZZER] = MODULE_STATE_ERROR;
         LOG_CRITICAL_SYSTEM("[✗] Buzzer Polling Task FAILED - Buzzer initialization error\r\n");
     }
@@ -368,6 +403,10 @@ static void system_init(void)
         Task_Start_RS485_Task();
         s_module_states[MODULE_RS485] = MODULE_STATE_RUNNING;
         LOG_CRITICAL_SYSTEM("[→] RS485 Communication Task started\r\n");
+        
+        /* Register BigYellow-specific RS485 commands */
+        RS485_Command_Adapter_Init();
+        LOG_CRITICAL_SYSTEM("[✓] RS485 Command Adapter initialized\r\n");
     } else {
         LOG_CRITICAL_SYSTEM("[!] RS485 Communication Task DISABLED by config\r\n");
     }
@@ -419,39 +458,27 @@ static void System_Task(void* argument)
     
     LOG_CRITICAL_SYSTEM("[WDT] Grace period complete - starting watchdog monitoring\r\n");
     
-    /* Signal WDT start with double beep */
-    if (buzzer_handle != NULL && Buzzer_IsInitialized(buzzer_handle)) {
-        Buzzer_DoubleBeep(buzzer_handle);
-        LOG_CRITICAL_SYSTEM("[WDT] Startup beep signaled\r\n");
-    }
-    
     /* Main watchdog monitoring loop */
     const TickType_t wdt_check_period = pdMS_TO_TICKS(100);  /* Check every 100ms */
-    const TickType_t report_timeout = pdMS_TO_TICKS(800);    /* 800ms task health check window */
+    const TickType_t report_timeout = pdMS_TO_TICKS(800);    /* 800ms reporting window (leaves 200ms margin before 1000ms WDT timeout) */
     
     /* Clear watchdog once before starting monitoring loop */
     watchdog_update();
-    TickType_t last_task_check = xTaskGetTickCount();
+    TickType_t last_wdt_clear = xTaskGetTickCount();
     
     for (;;)
     {
         vTaskDelay(wdt_check_period);
         
-        /* ALWAYS feed hardware WDT - proves System_Task is running */
-        /* This is separate from task health monitoring */
-        watchdog_update();
-        
         if (!s_watchdog_enabled || !s_wdt_status_mutex) {
             continue;
         }
         
-        /* Check task health periodically (separate from hardware WDT) */
+        /* Check if it's time to evaluate task statuses */
         TickType_t check_time = xTaskGetTickCount();
-        TickType_t elapsed_since_check = check_time - last_task_check;
+        TickType_t elapsed_since_clear = check_time - last_wdt_clear;
         
-        if (elapsed_since_check >= report_timeout) {
-            last_task_check = check_time;
-            
+        if (elapsed_since_clear >= report_timeout) {
             bool all_tasks_ok = true;
             bool any_task_reported = false;
             TickType_t now;  /* Will be read inside mutex to avoid race condition */
@@ -488,12 +515,36 @@ static void System_Task(void* argument)
                 const TickType_t max_silence_time = report_timeout * 3;
                 
                 for (uint8_t i = 0; i < TASK_ID_COUNT; i++) {
-                    /* Skip MIFARE task if disabled due to hardware failure */
-                    if (i == TASK_ID_MIFARE_POLLING && !s_mifare_polling_enabled) {
-                        continue;
+                    /* Check if task is expected to be running based on module state */
+                    bool expected_running = true;
+                    
+                    /* Map Task ID to Module ID where applicable */
+                    switch (i) {
+                        case TASK_ID_LCD_DISPLAY:
+                            if (s_module_states[MODULE_LCD_DISPLAY] != MODULE_STATE_RUNNING) expected_running = false;
+                            break;
+                        case TASK_ID_MIFARE_POLLING:
+                            if (s_module_states[MODULE_MIFARE_POLLING] != MODULE_STATE_RUNNING) expected_running = false;
+                            break;
+                        case TASK_ID_CARWASH:
+                            if (s_module_states[MODULE_CARWASH] != MODULE_STATE_RUNNING) expected_running = false;
+                            break;
+                        case TASK_ID_BUZZER_POLLING:
+                            if (s_module_states[MODULE_BUZZER] != MODULE_STATE_RUNNING) expected_running = false;
+                            break;
+                        case TASK_ID_IO_EXPANDER:
+                            if (s_module_states[MODULE_IO_EXPANDER] != MODULE_STATE_RUNNING) expected_running = false;
+                            break;
+                        case TASK_ID_RS485:
+                            if (s_module_states[MODULE_RS485] != MODULE_STATE_RUNNING) expected_running = false;
+                            break;
+                        default:
+                            /* Core system tasks (USB, SD, RTC) are always expected to run */
+                            expected_running = true;
+                            break;
                     }
-                    /* Skip Buzzer task if disabled due to hardware failure */
-                    if (i == TASK_ID_BUZZER_POLLING && !s_buzzer_polling_enabled) {
+                    
+                    if (!expected_running) {
                         continue;
                     }
 
@@ -515,8 +566,11 @@ static void System_Task(void* argument)
                     }
                 }
                 
-                /* If all tasks reported OK, just reset statuses for next cycle */
+                /* If all tasks reported OK, clear watchdog */
                 if (all_tasks_ok && any_task_reported) {
+                    watchdog_update();  /* Clear hardware watchdog */
+                    last_wdt_clear = now;
+                    
                     /* Reset task statuses for next cycle - take mutex briefly */
                     if (xSemaphoreTake(s_wdt_status_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                         for (uint8_t i = 0; i < TASK_ID_COUNT; i++) {
@@ -529,15 +583,6 @@ static void System_Task(void* argument)
                     LOG_CRITICAL_SYSTEM("[WDT] Not all tasks reported within 2400ms:\r\n");
                     
                     for (uint8_t i = 0; i < TASK_ID_COUNT; i++) {
-                        /* Skip MIFARE task if disabled */
-                        if (i == TASK_ID_MIFARE_POLLING && !s_mifare_polling_enabled) {
-                            continue;
-                        }
-                        /* Skip Buzzer task if disabled */
-                        if (i == TASK_ID_BUZZER_POLLING && !s_buzzer_polling_enabled) {
-                            continue;
-                        }
-
                         const char* status_str;
                         TickType_t time_since_report = now - status_snapshot[i].last_report_tick;
                         
@@ -583,7 +628,8 @@ static void System_Task(void* argument)
                         }
                     }
                     
-                    /* Reset task statuses for next cycle to avoid spam */
+                    /* Reset timer and task statuses for next cycle to avoid spam */
+                    last_wdt_clear = now;
                     if (xSemaphoreTake(s_wdt_status_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                         for (uint8_t i = 0; i < TASK_ID_COUNT; i++) {
                             s_task_wdt_status[i].status = TASK_STATUS_UNKNOWN;
@@ -686,22 +732,98 @@ void System_ReportTaskStatus(System_Task_ID_t task_id, bool is_running_ok)
 }
 
 /* ========================================================================== */
-/*                    MODULE RUNTIME CONTROL API                              */
+/*                      MODULE RUNTIME CONTROL API                           */
 /* ========================================================================== */
 
 /**
- * @brief Get module name string
+ * @brief Start a module at runtime
+ * @param module Module to start
+ * @return true if module started successfully, false otherwise
  */
-const char* System_GetModuleName(System_Module_t module)
+bool System_StartModule(System_Module_t module)
 {
     if (module >= MODULE_COUNT) {
-        return "Unknown";
+        LOG_ERROR_SYSTEM("[MODULE] Invalid module ID: %d\r\n", module);
+        return false;
     }
-    return s_module_names[module];
+    
+    if (s_module_states[module] == MODULE_STATE_RUNNING) {
+        LOG_ERROR_SYSTEM("[MODULE] %s already running\r\n", s_module_names[module]);
+        return false;
+    }
+    
+    LOG_CRITICAL_SYSTEM("[MODULE] Starting %s...\r\n", s_module_names[module]);
+    
+    switch (module) {
+        case MODULE_LCD_DISPLAY:
+            Task_Start_LCD_Display_Driver_Task();
+            s_module_states[MODULE_LCD_DISPLAY] = MODULE_STATE_RUNNING;
+            return true;
+            
+        case MODULE_MIFARE_POLLING:
+            MIFARE_StartPollingTask();
+            s_module_states[MODULE_MIFARE_POLLING] = MODULE_STATE_RUNNING;
+            return true;
+            
+        case MODULE_CARWASH:
+            Task_Start_CarWash_Task();
+            s_module_states[MODULE_CARWASH] = MODULE_STATE_RUNNING;
+            return true;
+            
+        case MODULE_BUZZER:
+            if (Buzzer_IsInitialized(buzzer_handle)) {
+                Buzzer_StartPollingTask(buzzer_handle);
+                s_module_states[MODULE_BUZZER] = MODULE_STATE_RUNNING;
+                return true;
+            } else {
+                LOG_ERROR_SYSTEM("[MODULE] Buzzer hardware not initialized\r\n");
+                s_module_states[MODULE_BUZZER] = MODULE_STATE_ERROR;
+                return false;
+            }
+            
+        case MODULE_IO_EXPANDER:
+            Task_Start_IO_Expander_Control_Task();
+            s_module_states[MODULE_IO_EXPANDER] = MODULE_STATE_RUNNING;
+            return true;
+            
+        case MODULE_RS485:
+            Task_Start_RS485_Task();
+            s_module_states[MODULE_RS485] = MODULE_STATE_RUNNING;
+            return true;
+            
+        default:
+            LOG_ERROR_SYSTEM("[MODULE] Unknown module: %d\r\n", module);
+            return false;
+    }
+}
+
+/**
+ * @brief Stop a module at runtime
+ * @param module Module to stop
+ * @return true if module stopped successfully, false otherwise
+ * @note Currently not fully implemented - task deletion requires careful resource cleanup
+ */
+bool System_StopModule(System_Module_t module)
+{
+    if (module >= MODULE_COUNT) {
+        LOG_ERROR_SYSTEM("[MODULE] Invalid module ID: %d\r\n", module);
+        return false;
+    }
+    
+    if (s_module_states[module] != MODULE_STATE_RUNNING) {
+        LOG_ERROR_SYSTEM("[MODULE] %s not running\r\n", s_module_names[module]);
+        return false;
+    }
+    
+    LOG_CRITICAL_SYSTEM("[MODULE] Stopping %s not fully implemented\r\n", s_module_names[module]);
+    /* TODO: Implement task suspension/deletion with proper cleanup */
+    return false;
 }
 
 /**
  * @brief Get current state of a module
+ * @param module Module to query
+ * @return Current module state
  */
 Module_State_t System_GetModuleState(System_Module_t module)
 {
@@ -712,192 +834,52 @@ Module_State_t System_GetModuleState(System_Module_t module)
 }
 
 /**
- * @brief Start a module at runtime
+ * @brief Get module name string
+ * @param module Module ID
+ * @return Module name string, or "Unknown" if invalid
  */
-bool System_StartModule(System_Module_t module)
+const char* System_GetModuleName(System_Module_t module)
 {
     if (module >= MODULE_COUNT) {
-        LOG_ERROR_SYSTEM("[MODULES] Invalid module ID: %d\r\n", module);
-        return false;
+        return "Unknown";
     }
-    
-    /* Check if already running */
-    if (s_module_states[module] == MODULE_STATE_RUNNING) {
-        LOG_CRITICAL_SYSTEM("[MODULES] %s already running\r\n", s_module_names[module]);
-        return true;
-    }
-    
-    LOG_CRITICAL_SYSTEM("[MODULES] Starting %s...\r\n", s_module_names[module]);
-    
-    bool success = false;
-    
-    switch (module) {
-        case MODULE_LCD_DISPLAY:
-            Task_Start_LCD_Display_Driver_Task();
-            success = true;
-            break;
-            
-        case MODULE_MIFARE_POLLING:
-            /* Requires PN532 to be initialized - check handle exists */
-            if (pn532_handle != NULL) {
-                MIFARE_StartPollingTask();
-                s_mifare_polling_enabled = true;
-                success = true;
-            } else {
-                LOG_ERROR_SYSTEM("[MODULES] Cannot start MIFARE - PN532 not initialized\r\n");
-                success = false;
-            }
-            break;
-            
-        case MODULE_DISPENSER:
-            Task_Start_Dispenser_Task();
-            success = true;
-            break;
-            
-        case MODULE_BUZZER:
-            /* Requires buzzer to be initialized */
-            if (buzzer_handle != NULL && Buzzer_IsInitialized(buzzer_handle)) {
-                Buzzer_StartPollingTask(buzzer_handle);
-                s_buzzer_polling_enabled = true;
-                success = true;
-            } else {
-                LOG_ERROR_SYSTEM("[MODULES] Cannot start Buzzer - not initialized\r\n");
-                success = false;
-            }
-            break;
-            
-        case MODULE_IO_EXPANDER:
-            Task_Start_IO_Expander_Control_Task();
-            success = true;
-            break;
-            
-        case MODULE_RS485:
-            Task_Start_RS485_Task();
-            success = true;
-            break;
-            
-        default:
-            LOG_ERROR_SYSTEM("[MODULES] Unknown module: %d\r\n", module);
-            success = false;
-            break;
-    }
-    
-    if (success) {
-        s_module_states[module] = MODULE_STATE_RUNNING;
-        LOG_CRITICAL_SYSTEM("[✓] %s started\r\n", s_module_names[module]);
-    } else {
-        s_module_states[module] = MODULE_STATE_ERROR;
-        LOG_ERROR_SYSTEM("[✗] %s failed to start\r\n", s_module_names[module]);
-    }
-    
-    return success;
+    return s_module_names[module];
 }
 
 /**
- * @brief Stop a module at runtime
- * @note Not all modules support stopping - some FreeRTOS tasks cannot be cleanly deleted
- */
-bool System_StopModule(System_Module_t module)
-{
-    if (module >= MODULE_COUNT) {
-        LOG_ERROR_SYSTEM("[MODULES] Invalid module ID: %d\r\n", module);
-        return false;
-    }
-    
-    /* Check if already stopped */
-    if (s_module_states[module] == MODULE_STATE_STOPPED) {
-        LOG_CRITICAL_SYSTEM("[MODULES] %s already stopped\r\n", s_module_names[module]);
-        return true;
-    }
-    
-    LOG_CRITICAL_SYSTEM("[MODULES] Stopping %s...\r\n", s_module_names[module]);
-    
-    bool success = false;
-    
-    switch (module) {
-        case MODULE_LCD_DISPLAY:
-            Task_Stop_LCD_Display_Driver_Task();
-            success = true;
-            break;
-            
-        case MODULE_MIFARE_POLLING:
-            MIFARE_StopPollingTask();
-            s_mifare_polling_enabled = false;
-            success = true;
-            break;
-            
-        case MODULE_DISPENSER:
-            Task_Stop_Dispenser_Task();
-            success = true;
-            break;
-            
-        case MODULE_BUZZER:
-            if (buzzer_handle != NULL) {
-                Buzzer_StopPollingTask(buzzer_handle);
-                s_buzzer_polling_enabled = false;
-                success = true;
-            }
-            break;
-            
-        case MODULE_IO_EXPANDER:
-            Task_Stop_IO_Expander_Control_Task();
-            success = true;
-            break;
-            
-        case MODULE_RS485:
-            /* RS485 task doesn't support runtime stop yet */
-            LOG_ERROR_SYSTEM("[MODULES] RS485 module cannot be stopped at runtime\r\n");
-            success = false;
-            break;
-            
-        default:
-            LOG_ERROR_SYSTEM("[MODULES] Unknown module: %d\r\n", module);
-            success = false;
-            break;
-    }
-    
-    if (success) {
-        s_module_states[module] = MODULE_STATE_STOPPED;
-        LOG_CRITICAL_SYSTEM("[✓] %s stopped\r\n", s_module_names[module]);
-    } else {
-        LOG_ERROR_SYSTEM("[✗] %s cannot be stopped\r\n", s_module_names[module]);
-    }
-    
-    return success;
-}
-
-/**
- * @brief Print status of all modules
+ * @brief Print status of all modules to USB log
  */
 void System_PrintModuleStatus(void)
 {
-    const SystemConfig_t* cfg = Config_Get();
+    const SystemConfig_t *cfg = Config_Get();
     
-    USB_Log_Printf("\r\n═══════════════════════════════════════════════════════════════\r\n");
+    USB_Log_Printf("\r\n");
+    USB_Log_Printf("═══════════════════════════════════════════════════════════════\r\n");
     USB_Log_Printf("                    MODULE STATUS                                \r\n");
     USB_Log_Printf("═══════════════════════════════════════════════════════════════\r\n");
-    USB_Log_Printf("%-20s %-12s %-12s\r\n", "Module", "Boot Config", "Runtime State");
+    USB_Log_Printf("Module               Boot Config  Runtime State\r\n");
     USB_Log_Printf("───────────────────────────────────────────────────────────────\r\n");
     
-    const bool boot_enabled[MODULE_COUNT] = {
-        cfg->modules.lcd_display_enabled,
-        cfg->modules.mifare_polling_enabled,
-        cfg->modules.dispenser_enabled,
-        cfg->modules.buzzer_enabled,
-        cfg->modules.io_expander_enabled,
-        cfg->modules.rs485_enabled
+    const char* boot_enabled[MODULE_COUNT] = {
+        cfg->modules.lcd_display_enabled ? "Enabled " : "Disabled",
+        cfg->modules.mifare_polling_enabled ? "Enabled " : "Disabled",
+        cfg->modules.carwash_enabled ? "Enabled " : "Disabled",
+        cfg->modules.buzzer_enabled ? "Enabled " : "Disabled",
+        cfg->modules.io_expander_enabled ? "Enabled " : "Disabled",
+        cfg->modules.rs485_enabled ? "Enabled " : "Disabled"
     };
     
-    const char* state_names[] = {"STOPPED", "RUNNING", "ERROR"};
+    const char* state_strings[] = {"STOPPED", "RUNNING", "ERROR"};
     
-    for (int i = 0; i < MODULE_COUNT; i++) {
+    for (uint8_t i = 0; i < MODULE_COUNT; i++) {
         USB_Log_Printf("%-20s %-12s %-12s\r\n",
-                      s_module_names[i],
-                      boot_enabled[i] ? "Enabled" : "Disabled",
-                      state_names[s_module_states[i]]);
+                       s_module_names[i],
+                       boot_enabled[i],
+                       state_strings[s_module_states[i]]);
     }
     
     USB_Log_Printf("═══════════════════════════════════════════════════════════════\r\n");
     USB_Log_Printf("\r\nCommands: start <module>, stop <module>\r\n");
-    USB_Log_Printf("Modules: lcd, mifare, dispenser, buzzer, ioexp, rs485\r\n");
+    USB_Log_Printf("Modules: lcd, mifare, carwash, buzzer, ioexp, rs485\r\n");
+    USB_Log_Printf("\r\n");
 }

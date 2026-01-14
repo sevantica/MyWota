@@ -97,7 +97,7 @@ void vApplicationMallocFailedHook( void )
 void vApplicationStackOverflowHook( TaskHandle_t pxTask, char *pcTaskName )
 {
     // CRITICAL: Disable hardware watchdog so we can see the fault
-    watchdog_disable();
+    // watchdog_disable();
     
     // Try to print the task name if possible
     printf("\n=== STACK OVERFLOW DETECTED ===\n");
@@ -140,7 +140,7 @@ void HardFault_Handler_C(HardFaultStackFrame_t *stack_frame)
     taskDISABLE_INTERRUPTS();
     
     // CRITICAL: Disable hardware watchdog so we can see the fault
-    watchdog_disable();
+    // watchdog_disable();
     
     // Light up the LED to indicate hard fault
     const uint LED_PIN = PICO_DEFAULT_LED_PIN;

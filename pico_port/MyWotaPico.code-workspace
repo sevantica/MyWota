@@ -7,6 +7,9 @@
         {
             "path": "../application",
             "name": "application (Source Library)"
+        },
+        {
+            "path": "../../../../Big Yellow/BigYellow_FW/BigYellow"
         }
     ],
     "settings": {

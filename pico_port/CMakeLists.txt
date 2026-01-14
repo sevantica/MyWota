@@ -66,7 +66,8 @@ set(TUSB_CONFIG_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 set(COMMON_PROJECT_DIR "C:/Business/Cross Project/VS Code Common")
 
 # Add the custom drivers library (includes FreeRTOS via FetchContent)
-add_subdirectory(${COMMON_PROJECT_DIR}/sevantica_drivers ${CMAKE_CURRENT_BINARY_DIR}/drivers)
+# Note: MIFARE Transaction Core now included in sevantica_drivers
+add_subdirectory("${COMMON_PROJECT_DIR}/sevantica_drivers" ${CMAKE_CURRENT_BINARY_DIR}/drivers)
 
 # Set C/C++ standards
 set(CMAKE_C_STANDARD 11)
@@ -115,7 +116,7 @@ include_directories(
     ../application/User_Interface/MyWota/lvgl/src
     ../application/User_Interface/MyWota/lvgl/src/drivers
     ../application/Include
-    ${COMMON_PROJECT_DIR}/sevantica_drivers/Include
+    "${COMMON_PROJECT_DIR}/sevantica_drivers/Include"
     ../application/User_Interface/MyWota/ui
     ../application/User_Interface/MyWota/ui/screens
     ../application/User_Interface/MyWota/ui/images
@@ -140,14 +141,21 @@ set(APP_SOURCES
     ../application/Source/Firmware_Version.c
     ../application/Source/Hardware_Access.c
     ../application/Source/IO_Expander_Control.c
-    ../application/Source/MIFARE_Transaction_Manager.c
+    ../application/Source/MyWota_Config_Adapter.c
+    ../application/Source/MyWota_Hardware_Adapter.c
+    ../application/Source/MyWota_IO_Expander_Adapter.c
+    ../application/Source/MIFARE_Volume_Adapter.c
     ../application/Source/RS485_Task.c
     ../application/Source/RTC_Manager.c
+    ../application/Source/RTC_Persistence_Adapter.c
     ../application/Source/RTC_Task.c
     ../application/Source/SD_Logger_Task.c
+    ../application/Source/SD_Logger_Format_Adapter.c
     ../application/Source/System.c
+    ../application/Source/RS485_Command_Adapter.c
     ../application/Source/System_Config.c
-    ../application/Source/USB_Command_Handler.c
+    ../application/Source/USB_Command_Adapter.c
+    # Note: MIFARE core and USB Command Handler in sevantica_drivers, adapters in this project
 )
 
 # Combine all local sources (drivers now handled by library)
@@ -163,7 +171,7 @@ pico_set_linker_script(UI_PICO_PORT ${CMAKE_CURRENT_SOURCE_DIR}/memmap_app.ld)
 target_link_libraries(UI_PICO_PORT
     ui    # Add UI library from ../application/User_Interface/MyWota/ui
     lvgl  # Add LVGL library
-    Drivers  # Add custom drivers library
+    Drivers  # Add custom drivers library (includes MIFARE core)
     pico_runtime
     pico_platform
     pico_multicore
@@ -213,8 +221,8 @@ target_include_directories(lvgl PRIVATE
 
 # Add FatFs include path as SYSTEM to LVGL for LV_USE_FS_FATFS support
 target_include_directories(lvgl SYSTEM PUBLIC
-    ${COMMON_PROJECT_DIR}/sevantica_drivers/FatFs
-    ${COMMON_PROJECT_DIR}/sevantica_drivers/Include
+    "${COMMON_PROJECT_DIR}/sevantica_drivers/FatFs"
+    "${COMMON_PROJECT_DIR}/sevantica_drivers/Include"
 )
 
 # Also need to link LVGL with FreeRTOS-Kernel and Pico SDK for headers
@@ -250,7 +258,7 @@ target_compile_definitions(UI_PICO_PORT PRIVATE
 
 # Enable UART output only (USB CDC handled by TinyUSB)
 pico_enable_stdio_usb(UI_PICO_PORT 0)
-pico_enable_stdio_uart(UI_PICO_PORT 1)
+pico_enable_stdio_uart(UI_PICO_PORT 0)
 
 # Create map/bin/hex/uf2 files automatically after each build
 pico_add_extra_outputs(UI_PICO_PORT)

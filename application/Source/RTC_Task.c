@@ -12,8 +12,9 @@
 /* Includes ------------------------------------------------------------------*/
 #include "RTC_Task.h"
 #include "RTC_Manager.h"
-#include "Task_Heartbeat.h"
-#include "task_stack_config.h"
+#include "RTC_Persistence_Interface.h"
+#include "Heartbeat_Task.h"
+#include "Task_Stack_Config.h"
 #include "USB_Logging.h"
 #include "System.h"
 #include "FreeRTOS.h"
@@ -118,18 +119,25 @@ static void RTC_Task(void* argument)
         TASK_HEARTBEAT_EVERY_SECOND("RTC");
         System_ReportTaskStatus(SYSTEM_TASK_ID_RTC, true);
         
-        // Check if it's time to save to SD card (every 1 minute)
+        // Get save interval from persistence adaptor (project-specific)
+        uint32_t save_interval_ms = RTC_PersistGetInterval();
+        
+        // Check if it's time to save to persistent storage
         uint32_t current_time = xTaskGetTickCount();
         uint32_t elapsed_ms = pdTICKS_TO_MS(current_time - last_save_time);
         
-        if (elapsed_ms >= RTC_SAVE_INTERVAL_MS) {
-            // Save current time to SD card
-            status = RTC_SaveToSD();
-            if (status == RTC_OK) {
-                LOG_DEBUG_RTC_TASK("[RTC_TASK] ✓ Time saved to SD\r\n");
-            } else {
-                LOG_DEBUG_RTC_TASK("[RTC_TASK] ✗ Failed to save time: %s\r\n", 
-                                   RTC_GetStatusString(status));
+        if (elapsed_ms >= save_interval_ms) {
+            // Use persistence interface for saving (adaptor handles storage type)
+            if (RTC_PersistIsReady()) {
+                time_t unix_time = RTC_GetUnixTime();
+                RTC_Persist_Result_t persist_result = RTC_PersistSave(unix_time);
+                
+                if (persist_result == RTC_PERSIST_OK) {
+                    LOG_DEBUG_RTC_TASK("[RTC_TASK] ✓ Time saved via persistence adaptor\r\n");
+                } else {
+                    LOG_DEBUG_RTC_TASK("[RTC_TASK] ✗ Failed to save time: %s\r\n", 
+                                       RTC_Persist_GetResultString(persist_result));
+                }
             }
             
             last_save_time = current_time;

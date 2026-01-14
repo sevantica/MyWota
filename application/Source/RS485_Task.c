@@ -13,10 +13,12 @@
 #include "RS485_Task.h"
 #include "RS485_Protocol.h"
 #include "RS485_File_Transfer.h"
+#include "RS485_Command_Interface.h"
 #include "RTC_Manager.h"
-#include "Task_Heartbeat.h"
-#include "task_stack_config.h"
+#include "Heartbeat_Task.h"
+#include "Task_Stack_Config.h"
 #include "USB_Logging.h"
+#include "USB_Command_Handler.h"
 #include "System.h"
 #include "Hardware_Access.h"
 #include "pico/stdlib.h"
@@ -63,6 +65,52 @@ static uint8_t rx_buffer[RS485_RX_BUFFER_SIZE];
 static uint16_t rx_index = 0;
 static uint32_t last_rx_time = 0;
 static App_GPIO_Pins_t app_pins;
+
+/* Log capture for RS485 debug commands */
+#define RS485_SYSTEM_LOG_SIZE 1024
+static struct {
+    char buffer[RS485_SYSTEM_LOG_SIZE];
+    uint16_t head;
+    uint16_t tail;
+    bool overflow;
+} rs485_system_log = {0};
+
+static struct {
+    char buffer[RS485_MAX_PAYLOAD];
+    size_t length;
+    bool active;
+} rs485_cmd_capture = {0};
+
+/**
+ * @brief Global log handler for RS485
+ * @details Captures all system logs into a circular buffer and optionally a command capture buffer
+ */
+static void rs485_global_log_handler(const char* message, size_t length)
+{
+    // 1. Append to circular system log buffer
+    for (size_t i = 0; i < length; i++) {
+        rs485_system_log.buffer[rs485_system_log.head] = message[i];
+        rs485_system_log.head = (rs485_system_log.head + 1) % RS485_SYSTEM_LOG_SIZE;
+        
+        // If head catches tail, move tail forward (drop oldest)
+        if (rs485_system_log.head == rs485_system_log.tail) {
+            rs485_system_log.tail = (rs485_system_log.tail + 1) % RS485_SYSTEM_LOG_SIZE;
+            rs485_system_log.overflow = true;
+        }
+    }
+    
+    // 2. Append to command capture buffer if a debug command is active
+    if (rs485_cmd_capture.active) {
+        size_t space = sizeof(rs485_cmd_capture.buffer) - rs485_cmd_capture.length - 1;
+        size_t to_copy = (length < space) ? length : space;
+        
+        if (to_copy > 0) {
+            memcpy(&rs485_cmd_capture.buffer[rs485_cmd_capture.length], message, to_copy);
+            rs485_cmd_capture.length += to_copy;
+            rs485_cmd_capture.buffer[rs485_cmd_capture.length] = '\0';
+        }
+    }
+}
 
 /* Firmware Update State */
 static bool fw_update_active = false;
@@ -132,6 +180,14 @@ bool RS485_Task_IsReady(void)
     return rs485_initialized;
 }
 
+/**
+ * @brief Send RS485 frame (public API for command adaptors)
+ */
+void RS485_SendFrame(const RS485_Frame_t *frame)
+{
+    rs485_send_frame(frame);
+}
+
 /* ========================================================================== */
 /*                            TASK IMPLEMENTATION                             */
 /* ========================================================================== */
@@ -150,6 +206,9 @@ static void RS485_Task(void* argument)
     
     // Initialize file transfer module
     RS485_FileTransfer_Init();
+    
+    // Register global log handler to capture all system activity
+    USB_Log_SetOutputHandler(rs485_global_log_handler);
     
     rs485_initialized = true;
     LOG_DEBUG_RS485("[RS485] Initialized as slave address 0x%02X\r\n", RS485_SLAVE_ADDRESS);
@@ -429,8 +488,84 @@ static void rs485_handle_command(const RS485_Frame_t *rx_frame)
             fw_update_abort();
             rs485_send_ack(rx_frame->header.sequence);
             break;
+            
+        case RS485_CMD_DEBUG_LOG: {
+            // Return accumulated system logs
+            uint16_t log_len = 0;
+            char temp_payload[RS485_MAX_PAYLOAD];
+            
+            // Calculate how much we can send
+            uint16_t available;
+            if (rs485_system_log.head >= rs485_system_log.tail) {
+                available = rs485_system_log.head - rs485_system_log.tail;
+            } else {
+                available = RS485_SYSTEM_LOG_SIZE - rs485_system_log.tail + rs485_system_log.head;
+            }
+            
+            log_len = (available > RS485_MAX_PAYLOAD) ? RS485_MAX_PAYLOAD : available;
+            
+            if (log_len > 0) {
+                // Copy from circular buffer to linear response payload
+                for (uint16_t i = 0; i < log_len; i++) {
+                    temp_payload[i] = rs485_system_log.buffer[rs485_system_log.tail];
+                    rs485_system_log.tail = (rs485_system_log.tail + 1) % RS485_SYSTEM_LOG_SIZE;
+                }
+                
+                RS485_Frame_t response;
+                RS485_BuildFrame(&response, RS485_ADDR_MASTER, RS485_CMD_DEBUG_LOG,
+                                 rx_frame->header.sequence, temp_payload, log_len);
+                rs485_send_frame(&response);
+            } else {
+                // No logs available
+                rs485_send_ack(rx_frame->header.sequence);
+            }
+            break;
+        }
+        
+        case RS485_CMD_DEBUG_CMD: {
+            if (rx_frame->header.length > 0) {
+                char cmd_temp[RS485_MAX_PAYLOAD + 1];
+                memcpy(cmd_temp, rx_frame->payload, rx_frame->header.length);
+                cmd_temp[rx_frame->header.length] = '\0';
+                
+                // Clear and enable command output capture
+                rs485_cmd_capture.length = 0;
+                rs485_cmd_capture.active = true;
+                
+                USB_Command_Status_t status = USB_Command_HandleString(cmd_temp);
+                
+                // Disable capture
+                rs485_cmd_capture.active = false;
+                
+                if (status == USB_CMD_OK) {
+                    // Send captured logs as response if any, otherwise ACK
+                    if (rs485_cmd_capture.length > 0) {
+                        RS485_Frame_t response;
+                        RS485_BuildFrame(&response, RS485_ADDR_MASTER, RS485_CMD_DEBUG_CMD,
+                                         rx_frame->header.sequence, 
+                                         rs485_cmd_capture.buffer, 
+                                         (uint16_t)rs485_cmd_capture.length);
+                        rs485_send_frame(&response);
+                    } else {
+                        rs485_send_ack(rx_frame->header.sequence);
+                    }
+                } else {
+                    rs485_send_nak(rx_frame->header.sequence, RS485_NAK_INVALID_CMD);
+                }
+            } else {
+                rs485_send_nak(rx_frame->header.sequence, RS485_NAK_INVALID_PARAM);
+            }
+            break;
+        }
         
         default:
+            // Try project-specific command handlers from adaptor
+            if (RS485_DispatchCommand(rx_frame, rx_frame->header.sequence)) {
+                // Command was handled by adaptor
+                break;
+            }
+            
+            // Unknown command - not handled by core or adaptor
             LOG_ERROR_RS485("[RS485] Unknown command: 0x%02X\r\n", rx_frame->header.command);
             rs485_send_nak(rx_frame->header.sequence, RS485_NAK_INVALID_CMD);
             break;

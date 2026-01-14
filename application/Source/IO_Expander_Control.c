@@ -22,8 +22,8 @@
 #include "CAT9555_Driver.h"
 #include "USB_Logging.h"
 #include "System.h"
-#include "Task_Heartbeat.h"
-#include "task_stack_config.h"
+#include "Heartbeat_Task.h"
+#include "Task_Stack_Config.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include <stddef.h>
@@ -125,14 +125,14 @@ IO_Expander_Control_Status_t IO_Expander_Control_Init(void)
     IO_Expander_WritePin(IO_EXP_PIN_BUZZER, IO_EXP_STATE_LOW);      // Buzzer off (managed by Buzzer_Driver)
 
     // Configure input pins
-    // Pins 0, 1, 2 configured by Dispenser_Controller as button inputs
+    // Pins 0, 1, 2 configured by Car_Wash_Controller as button inputs
     IO_Expander_SetPinInput(IO_EXP_PIN_USER_BUTTON);
     IO_Expander_SetPinInput(IO_EXP_PIN_RELAY_SENSE_1);
     IO_Expander_SetPinInput(IO_EXP_PIN_RELAY_SENSE_2);
-    IO_Expander_SetPinInput(IO_EXP_PIN_SPARE_INPUT_1);
+    // IO_Expander_SetPinInput(IO_EXP_PIN_SPARE_INPUT_1); // Repurposed for Pressure Washer Output
     IO_Expander_SetPinInput(IO_EXP_PIN_SPARE_INPUT_2);
 
-    // Keypad DISABLED - pins 0,1,2 used for dispense buttons
+    // Keypad DISABLED - pins 0,1,2 used for wash buttons
     // Keypad driver configuration removed
 
     s_initialized = true;
@@ -154,9 +154,9 @@ void Task_Start_IO_Expander_Control_Task(void)
     BaseType_t result = xTaskCreate(
         IO_Expander_Control_Task,
         "IO_Expander_Task",
-        IO_EXPANDER_CONTROL_TASK_STACK_WORDS,
+        IO_EXPANDER_TASK_STACK_WORDS,
         NULL,
-        IO_EXPANDER_CONTROL_TASK_PRIORITY,
+        IO_EXPANDER_TASK_PRIORITY,
         &s_task_handle
     );
 
@@ -164,18 +164,6 @@ void Task_Start_IO_Expander_Control_Task(void)
         IO_EXP_CTRL_CRITICAL("[✓] I/O Expander Control task started");
     } else {
         IO_EXP_CTRL_ERROR("[✗] Failed to create I/O Expander Control task");
-    }
-}
-
-/**
- * @brief Stop I/O Expander Control polling task
- */
-void Task_Stop_IO_Expander_Control_Task(void)
-{
-    if (s_task_handle != NULL) {
-        vTaskDelete(s_task_handle);
-        s_task_handle = NULL;
-        IO_EXP_CTRL_CRITICAL("[✓] I/O Expander Control task stopped");
     }
 }
 

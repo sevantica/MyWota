@@ -14,19 +14,19 @@
 #include "task.h"
 #include "semphr.h"
 #include "queue.h"
-#include "Task_Heartbeat.h"
-#include "task_stack_config.h"
+#include "Heartbeat_Task.h"
+#include "Task_Stack_Config.h"
 #include "USB_Logging.h"
 #include "SD_Logger_Task.h"
 #include "SD_SPI_Driver.h"
-#include "MIFARE_Transaction_Manager.h"
+#include "MIFARE_Transaction_Core.h"
 #include "System_Config.h"
 #include "System.h"
 #include "ff.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>
-#include <stdlib.h>
+#include "RTC_Manager.h"
 
 /* Private defines -----------------------------------------------------------*/
 #define SD_INIT_RETRY_DELAY_MS      5000    // Wait 5 seconds before retrying initialization
@@ -69,7 +69,6 @@ typedef struct {
     uint32_t time_in_state;
     uint32_t retry_count;
     bool filesystem_ready;
-    bool suspended;                         // Suspended for USB MSC mode
     FATFS fatfs;                            // FAT filesystem object
 } SDLoggerContext_t;
 
@@ -79,8 +78,7 @@ static SDLoggerContext_t sd_logger_context = {
     .state_entry_time = 0,
     .time_in_state = 0,
     .retry_count = 0,
-    .filesystem_ready = false,
-    .suspended = false
+    .filesystem_ready = false
 };
 
 /* Private function prototypes -----------------------------------------------*/
@@ -403,29 +401,39 @@ static FRESULT log_startup_event(void)
         return result;
     }
     
-    // Get current tick count as timestamp
+    // Get current RTC time
+    RTC_DateTime_t get_time;
+    char time_str[32];
     uint32_t timestamp = xTaskGetTickCount();
+    
+    if (RTC_GetDateTime(&get_time) == RTC_OK && get_time.year > 2020) {
+        snprintf(time_str, sizeof(time_str), "%04d-%02d-%02d %02d:%02d:%02d",
+                 get_time.year, get_time.month, get_time.day,
+                 get_time.hour, get_time.minute, get_time.second);
+    } else {
+        snprintf(time_str, sizeof(time_str), "%lu", timestamp);
+    }
     
     // Write boot header
     snprintf(log_buffer, sizeof(log_buffer), 
-             "\r\n======== SYSTEM BOOT [%lu] ========\r\n", timestamp);
+             "\r\n======== SYSTEM BOOT [%s] ========\r\n", time_str);
     f_write(&file, log_buffer, strlen(log_buffer), &bytes_written);
     
     // Log SD Logger init
     snprintf(log_buffer, sizeof(log_buffer), 
-             "[%lu] SD_Logger: Initialized\r\n", timestamp);
+             "[%s] SD_Logger: Initialized\r\n", time_str);
     f_write(&file, log_buffer, strlen(log_buffer), &bytes_written);
     
     // Log config info from loaded configuration
     extern SystemConfig_t g_system_config;
     snprintf(log_buffer, sizeof(log_buffer), 
-             "[%lu] Config: Device=%s Site=%s\r\n", 
-             timestamp, g_system_config.system.device_id, g_system_config.system.site_id);
+             "[%s] Config: Device=%s Site=%s\r\n", 
+             time_str, g_system_config.system.device_id, g_system_config.system.site_id);
     f_write(&file, log_buffer, strlen(log_buffer), &bytes_written);
     
     snprintf(log_buffer, sizeof(log_buffer), 
-             "[%lu] Mode: %s\r\n", 
-             timestamp, g_system_config.system.test_mode_enabled ? "TEST" : "PRODUCTION");
+             "[%s] Mode: %s\r\n", 
+             time_str, g_system_config.system.test_mode_enabled ? "TEST" : "PRODUCTION");
     result = f_write(&file, log_buffer, strlen(log_buffer), &bytes_written);
     
     // Close file
@@ -509,15 +517,17 @@ bool SD_Logger_LogMIFARECardScan(const uint8_t *card_uid, uint8_t uid_length,
         return false;
     }
     
-    // Get current tick count as timestamp
-    uint32_t timestamp = xTaskGetTickCount();
+    // Get RTC time
+    RTC_DateTime_t now;
+    RTC_GetDateTime(&now);
+    uint16_t ms = xTaskGetTickCount() % 1000;
     
-    // Format log entry header
+    // Format log entry header with full timestamp for card logs
     int len = snprintf(log_buffer, sizeof(log_buffer),
                       "\r\n========================================\r\n"
-                      "[%lu] MIFARE CARD SCAN - Log Type: %d\r\n"
+                      "[%04d-%02d-%02d %02d:%02d:%02d:%03d] MIFARE CARD SCAN - Log Type: %d\r\n"
                       "========================================\r\n",
-                      timestamp, log_type);
+                      now.year, now.month, now.day, now.hour, now.minute, now.second, ms, log_type);
     
     // Write header
     result = f_write(&file, log_buffer, len, &bytes_written);
@@ -546,14 +556,14 @@ bool SD_Logger_LogMIFARECardScan(const uint8_t *card_uid, uint8_t uid_length,
     // Log User Primary Data (Block 5)
     len = snprintf(log_buffer, sizeof(log_buffer),
                   "BLOCK %d (USER PRIMARY):\r\n"
-                  "  Balance: %lu ml\r\n"
-                  "  Last Topup: %lu ml\r\n"
+                  "  Token Count: %lu tokens\r\n"
+                  "  Last Topup: %lu tokens\r\n"
                   "  Transaction Counter: %u\r\n"
                   "  Status Flags: 0x%02X\r\n"
                   "  Transaction State: 0x%02X\r\n",
                   MIFARE_BLOCK_USER_PRIMARY,
-                  mifare_data->user_primary.balance_ml,
-                  mifare_data->user_primary.last_topup_ml,
+                  mifare_data->user_primary.balance,
+                  mifare_data->user_primary.last_topup,
                   mifare_data->user_primary.transaction_counter,
                   mifare_data->user_primary.status_flags,
                   mifare_data->user_primary.transaction_state);
@@ -562,29 +572,85 @@ bool SD_Logger_LogMIFARECardScan(const uint8_t *card_uid, uint8_t uid_length,
     // Log User Backup Data (Block 6)
     len = snprintf(log_buffer, sizeof(log_buffer),
                   "BLOCK %d (USER BACKUP):\r\n"
-                  "  Balance: %lu ml\r\n"
-                  "  Last Topup: %lu ml\r\n"
+                  "  Token Count: %lu tokens\r\n"
+                  "  Last Topup: %lu tokens\r\n"
                   "  Transaction Counter: %u\r\n"
                   "  Status Flags: 0x%02X\r\n"
                   "  Transaction State: 0x%02X\r\n",
                   MIFARE_BLOCK_USER_BACKUP,
-                  mifare_data->user_backup.balance_ml,
-                  mifare_data->user_backup.last_topup_ml,
+                  mifare_data->user_backup.balance,
+                  mifare_data->user_backup.last_topup,
                   mifare_data->user_backup.transaction_counter,
                   mifare_data->user_backup.status_flags,
                   mifare_data->user_backup.transaction_state);
     f_write(&file, log_buffer, len, &bytes_written);
     
-    // Log Usage Data (Block 8)
+    // Log Usage Data (Block 56)
     len = snprintf(log_buffer, sizeof(log_buffer),
                   "BLOCK %d (USAGE DATA):\r\n"
-                  "  Total Volume Purchased: %lu ml\r\n"
-                  "  Total Dispenses Completed: %lu\r\n"
+                  "  Total Tokens Purchased: %lu tokens\r\n"
+                  "  Total Washes Completed: %lu washes\r\n"
                   "  Total Volume Dispensed: %lu ml\r\n",
                   MIFARE_BLOCK_USAGE_DATA,
-                  mifare_data->usage_data.total_volume_purchased_ml,
+                  mifare_data->usage_data.total_volume_purchased,
                   mifare_data->usage_data.total_dispenses_completed,
-                  mifare_data->usage_data.total_volume_dispensed_ml);
+                  mifare_data->usage_data.total_volume_dispensed);
+    f_write(&file, log_buffer, len, &bytes_written);
+    
+    // Log Loyalty Data (Block 53 for car wash)
+    len = snprintf(log_buffer, sizeof(log_buffer),
+                  "BLOCK %d (LOYALTY DATA):\r\n"
+                  "  Loyalty Points: %u pts\r\n"
+                  "  Free Credits: %u\r\n",
+                  MIFARE_BLOCK_LOYALTY,
+                  mifare_data->loyalty_data.loyalty_points,
+                  mifare_data->loyalty_data.free_credits);
+    f_write(&file, log_buffer, len, &bytes_written);
+    
+    // Log Recovery Info (Block 12)
+    len = snprintf(log_buffer, sizeof(log_buffer),
+                  "BLOCK %d (RECOVERY INFO):\r\n"
+                  "  Last Update Time: %lu\r\n"
+                  "  Primary CRC: 0x%04X\r\n"
+                  "  Backup CRC: 0x%04X\r\n"
+                  "  Sequence Number: %u\r\n"
+                  "  Recovery Attempts: %u\r\n"
+                  "  Integrity Flags: 0x%04X\r\n",
+                  MIFARE_BLOCK_ACCOUNT_DATA,
+                  mifare_data->recovery_info.last_update_time,
+                  mifare_data->recovery_info.primary_data_crc,
+                  mifare_data->recovery_info.backup_data_crc,
+                  mifare_data->recovery_info.sequence_number,
+                  mifare_data->recovery_info.recovery_attempts,
+                  mifare_data->recovery_info.integrity_flags);
+    f_write(&file, log_buffer, len, &bytes_written);
+    
+    // Log Token Cache Primary (Block 13)
+    len = snprintf(log_buffer, sizeof(log_buffer),
+                  "BLOCK %d (TOKEN CACHE PRIMARY):\r\n"
+                  "  Token Count: %lu tokens\r\n"
+                  "  Sequence: %u\r\n"
+                  "  Timestamp: %lu\r\n"
+                  "  CRC32: 0x%08lX\r\n",
+                  MIFARE_BLOCK_USER_PRIMARY,
+                  mifare_data->token_cache_primary.balance,
+                  mifare_data->token_cache_primary.sequence_number,
+                  mifare_data->token_cache_primary.timestamp,
+                  mifare_data->token_cache_primary.crc32);
+    f_write(&file, log_buffer, len, &bytes_written);
+    
+    // Log Token Cache Backup (Block 14)
+    len = snprintf(log_buffer, sizeof(log_buffer),
+                  "BLOCK %d (TOKEN CACHE BACKUP):\r\n"
+                  "  Token Count: %lu tokens\r\n"
+                  "  Sequence: %u\r\n"
+                  "  Timestamp: %lu\r\n"
+                  "  CRC32: 0x%08lX\r\n",
+                  MIFARE_BLOCK_USER_BACKUP,
+                  mifare_data->token_cache_backup.balance,
+                  mifare_data->token_cache_backup.sequence_number,
+                  mifare_data->token_cache_backup.timestamp,
+                  mifare_data->token_cache_backup.crc32);
     f_write(&file, log_buffer, len, &bytes_written);
     
     // Log Account Data (Block 16)
@@ -682,7 +748,7 @@ bool SD_Logger_PrintCardLog(const uint8_t *card_uid, uint8_t uid_length)
         
         // Report task health every 50 lines to prevent watchdog timeout
         if (line_count % 50 == 0) {
-            System_ReportTaskStatus(SYSTEM_TASK_ID_SD_LOGGER, true);
+            System_ReportTaskStatus(SYSTEM_TASK_ID_USB_COMMAND_HANDLER, true);
         }
     }
     
@@ -695,105 +761,6 @@ bool SD_Logger_PrintCardLog(const uint8_t *card_uid, uint8_t uid_length)
     xSemaphoreGive(sd_file_mutex);
     
     return true;
-}
-
-/**
- * @brief Recover card balance from SD card log file
- * @param card_uid Card unique identifier (4 or 7 bytes)
- * @param uid_length Length of card UID
- * @param balance_ml Pointer to store recovered balance (in milliliters)
- * @return true if balance was recovered successfully, false otherwise
- * @note Parses the card log file to find the latest balance entry (searches for "Balance:")
- */
-bool SD_Logger_RecoverCardBalance(const uint8_t *card_uid, uint8_t uid_length, uint32_t *balance_ml)
-{
-    if (!sd_logger_context.filesystem_ready || card_uid == NULL || balance_ml == NULL) {
-        USB_Log_Printf("[✗] SD card not ready or invalid parameters\r\n");
-        return false;
-    }
-    
-    // Try to acquire mutex with timeout
-    if (sd_file_mutex == NULL || xSemaphoreTake(sd_file_mutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
-        USB_Log_Printf("[✗] Failed to acquire SD mutex\r\n");
-        return false;
-    }
-    
-    FIL file;
-    FRESULT result;
-    char filename[64];
-    
-    // Create filename based on card UID (e.g., "CARD_42680B06.log")
-    snprintf(filename, sizeof(filename), "0:/CARD_");
-    int offset = strlen(filename);
-    for (uint8_t i = 0; i < uid_length && i < 7; i++) {
-        snprintf(filename + offset, sizeof(filename) - offset, "%02X", card_uid[i]);
-        offset += 2;
-    }
-    snprintf(filename + offset, sizeof(filename) - offset, ".log");
-    
-    // Open card log file for reading
-    result = f_open(&file, filename, FA_READ);
-    if (result != FR_OK) {
-        USB_Log_Printf("[✗] No log file found for card: %s\r\n", filename + 3);
-        xSemaphoreGive(sd_file_mutex);
-        return false;
-    }
-    
-    USB_Log_Printf("[→] Searching log file: %s\r\n", filename + 3);
-    
-    // Read file and find the LAST occurrence of "Balance:" in USER PRIMARY section
-    // We want the most recent balance logged
-    char line_buffer[128];
-    uint32_t last_balance = 0;
-    bool found_balance = false;
-    uint32_t line_count = 0;
-    bool in_primary_section = false;
-    
-    while (f_gets(line_buffer, sizeof(line_buffer), &file) != NULL) {
-        line_count++;
-        
-        // Track if we're in USER PRIMARY section (we want primary balance, not backup)
-        if (strstr(line_buffer, "USER PRIMARY") != NULL) {
-            in_primary_section = true;
-        } else if (strstr(line_buffer, "USER BACKUP") != NULL || 
-                   strstr(line_buffer, "USAGE DATA") != NULL ||
-                   strstr(line_buffer, "ACCOUNT DATA") != NULL) {
-            in_primary_section = false;
-        }
-        
-        // Look for "Balance:" line within USER PRIMARY section
-        if (in_primary_section) {
-            const char *balance_ptr = strstr(line_buffer, "Balance:");
-            if (balance_ptr != NULL) {
-                // Parse the balance value - format is "  Balance: 12345 ml"
-                balance_ptr += 8;  // Skip "Balance:"
-                while (*balance_ptr == ' ') balance_ptr++;  // Skip whitespace
-                
-                uint32_t parsed_balance = (uint32_t)strtoul(balance_ptr, NULL, 10);
-                if (parsed_balance > 0 || *balance_ptr == '0') {
-                    last_balance = parsed_balance;
-                    found_balance = true;
-                }
-            }
-        }
-        
-        // Report task health every 100 lines
-        if (line_count % 100 == 0) {
-            System_ReportTaskStatus(SYSTEM_TASK_ID_SD_LOGGER, true);
-        }
-    }
-    
-    f_close(&file);
-    xSemaphoreGive(sd_file_mutex);
-    
-    if (found_balance) {
-        *balance_ml = last_balance;
-        USB_Log_Printf("[✓] Found balance in log: %lu ml\r\n", last_balance);
-        return true;
-    } else {
-        USB_Log_Printf("[✗] No balance entry found in log file\r\n");
-        return false;
-    }
 }
 
 /**
@@ -833,7 +800,8 @@ static bool write_log_to_file(const char *message, uint32_t timestamp)
     FIL file;
     FRESULT result;
     UINT bytes_written;
-    char log_buffer[140];
+    char log_buffer[160];
+    static RTC_DateTime_t last_log_date = {0};
     
     // Open/create system log file
     result = f_open(&file, "0:/system_log.txt", FA_OPEN_APPEND | FA_WRITE);
@@ -842,8 +810,29 @@ static bool write_log_to_file(const char *message, uint32_t timestamp)
         return false;
     }
     
-    // Format with timestamp
-    int len = snprintf(log_buffer, sizeof(log_buffer) - 2, "[%lu] %s", timestamp, message);
+    // Get current RTC time
+    RTC_DateTime_t now;
+    RTC_GetDateTime(&now);
+    uint16_t ms = xTaskGetTickCount() % 1000;
+    
+    // Check if date changed (or first run)
+    if (now.year != last_log_date.year || 
+        now.month != last_log_date.month || 
+        now.day != last_log_date.day) {
+        
+        // Write date header
+        int header_len = snprintf(log_buffer, sizeof(log_buffer), 
+                                "\r\nDate: %02d-%02d-%04d\r\n", 
+                                now.day, now.month, now.year);
+        f_write(&file, log_buffer, header_len, &bytes_written);
+        
+        // Update last log date
+        last_log_date = now;
+    }
+    
+    // Format with RTC timestamp [HH:MM:SS:ms]
+    int len = snprintf(log_buffer, sizeof(log_buffer) - 2, "[%02d:%02d:%02d:%03d] %s", 
+                      now.hour, now.minute, now.second, ms, message);
     if (len < 0) len = 0;
     if (len > (int)sizeof(log_buffer) - 3) len = sizeof(log_buffer) - 3;
     log_buffer[len++] = '\r';
@@ -865,24 +854,33 @@ static bool write_log_to_file(const char *message, uint32_t timestamp)
  */
 bool SD_Logger_LogEvent(const char *format, ...)
 {
-    if (!sd_logger_context.filesystem_ready || format == NULL || sd_log_queue == NULL) {
+    if (format == NULL) {
+        return false;
+    }
+    
+    char log_buffer[SD_LOG_MSG_MAX_LEN];
+    va_list args;
+    va_start(args, format);
+    int len = vsnprintf(log_buffer, sizeof(log_buffer), format, args);
+    va_end(args);
+    
+    // Ensure null termination
+    if (len < 0) len = 0;
+    if (len >= (int)sizeof(log_buffer)) {
+        log_buffer[sizeof(log_buffer) - 1] = '\0';
+    }
+    
+    // Always mirror to USB Log for visibility (especially if RS485 is listening)
+    USB_Log_Printf("[SD] %s\r\n", log_buffer);
+    
+    if (!sd_logger_context.filesystem_ready || sd_log_queue == NULL) {
         return false;
     }
     
     SDLogQueueMsg_t log_msg;
     log_msg.timestamp = xTaskGetTickCount();
-    
-    // Format the message
-    va_list args;
-    va_start(args, format);
-    int len = vsnprintf(log_msg.message, sizeof(log_msg.message), format, args);
-    va_end(args);
-    
-    // Ensure null termination
-    if (len < 0) len = 0;
-    if (len >= (int)sizeof(log_msg.message)) {
-        log_msg.message[sizeof(log_msg.message) - 1] = '\0';
-    }
+    strncpy(log_msg.message, log_buffer, sizeof(log_msg.message) - 1);
+    log_msg.message[sizeof(log_msg.message) - 1] = '\0';
     
     // Queue the message (non-blocking)
     if (xQueueSend(sd_log_queue, &log_msg, 0) != pdTRUE) {
@@ -909,6 +907,15 @@ bool SD_Logger_LogTransaction(const uint8_t *card_uid, uint8_t uid_length,
                               uint32_t balance_before, uint32_t balance_after,
                               uint32_t amount)
 {
+    const char* unit = MIFARE_GetBalanceUnit();
+
+    // Always log to console for immediate visibility
+    USB_Log_Printf("[SD TXN] [%02X%02X%02X%02X] %s | %lu -> %lu %s (Amt: %lu)\r\n",
+                   card_uid ? card_uid[0] : 0, card_uid ? card_uid[1] : 0,
+                   card_uid ? card_uid[2] : 0, card_uid ? card_uid[3] : 0,
+                   event_type ? event_type : "?",
+                   balance_before, balance_after, unit, amount);
+
     if (!sd_logger_context.filesystem_ready || card_uid == NULL || event_type == NULL) {
         return false;
     }
@@ -942,13 +949,17 @@ bool SD_Logger_LogTransaction(const uint8_t *card_uid, uint8_t uid_length,
         return false;
     }
     
-    // Get current tick count as timestamp
-    uint32_t timestamp = xTaskGetTickCount();
+    // Get RTC time
+    RTC_DateTime_t now;
+    RTC_GetDateTime(&now);
+    uint16_t ms = xTaskGetTickCount() % 1000;
     
     // Format transaction log entry
+    // Format transaction log entry with full timestamp for card logs
     int len = snprintf(log_buffer, sizeof(log_buffer),
-                      "[%lu] TRANSACTION: %s | Before: %lu mL | After: %lu mL | Amount: %lu mL\r\n",
-                      timestamp, event_type, balance_before, balance_after, amount);
+                      "[%04d-%02d-%02d %02d:%02d:%02d:%03d] TRANSACTION: %s | Before: %lu %s | After: %lu %s | Amount: %lu %s\r\n",
+                      now.year, now.month, now.day, now.hour, now.minute, now.second, ms, 
+                      event_type, balance_before, unit, balance_after, unit, amount, unit);
     
     // Write to file
     result = f_write(&file, log_buffer, len, &bytes_written);
@@ -959,9 +970,9 @@ bool SD_Logger_LogTransaction(const uint8_t *card_uid, uint8_t uid_length,
     xSemaphoreGive(sd_file_mutex);
     
     // Also log to system log (this will acquire its own mutex)
-    SD_Logger_LogEvent("TXN [%02X%02X%02X%02X]: %s | %lu->%lu mL",
+    SD_Logger_LogEvent("TXN [%02X%02X%02X%02X]: %s | %lu->%lu %s",
                        card_uid[0], card_uid[1], card_uid[2], card_uid[3],
-                       event_type, balance_before, balance_after);
+                       event_type, balance_before, balance_after, unit);
     
     LOG_DEBUG_SD_LOGGER("[SD_LOGGER] Transaction logged: %s - %s\r\n", filename, event_type);
     
@@ -977,6 +988,12 @@ bool SD_Logger_LogTransaction(const uint8_t *card_uid, uint8_t uid_length,
  */
 bool SD_Logger_LogError(const char *module, int error_code, const char *description)
 {
+    // Always log to console for immediate visibility
+    USB_Log_Printf("[SD ERR] [%s] %d: %s\r\n", 
+                   module ? module : "?", 
+                   error_code, 
+                   description ? description : "");
+
     if (!sd_logger_context.filesystem_ready) {
         return false;
     }
@@ -1000,13 +1017,15 @@ bool SD_Logger_LogError(const char *module, int error_code, const char *descript
         return false;
     }
     
-    // Get current tick count as timestamp
-    uint32_t timestamp = xTaskGetTickCount();
+    // Get RTC time
+    RTC_DateTime_t now;
+    RTC_GetDateTime(&now);
+    uint16_t ms = xTaskGetTickCount() % 1000;
     
-    // Format error log entry
+    // Format error log entry with full timestamp
     int len = snprintf(log_buffer, sizeof(log_buffer),
-                      "[%lu] ERROR [%s] Code: %d - %s\r\n",
-                      timestamp, 
+                      "[%04d-%02d-%02d %02d:%02d:%02d:%03d] ERROR [%s] Code: %d - %s\r\n",
+                      now.year, now.month, now.day, now.hour, now.minute, now.second, ms, 
                       module ? module : "UNKNOWN",
                       error_code,
                       description ? description : "No description");
@@ -1025,66 +1044,72 @@ bool SD_Logger_LogError(const char *module, int error_code, const char *descript
                        error_code, 
                        description ? description : "");
     
-    LOG_DEBUG_SD_LOGGER("[SD_LOGGER] Error logged: [%s] %d\r\n", module, error_code);
+    LOG_DEBUG_SD_LOGGER("[SD_LOGGER] Error logged: %s - %d\r\n", module, error_code);
     
     return (result == FR_OK);
 }
 
-/* ========================================================================== */
-/*                       USB MSC MODE SUPPORT FUNCTIONS                       */
-/* ========================================================================== */
-
 /**
- * @brief Suspend SD logging for USB MSC mode
- * @note Stops the logging task from writing to SD card
+ * @brief Get last known balance from SD card transaction logs
+ * @param card_uid Card unique identifier  
+ * @param uid_length Length of card UID (4 or 7 bytes)
+ * @param balance_out Pointer to store retrieved balance
+ * @return true if balance found, false otherwise
  */
-void SD_Logger_SuspendLogging(void)
+bool SD_Logger_GetLastBalance(const uint8_t *card_uid, uint8_t uid_length, uint32_t *balance_out)
 {
-    LOG_CRITICAL_SD_LOGGER("[SD_LOGGER] Suspending logging for USB MSC mode\r\n");
+    if (!sd_logger_context.filesystem_ready || card_uid == NULL || balance_out == NULL) {
+        return false;
+    }
     
-    // Mark as suspended first
-    sd_logger_context.suspended = true;
-    sd_logger_context.filesystem_ready = false;
+    // Try to acquire mutex with timeout
+    if (sd_file_mutex == NULL || xSemaphoreTake(sd_file_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        return false;
+    }
     
-    // Wait for any pending file operations to complete
-    if (sd_file_mutex != NULL) {
-        if (xSemaphoreTake(sd_file_mutex, pdMS_TO_TICKS(2000)) == pdTRUE) {
-            // Got mutex, release it - ensures no file ops in progress
-            xSemaphoreGive(sd_file_mutex);
+    FIL file;
+    FRESULT result;
+    char filename[64];
+    char line_buffer[256];
+    
+    // Create filename based on card UID
+    snprintf(filename, sizeof(filename), "0:/CARD_");
+    int offset = strlen(filename);
+    for (uint8_t i = 0; i < uid_length && i < 7; i++) {
+        snprintf(filename + offset, sizeof(filename) - offset, "%02X", card_uid[i]);
+        offset += 2;
+    }
+    snprintf(filename + offset, sizeof(filename) - offset, ".log");
+    
+    // Open card log file for reading
+    result = f_open(&file, filename, FA_READ);
+    if (result != FR_OK) {
+        xSemaphoreGive(sd_file_mutex);
+        return false;
+    }
+    
+    // Scan file backwards for last transaction entry
+    uint32_t last_balance = 0;
+    bool found = false;
+    
+    while (f_gets(line_buffer, sizeof(line_buffer), &file)) {
+        // Look for transaction lines: "[timestamp] TRANSACTION: ... | After: XXX mL ..."
+        char *after_marker = strstr(line_buffer, "After: ");
+        if (after_marker) {
+            uint32_t balance = 0;
+            if (sscanf(after_marker + 7, "%lu", &balance) == 1) {
+                last_balance = balance;
+                found = true;
+            }
         }
     }
     
-    LOG_CRITICAL_SD_LOGGER("[SD_LOGGER] Logging suspended\r\n");
-}
-
-/**
- * @brief Resume SD logging after USB MSC mode
- * @note Resumes the logging task after FatFs is remounted
- */
-void SD_Logger_ResumeLogging(void)
-{
-    LOG_CRITICAL_SD_LOGGER("[SD_LOGGER] Resuming logging after USB MSC mode\r\n");
+    f_close(&file);
+    xSemaphoreGive(sd_file_mutex);
     
-    // Clear suspended flag and reset state to remount
-    sd_logger_context.suspended = false;
-    sd_logger_context.retry_count = 0;
-    
-    // Force remount by going to MOUNT_FS state
-    // The FatFs should already be mounted by USB_MSC_Disable()
-    sd_logger_context.filesystem_ready = true;
-    sd_logger_context.current_state = SD_LOGGER_STATE_READY;
-    
-    LOG_CRITICAL_SD_LOGGER("[SD_LOGGER] Logging resumed\r\n");
-}
-
-/**
- * @brief Get the FatFs object used by SD Logger
- * @return Pointer to FATFS object, or NULL if not mounted
- */
-FATFS* SD_Logger_GetFatFs(void)
-{
-    if (sd_logger_context.filesystem_ready && !sd_logger_context.suspended) {
-        return &sd_logger_context.fatfs;
+    if (found) {
+        *balance_out = last_balance;
     }
-    return NULL;
+    
+    return found;
 }

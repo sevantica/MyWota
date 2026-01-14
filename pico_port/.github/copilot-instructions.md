@@ -1,4 +1,4 @@
-# Copilot Instructions for MyWota Firmware
+# Copilot Instructions for BigYellow Firmware
 
 ## Driver and Module Initialization Pattern
 
@@ -74,31 +74,6 @@ void init_pcd_hw(void)
 | `init_pcd_hw()` | NFC/RFID hardware | I2C0 |
 | `init_io_expander_hw()` | I/O expander hardware | I2C0 |
 | `init_sd_hw()` | SD card hardware | SPI0 |
-
-### Example: RS485 Communication Task (UART-based)
-
-```c
-// In RS485_Task.c
-static void RS485_Task(void* argument)
-{
-    rs485_hardware_init();  // Initializes UART0 + DE pin internally
-    RS485_FileTransfer_Init();
-    
-    for(;;) {
-        TASK_HEARTBEAT_EVERY_SECOND("RS485_Task");
-        System_ReportTaskStatus(SYSTEM_TASK_ID_RS485, true);
-        // ... task work
-    }
-}
-
-// Hardware initialization is internal to the task
-static void rs485_hardware_init(void)
-{
-    app_pins = Get_App_GPIO_Pins();
-    uart_init(RS485_UART_INSTANCE, RS485_BAUDRATE);
-    // DE pin already initialized by Hardware_Access
-}
-```
 
 ### Low-Level Init Functions (Idempotent)
 
@@ -202,7 +177,7 @@ taskEXIT_CRITICAL();  // Re-enable interrupts
 - **Never push to buzzer** - Don't call `Buzzer_Beep()` directly from other modules
 - Buzzer driver polls:
   - `Dispenser_IsValveOpen()` - Monitors valve state for dispense start/stop
-  - `MIFARE_Dispenser_IsDispenseActive()` - Monitors dispense state for dispenser start/finish
+  - `MIFARE_CarWash_IsWashActive()` - Monitors wash state for car wash start/finish
 - Buzzer task handles beep patterns internally based on state transitions
 
 ### Benefits
@@ -214,29 +189,104 @@ taskEXIT_CRITICAL();  // Re-enable interrupts
 ### Implementation Pattern
 ```c
 // ❌ WRONG - Direct call (push pattern)
-void Dispenser_StartDispense(void) {
+void CarWash_StartWash(void) {
     Buzzer_Beep(buzzer, 200);  // DON'T DO THIS
 }
 
 // ✅ CORRECT - Polling pattern
-bool MIFARE_Dispenser_IsDispenseActive(void) {
-    return g_dispense_timer.dispense_active;  // Getter for polling
+bool MIFARE_CarWash_IsWashActive(void) {
+    return g_wash_timer.wash_active;  // Getter for polling
 }
 
 // Buzzer task polls this getter every 50ms
 static void Buzzer_PollingTaskFunc(void *pvParameters) {
-    bool last_dispense_state = false;
+    bool last_wash_state = false;
     while(1) {
-        bool current = MIFARE_Dispenser_IsDispenseActive();
-        if (current != last_dispense_state) {
+        bool current = MIFARE_CarWash_IsWashActive();
+        if (current != last_wash_state) {
             if (current) Buzzer_SignalDispenserStart(handle);
             else Buzzer_SignalDispenserStop(handle);
-            last_dispense_state = current;
+            last_wash_state = current;
         }
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 ```
+
+## Adapter Pattern for Cross-Project Code Sharing
+
+When functionality differs between projects (BigYellow vs MyWota), use the **adapter pattern** to keep core logic shared in `sevantica_drivers` while isolating project-specific behavior in application adapters.
+
+### Pattern Structure
+
+**Core files (in sevantica_drivers/):**
+- Shared implementation used by both projects
+- Contains common logic, state management, and interfaces
+- Auto-included via GLOB in sevantica_drivers/CMakeLists.txt
+
+**Adapter files (in application/):**
+- Project-specific implementations
+- Small files containing only differences between projects
+- Explicitly listed in project CMakeLists.txt
+
+### Example: MIFARE Transaction Management
+
+**Core (shared):**
+- `sevantica_drivers/Source/MIFARE_Transaction_Core.c` - Common card operations
+- `sevantica_drivers/Include/MIFARE_Transaction_Core.h` - Core interface
+
+**Adapters (project-specific):**
+- BigYellow: `application/Source/MIFARE_Token_Adapter.c` - Token-based car wash
+- MyWota: `application/Source/MIFARE_Volume_Adapter.c` - Volume-based dispensing
+
+### Example: USB Command Handler
+
+**Core (shared):**
+- `sevantica_drivers/Source/USB_Command_Handler.c` - Command parsing, core commands
+- `sevantica_drivers/Include/USB_Command_Handler.h` - Core interface
+
+**Adapters (project-specific):**
+- BigYellow: `application/Source/USB_Command_Adapter.c` - Wash commands (washstart/washstop)
+- MyWota: `application/Source/USB_Command_Adapter.c` - Dispenser commands (dispensestart/stop/wait, msc)
+
+### Adapter Interface Functions
+
+Each adapter must implement standard functions called by the core:
+
+```c
+// In USB_Command_Adapter.h (both projects)
+const USB_Command_Adapter_Entry_t* USB_Command_Adapter_GetCommands(void);
+size_t USB_Command_Adapter_GetCommandCount(void);
+void USB_Command_Adapter_PrintStatus(void);
+const char* USB_Command_Adapter_GetIncludesInfo(void);
+```
+
+### Benefits
+
+✅ **Single source of truth** - Core logic maintained in one place  
+✅ **Easy updates** - Bug fixes automatically apply to both projects  
+✅ **Clear separation** - Project differences isolated in small adapter files  
+✅ **No duplication** - Common code isn't copied between projects  
+✅ **Build efficiency** - Core files auto-included via GLOB  
+
+### When to Use Adapters
+
+Use this pattern when:
+- Functionality is >80% identical between projects
+- Differences are isolated to specific operations/commands
+- Projects share the same underlying architecture
+- You want to avoid maintaining duplicate files
+
+**Don't use** for completely different implementations - just make separate files.
+
+### Critical Rule
+
+**ALWAYS place core files in `sevantica_drivers/`, NOT in application folders.**
+
+This ensures:
+- Single file to maintain (not duplicated per project)
+- Automatic inclusion via sevantica_drivers GLOB
+- Clear separation of shared vs project-specific code
 
 ## FreeRTOS Task Patterns
 
@@ -485,148 +535,6 @@ if (xSemaphoreTake(mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
 xTimerCreate("Timer", pdMS_TO_TICKS(1000), pdTRUE, NULL, callback);
 ```
 
-## System Configuration Organization Pattern
-
-### Configuration Structure Philosophy
-All configuration follows a strict organizational pattern for maintainability and clarity:
-
-1. **One config struct per module** - Each module (MIFARE, UI, Dispenser, etc.) has exactly ONE configuration structure
-2. **No separate timing configs** - Timing parameters are part of the main module config, not separate structs
-3. **Grouped organization** - All module configs are grouped together in `SystemConfig_t`
-4. **Consistent ordering** - Same order everywhere: defaults, parsing, writing, printing, example file
-
-### SystemConfig_t Structure Order
-
-```c
-typedef struct {
-    uint32_t magic;                         /* Config file marker */
-    uint8_t version;                        /* Config file version */
-    
-    /* System-wide configuration (first) */
-    System_Config_t system;                 /* System-wide parameters */
-    Modules_Config_t modules;               /* Module enable/disable */
-    
-    /* Module-specific configurations (grouped together) */
-    MIFARE_Config_t mifare;                 /* MIFARE card reader module */
-    UI_Config_t ui;                         /* UI display module */
-    Dispenser_Config_t dispenser;           /* Dispenser controller module */
-    IOExpander_Config_t io_expander;        /* I/O expander module */
-    RS485_Config_t rs485;                   /* RS485 communication module */
-    Buzzer_Config_t buzzer;                 /* Buzzer module */
-    SDLogger_Config_t sd_logger;            /* SD logger module */
-    RTC_Config_t rtc;                       /* RTC module */
-    FlowSensor_Config_t flow_sensor;        /* Flow sensor module */
-    Hardware_Bus_Config_t hardware_bus;     /* Hardware bus (SPI/I2C) */
-    
-    uint32_t crc32;                         /* Config integrity checksum */
-} SystemConfig_t;
-```
-
-### Module Config Example: MIFARE
-
-**Correct** - All parameters in one structure:
-```c
-typedef struct {
-    uint32_t card_timeout_ms;
-    uint8_t max_retries;
-    // ... other MIFARE parameters
-    uint32_t post_reset_cooldown_ms;        /* Timing parameter */
-    bool auto_recovery_enabled;             /* Timing parameter */
-    MIFARE_Security_Config_t security;      /* Nested config OK */
-} MIFARE_Config_t;
-```
-
-**Wrong** - Separate timing struct:
-```c
-// ❌ DON'T DO THIS
-typedef struct {
-    uint32_t card_timeout_ms;
-    uint8_t max_retries;
-} MIFARE_Config_t;
-
-typedef struct {
-    uint32_t post_reset_cooldown_ms;
-    bool auto_recovery_enabled;
-} MIFARE_Timing_Config_t;  // ❌ Separate timing config
-```
-
-### Config File Organization
-
-All functions must follow the same grouping order:
-
-1. **Config_InitDefaults()** - Group system-wide first, then all modules
-2. **Config_ParseLine()** - Parse in same order as defaults
-3. **Config_WriteToFile()** - Write sections in same order
-4. **Config_PrintToUSB()** - Print in same order
-5. **example_config.txt** - Comment sections matching code order
-
-Example from Config_InitDefaults():
-```c
-void Config_InitDefaults(void)
-{
-    g_system_config.magic = CONFIG_MAGIC_NUMBER;
-    g_system_config.version = CONFIG_VERSION;
-    
-    /* ========================================================================== */
-    /* SYSTEM-WIDE CONFIGURATION                                                  */
-    /* ========================================================================== */
-    
-    /* System defaults */
-    g_system_config.system.test_mode_enabled = false;
-    // ...
-    
-    /* Module enable defaults */
-    g_system_config.modules.lcd_display_enabled = true;
-    // ...
-    
-    /* ========================================================================== */
-    /* MODULE-SPECIFIC CONFIGURATION                                               */
-    /* ========================================================================== */
-    
-    /* MIFARE defaults */
-    g_system_config.mifare.card_timeout_ms = 2000;
-    g_system_config.mifare.post_reset_cooldown_ms = 1200;  // Timing with main config
-    // ...
-    
-    /* UI defaults */
-    g_system_config.ui.display_refresh_ms = 20;
-    g_system_config.ui.lvgl_task_period_ms = 5;  // Timing with main config
-    // ...
-    
-    /* Dispenser defaults */
-    // ...
-    
-    /* I/O Expander defaults */
-    // ...
-    
-    /* RS485 defaults */
-    // ...
-    
-    /* Buzzer defaults */
-    // ...
-    
-    /* SD Logger defaults */
-    // ...
-    
-    /* RTC defaults */
-    // ...
-    
-    /* Flow Sensor defaults */
-    // ...
-    
-    /* Hardware Bus defaults */
-    // ...
-}
-```
-
-### Benefits of This Pattern
-
-1. **Consistency** - Same order everywhere makes code predictable
-2. **Maintainability** - Adding parameters is straightforward
-3. **Clarity** - One config per module, no scattered timing structs
-4. **Review-friendly** - Easy to see all parameters for a module together
-5. **Config file matches code** - User-facing config.txt follows same structure
-
 ## SD Card Configuration Pattern
 
 ### Configuration File Structure
@@ -865,138 +773,6 @@ else if (strcmp(param, "ui.new_param") == 0) {
 }
 ```
 
-## Module Runtime Control System
-
-All major subsystems are managed as runtime-controllable modules that can be started/stopped dynamically and configured to auto-start at boot.
-
-### Module System Components
-
-Every module must be integrated into these locations:
-
-1. **System.h** - Add to `System_Module_t` enum
-2. **System.h** - Add to `System_Task_ID_t` enum (for watchdog tracking)
-3. **System.c** - Add to `Task_ID_t` internal enum
-4. **System.c** - Add to `s_task_wdt_status[]` array with name string
-5. **System.c** - Add to `s_module_states[]` array with initial state
-6. **System.c** - Add to `s_module_names[]` array with display name
-7. **System.c** - Add to `system_init()` with conditional startup based on config
-8. **System.c** - Add case to `System_StartModule()` switch statement
-9. **System.c** - Add case to `System_StopModule()` switch statement
-10. **System.c** - Add to `boot_enabled[]` array in `System_PrintModuleStatus()`
-11. **System_Config.h** - Add bool field to `Modules_Config_t` struct
-12. **System_Config.c** - Add default value in `Config_InitDefaults()`
-13. **System_Config.c** - Add parser in `Config_ParseLine()`
-14. **System_Config.c** - Update `EXPECTED_PARAMS_Vx` count
-15. **System_Config.c** - Add to `Config_WriteToFile()`
-16. **System_Config.c** - Add to `Config_PrintToUSB()`
-17. **USB_Command_Handler.c** - Add to `parse_module_name()` function
-18. **USB_Command_Handler.c** - Update help text in `cmd_start()` and `cmd_stop()`
-19. **USB_Command_Handler.c** - Add to `handle_set_command()` for runtime config
-
-### Example: Adding RS485 Module
-
-```c
-// 1. System.h - Module enum
-typedef enum {
-    MODULE_LCD_DISPLAY = 0,
-    MODULE_MIFARE_POLLING,
-    MODULE_DISPENSER,
-    MODULE_BUZZER,
-    MODULE_IO_EXPANDER,
-    MODULE_RS485,  // ← Add new module
-    MODULE_COUNT
-} System_Module_t;
-
-// 2. System.h - Task ID for watchdog
-typedef enum {
-    SYSTEM_TASK_ID_SD_LOGGER = 0,
-    // ... other tasks
-    SYSTEM_TASK_ID_RS485,  // ← Add task ID
-} System_Task_ID_t;
-
-// 3. System.c - Watchdog tracking
-static Task_WDT_Status_t s_task_wdt_status[TASK_ID_COUNT] = {
-    // ... other tasks
-    {"RS485", TASK_STATUS_UNKNOWN, 0}  // ← Add with name
-};
-
-// 4. System.c - Module names
-static const char* s_module_names[MODULE_COUNT] = {
-    // ... other names
-    "RS485"  // ← Display name
-};
-
-// 5. System.c - Conditional startup
-if (cfg->modules.rs485_enabled) {
-    Task_Start_RS485_Task();
-    s_module_states[MODULE_RS485] = MODULE_STATE_RUNNING;
-    LOG_CRITICAL_SYSTEM("[→] RS485 Task started\r\n");
-} else {
-    LOG_CRITICAL_SYSTEM("[!] RS485 Task DISABLED by config\r\n");
-}
-
-// 6. System.c - Start/Stop handlers
-case MODULE_RS485:
-    Task_Start_RS485_Task();
-    success = true;
-    break;
-
-// 7. System_Config.h - Config struct
-typedef struct {
-    bool lcd_display_enabled;
-    bool mifare_polling_enabled;
-    bool dispenser_enabled;
-    bool buzzer_enabled;
-    bool io_expander_enabled;
-    bool rs485_enabled;  // ← Add config field
-} Modules_Config_t;
-
-// 8. System_Config.c - Default value
-g_system_config.modules.rs485_enabled = true;
-
-// 9. System_Config.c - Parser
-else if (strcmp(k, "modules.rs485_enabled") == 0) {
-    g_system_config.modules.rs485_enabled = (atoi(v) != 0);
-    params_found++;
-}
-
-// 10. USB_Command_Handler.c - Name parser
-if (strcasecmp(name, "rs485") == 0 || strcasecmp(name, "rs485_comm") == 0) {
-    return MODULE_RS485;
-}
-```
-
-### Module Status Display
-
-The `modules` USB command shows all modules:
-
-```
-═══════════════════════════════════════════════════════════════
-                    MODULE STATUS                                
-═══════════════════════════════════════════════════════════════
-Module               Boot Config  Runtime State
-───────────────────────────────────────────────────────────────
-LCD_Display          Enabled      RUNNING     
-MIFARE_Polling       Enabled      RUNNING     
-Dispenser            Enabled      RUNNING     
-Buzzer               Enabled      RUNNING     
-IO_Expander          Enabled      RUNNING     
-RS485                Enabled      RUNNING     
-═══════════════════════════════════════════════════════════════
-
-Commands: start <module>, stop <module>
-Modules: lcd, mifare, dispenser, buzzer, ioexp, rs485
-```
-
-### Key Points
-
-- **Always update all 19 locations** when adding a new module
-- **Module names** should be concise for USB commands (e.g., "rs485", "lcd")
-- **Display names** can be more descriptive (e.g., "RS485", "LCD_Display")
-- **Config version** must increment when adding module config fields
-- **Expected param count** must update in System_Config.c
-- Modules start **conditionally** based on `cfg->modules.<name>_enabled`
-
 ## CMake Source File Management
 
 This project uses **explicit source file lists** in project-specific CMakeLists.txt instead of `file(GLOB ...)`. This provides better build reliability and ensures CMake properly detects when files are added or removed.
@@ -1020,8 +796,8 @@ Update `APP_SOURCES` in `pico_port/CMakeLists.txt`:
 
 ```cmake
 set(APP_SOURCES
-    ../application/Source/MyWota_ui_driver.c
-    ../application/Source/Dispenser_Controller.c
+    ../application/Source/bigYellow_ui_driver.c
+    ../application/Source/Car_Wash_Controller.c
     ../application/Source/Hardware_Access.c
     ../application/Source/IO_Expander_Control.c
     ../application/Source/MIFARE_Transaction_Manager.c

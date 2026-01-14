@@ -122,10 +122,10 @@ enum {
 char const *string_desc_arr[] = {
     (const char[]) { 0x09, 0x04 }, // 0: is supported language is English (0x0409)
     "Sevantica",                   // 1: Manufacturer
-    "BigYellow SD Logger",         // 2: Product
+    "MyWota SD Logger",            // 2: Product
     NULL,                          // 3: Serial will use unique ID
-    "BigYellow Serial",            // 4: CDC Interface
-    "BigYellow SD Card",           // 5: MSC Interface
+    "MyWota Serial",               // 4: CDC Interface
+    "MyWota SD Card",              // 5: MSC Interface
 };
 
 static uint16_t _desc_str[32 + 1];

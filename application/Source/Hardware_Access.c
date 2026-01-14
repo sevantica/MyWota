@@ -28,8 +28,7 @@
 #include "hardware/dma.h"
 #include "FreeRTOS.h"
 #include "semphr.h"
-
-#define I2C_TIMEOUT_US 50000  /* 50ms timeout for I2C operations */
+#include "task.h"
 
 /* ===================================================================== */
 /* Hardware Configuration Constants                                     */
@@ -286,6 +285,19 @@ void SPI_0_WriteBuffer_Raw(const uint8_t *src, size_t len)
     if (spi_0_dma_tx_channel >= 0 && len >= 32) {
         dma_channel_set_read_addr(spi_0_dma_tx_channel, src, false);
         dma_channel_set_trans_count(spi_0_dma_tx_channel, len, true);  // Start transfer
+        
+        /* Optimization: Yield CPU if transfer is long enough */
+        uint32_t actual_baud = spi_get_baudrate(SPI_0);
+        if (actual_baud > 0) {
+            /* Calculate duration in ms: (bytes * 8 bits * 1000 ms/s) / baudrate */
+            uint32_t duration_ms = (len * 8000U) / actual_baud;
+            if (duration_ms > 1) {
+                /* Yield for the estimated duration. 
+                 * The final blocking wait will catch any small remainder. */
+                vTaskDelay(pdMS_TO_TICKS(duration_ms));
+            }
+        }
+
         dma_channel_wait_for_finish_blocking(spi_0_dma_tx_channel);
         
         // Wait for SPI FIFO to drain completely
@@ -404,7 +416,7 @@ int I2C_0_WriteByte_Raw(uint8_t addr, uint8_t data)
  */
 int I2C_0_ReadByte_Raw(uint8_t addr, uint8_t *data)
 {
-    return i2c_read_timeout_us(I2C_0, addr, data, 1, false, I2C_TIMEOUT_US);
+    return i2c_read_blocking(I2C_0, addr, data, 1, false);
 }
 
 /**
@@ -417,7 +429,7 @@ int I2C_0_ReadByte_Raw(uint8_t addr, uint8_t *data)
  */
 int I2C_0_WriteBuffer_Raw(uint8_t addr, const uint8_t *src, size_t len, bool nostop)
 {
-    return i2c_write_timeout_us(I2C_0, addr, src, len, nostop, I2C_TIMEOUT_US);
+    return i2c_write_blocking(I2C_0, addr, src, len, nostop);
 }
 
 /**
@@ -430,7 +442,7 @@ int I2C_0_WriteBuffer_Raw(uint8_t addr, const uint8_t *src, size_t len, bool nos
  */
 int I2C_0_ReadBuffer_Raw(uint8_t addr, uint8_t *dst, size_t len, bool nostop)
 {
-    return i2c_read_timeout_us(I2C_0, addr, dst, len, nostop, I2C_TIMEOUT_US);
+    return i2c_read_blocking(I2C_0, addr, dst, len, nostop);
 }
 
 /**
@@ -451,7 +463,7 @@ int I2C_0_Write(uint8_t addr, const uint8_t *src, size_t len, bool nostop)
         return -1;  // Timeout acquiring mutex
     }
     
-    int result = i2c_write_timeout_us(I2C_0, addr, src, len, nostop, I2C_TIMEOUT_US);
+    int result = i2c_write_blocking(I2C_0, addr, src, len, nostop);
     
     xSemaphoreGive(i2c_0_mutex);
     return result;
@@ -475,7 +487,7 @@ int I2C_0_Read(uint8_t addr, uint8_t *dst, size_t len, bool nostop)
         return -1;  // Timeout acquiring mutex
     }
     
-    int result = i2c_read_timeout_us(I2C_0, addr, dst, len, nostop, I2C_TIMEOUT_US);
+    int result = i2c_read_blocking(I2C_0, addr, dst, len, nostop);
     
     xSemaphoreGive(i2c_0_mutex);
     return result;
@@ -501,14 +513,14 @@ int I2C_0_WriteRead(uint8_t addr, const uint8_t *src, size_t src_len, uint8_t *d
     }
     
     // Write with nostop=true to keep bus control
-    int write_result = i2c_write_timeout_us(I2C_0, addr, src, src_len, true, I2C_TIMEOUT_US);
+    int write_result = i2c_write_blocking(I2C_0, addr, src, src_len, true);
     if (write_result < 0) {
         xSemaphoreGive(i2c_0_mutex);
         return -1;
     }
     
     // Read with nostop=false to release bus
-    int result = i2c_read_timeout_us(I2C_0, addr, dst, dst_len, false, I2C_TIMEOUT_US);
+    int result = i2c_read_blocking(I2C_0, addr, dst, dst_len, false);
     
     xSemaphoreGive(i2c_0_mutex);
     return result;

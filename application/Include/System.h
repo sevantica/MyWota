@@ -15,6 +15,7 @@
 
 /*Includes ----------------------------------------------------------*/
 #include "FreeRTOS.h"
+#include "MIFARE_Transaction_Core.h"
 #include "task.h"
 #include "queue.h"
 #include "semphr.h"
@@ -34,7 +35,7 @@ typedef enum {
     SYSTEM_TASK_ID_USB_CDC,
     SYSTEM_TASK_ID_USB_COMMAND_HANDLER,
     SYSTEM_TASK_ID_LCD_DISPLAY,
-    SYSTEM_TASK_ID_DISPENSER,
+    SYSTEM_TASK_ID_CARWASH,
     SYSTEM_TASK_ID_BUZZER_POLLING,
     SYSTEM_TASK_ID_MIFARE_POLLING,
     SYSTEM_TASK_ID_IO_EXPANDER,
@@ -254,7 +255,7 @@ void Task_Start_System_Task();
 typedef enum {
     MODULE_LCD_DISPLAY = 0,
     MODULE_MIFARE_POLLING,
-    MODULE_DISPENSER,
+    MODULE_CARWASH,
     MODULE_BUZZER,
     MODULE_IO_EXPANDER,
     MODULE_RS485,

@@ -19,7 +19,9 @@ extern "C" {
 /* Includes ------------------------------------------------------------------*/
 #include "FreeRTOS.h"
 #include "task.h"
+#include "RS485_Protocol.h"
 #include <stdbool.h>
+#include <stdint.h> // Required for uint8_t and uint16_t
 
 /* Public Functions ----------------------------------------------------------*/
 
@@ -40,6 +42,13 @@ TaskHandle_t RS485_Task_GetHandle(void);
  * @return true if initialized and ready, false otherwise
  */
 bool RS485_Task_IsReady(void);
+
+/**
+ * @brief Send RS485 frame (for use by command adaptors)
+ * @param frame Frame to send
+ * @note Thread-safe, can be called from command handlers
+ */
+void RS485_SendFrame(const RS485_Frame_t *frame);
 
 #ifdef __cplusplus
 }

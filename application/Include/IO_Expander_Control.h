@@ -30,7 +30,7 @@
 /* Number of I/O expander pins */
 #define IO_EXP_NUM_PINS  (16u)
 
-/* Functional Pin Assignments - MyWota Hardware v2.0 */
+/* Functional Pin Assignments - BigYellow Hardware v2.0 */
 #define IO_EXP_PIN_RELAY_CONTROL_0         CAT9555_PIN_0   // IO0_0 - Main relay control
 #define IO_EXP_PIN_KEYPAD_ROW_0            CAT9555_PIN_1   // IO0_1 - Keypad Row A
 #define IO_EXP_PIN_KEYPAD_ROW_1            CAT9555_PIN_2   // IO0_2 - Keypad Row B  
@@ -138,11 +138,6 @@ const char* IO_Expander_Control_GetStatusString(IO_Expander_Control_Status_t sta
  * @details Creates FreeRTOS task that polls all I/O pins at fixed rate
  */
 void Task_Start_IO_Expander_Control_Task(void);
-
-/**
- * @brief Stop I/O Expander Control polling task
- */
-void Task_Stop_IO_Expander_Control_Task(void);
 
 /**
  * @brief Get cached state of an input pin

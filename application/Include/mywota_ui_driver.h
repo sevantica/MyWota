@@ -31,7 +31,6 @@
 /*Extern Variables ---------------------------------------------------*/
 
 void Task_Start_LCD_Display_Driver_Task(void);
-void Task_Stop_LCD_Display_Driver_Task(void);
 TaskHandle_t task_get_handle_LCD_Display_Driver_Task(void);
 
 /* LCD Backlight Control Functions */

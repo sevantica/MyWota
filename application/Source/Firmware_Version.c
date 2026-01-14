@@ -12,36 +12,74 @@
 
 /**
  * @file Firmware_Version.c
- * @brief Firmware version information and display
+ * @brief Firmware version tracking and display
+ * @details Provides version identification for runtime debugging and logging.
+ *          Version is compile-time constant independent of bootloader.
  */
 
-/* Includes ------------------------------------------------------------------*/
+/*Includes ----------------------------------------------------------*/
 #include "Firmware_Version.h"
 #include "USB_Logging.h"
-#include "pico/unique_id.h"
 #include <stdio.h>
 
-/* Public Functions ----------------------------------------------------------*/
+/*Private variables ----------------------------------------------------------*/
+static char version_buffer[32];
+static char build_datetime_buffer[64];
 
-void FW_PrintVersionInfo(void)
-{
-    // Get Pico unique ID
-    pico_unique_board_id_t board_id;
-    pico_get_unique_board_id(&board_id);
-    
+/*Public Functions ----------------------------------------------------------*/
+
+/**
+ * @brief Get firmware version string
+ * @return const char* Version string in format "Major.Minor.Patch.Build"
+ */
+const char* FW_GetVersionString(void) {
+    snprintf(version_buffer, sizeof(version_buffer), 
+             "%d.%d.%d.%d", 
+             FW_VERSION_MAJOR, FW_VERSION_MINOR, 
+             FW_VERSION_PATCH, FW_BUILD_NUMBER);
+    return version_buffer;
+}
+
+/**
+ * @brief Get build date string
+ * @return const char* Build date (e.g., "Jan 10 2026")
+ */
+const char* FW_GetBuildDateString(void) {
+    return FW_BUILD_DATE;
+}
+
+/**
+ * @brief Get build time string
+ * @return const char* Build time (e.g., "14:23:45")
+ */
+const char* FW_GetBuildTimeString(void) {
+    return FW_BUILD_TIME;
+}
+
+/**
+ * @brief Get firmware version as packed 32-bit number
+ * @return uint32_t Version number (bits 31-24: Major, 23-16: Minor, 15-8: Patch, 7-0: Build)
+ */
+uint32_t FW_GetVersionNumber(void) {
+    return ((uint32_t)FW_VERSION_MAJOR << 24) | 
+           ((uint32_t)FW_VERSION_MINOR << 16) | 
+           ((uint32_t)FW_VERSION_PATCH << 8) | 
+           (uint32_t)FW_BUILD_NUMBER;
+}
+
+/**
+ * @brief Print full firmware version information to USB log
+ * @details Displays formatted version banner with all version details
+ */
+void FW_PrintVersionInfo(void) {
     USB_Log_Printf("\r\n");
     USB_Log_Printf("═══════════════════════════════════════════════════════════════\r\n");
-    USB_Log_Printf("                    FIRMWARE INFORMATION                        \r\n");
+    USB_Log_Printf("           %s FIRMWARE VERSION\r\n", FW_PROJECT_NAME);
     USB_Log_Printf("═══════════════════════════════════════════════════════════════\r\n");
-    USB_Log_Printf("Product:         %s\r\n", FW_PRODUCT_NAME);
-    USB_Log_Printf("Version:         %s\r\n", FW_VERSION_STRING);
-    USB_Log_Printf("Build Date:      %s %s\r\n", FW_BUILD_DATE, FW_BUILD_TIME);
-    USB_Log_Printf("Hardware:        %s\r\n", FW_HARDWARE_VERSION);
-    USB_Log_Printf("Board ID:        ");
-    for (int i = 0; i < PICO_UNIQUE_BOARD_ID_SIZE_BYTES; i++) {
-        USB_Log_Printf("%02X", board_id.id[i]);
-    }
-    USB_Log_Printf("\r\n");
+    USB_Log_Printf("  Version:        %s\r\n", FW_GetVersionString());
+    USB_Log_Printf("  Build Date:     %s\r\n", FW_GetBuildDateString());
+    USB_Log_Printf("  Build Time:     %s\r\n", FW_GetBuildTimeString());
+    USB_Log_Printf("  Min Bootloader: %s\r\n", FW_MIN_BOOTLOADER_VERSION);
     USB_Log_Printf("═══════════════════════════════════════════════════════════════\r\n");
     USB_Log_Printf("\r\n");
 }

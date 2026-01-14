@@ -22,7 +22,6 @@ extern "C" {
 #include "FreeRTOS.h"
 #include "task.h"
 #include "queue.h"
-#include "ff.h"
 
 /* Configuration -------------------------------------------------------------*/
 #define SD_LOG_QUEUE_LENGTH     8       // Number of pending log messages
@@ -127,33 +126,13 @@ bool SD_Logger_IsReady(void);
 bool SD_Logger_PrintCardLog(const uint8_t *card_uid, uint8_t uid_length);
 
 /**
- * @brief Recover card balance from SD card log file
- * @param card_uid Card unique identifier (4 or 7 bytes)
- * @param uid_length Length of card UID
- * @param balance_ml Pointer to store recovered balance (in milliliters)
- * @return true if balance was recovered successfully, false otherwise
- * @note Parses the card log file to find the latest balance entry
+ * @brief Get last known balance from SD card transaction logs
+ * @param card_uid Card unique identifier
+ * @param uid_length Length of card UID (4 or 7 bytes)
+ * @param balance_out Pointer to store retrieved balance
+ * @return true if balance found, false otherwise
  */
-bool SD_Logger_RecoverCardBalance(const uint8_t *card_uid, uint8_t uid_length, uint32_t *balance_ml);
-
-/**
- * @brief Suspend SD logging for USB MSC mode
- * @note Stops the logging task from writing to SD card
- *       Must be called before unmounting FatFs for MSC
- */
-void SD_Logger_SuspendLogging(void);
-
-/**
- * @brief Resume SD logging after USB MSC mode
- * @note Resumes the logging task after FatFs is remounted
- */
-void SD_Logger_ResumeLogging(void);
-
-/**
- * @brief Get the FatFs object used by SD Logger
- * @return Pointer to FATFS object, or NULL if not mounted
- */
-FATFS* SD_Logger_GetFatFs(void);
+bool SD_Logger_GetLastBalance(const uint8_t *card_uid, uint8_t uid_length, uint32_t *balance_out);
 
 #ifdef __cplusplus
 }
