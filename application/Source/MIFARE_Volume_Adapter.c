@@ -11,12 +11,11 @@
  */
 
 /**
- * @file MIFARE_Token_Adapter.c
- * @brief Token-based adapter for BigYellow car wash system
- * @details Implements one-time token deduction on card detection
- *          - No continuous updates during transaction
- *          - Deduct 1 token immediately when card detected
- *          - User removes card, then wash cycle starts
+ * @file MIFARE_Volume_Adapter.c
+ * @brief Volume-based adapter for MyWota water dispenser system
+ * @details Implements volume-based balance tracking in milliliters
+ *          - Deduct ml based on actual water dispensed
+ *          - Balance stored in ml units
  */
 
 /* Includes ------------------------------------------------------------------*/
@@ -26,73 +25,73 @@
 #include <string.h>
 
 /* Logging Configuration -----------------------------------------------------*/
-#define LOG_DEBUG_TOKEN_ADAPTER_EN      0
-#define LOG_CRITICAL_TOKEN_ADAPTER_EN   1
+#define LOG_DEBUG_VOLUME_ADAPTER_EN      0
+#define LOG_CRITICAL_VOLUME_ADAPTER_EN   1
 
-#if LOG_DEBUG_TOKEN_ADAPTER_EN
-    #define LOG_DEBUG_TOKEN(...) USB_Log_Printf(__VA_ARGS__)
+#if LOG_DEBUG_VOLUME_ADAPTER_EN
+    #define LOG_DEBUG_VOLUME(...) USB_Log_Printf(__VA_ARGS__)
 #else
-    #define LOG_DEBUG_TOKEN(...)
+    #define LOG_DEBUG_VOLUME(...)
 #endif
 
-#if LOG_CRITICAL_TOKEN_ADAPTER_EN
-    #define LOG_CRITICAL_TOKEN(...) USB_Log_Printf(__VA_ARGS__)
+#if LOG_CRITICAL_VOLUME_ADAPTER_EN
+    #define LOG_CRITICAL_VOLUME(...) USB_Log_Printf(__VA_ARGS__)
 #else
-    #define LOG_CRITICAL_TOKEN(...)
+    #define LOG_CRITICAL_VOLUME(...)
 #endif
 
 /* Private function prototypes -----------------------------------------------*/
-static MIFARE_Result_t token_read_balance(MIFARE_CardData_t *card_data, uint32_t *balance_out);
-static MIFARE_Result_t token_write_balance(MIFARE_CardData_t *card_data, uint32_t new_balance);
-static MIFARE_Result_t token_deduct_balance(MIFARE_CardData_t *card_data, uint32_t amount);
-static MIFARE_Result_t token_add_balance(MIFARE_CardData_t *card_data, uint32_t amount);
-static MIFARE_Result_t token_format_card(MIFARE_CardData_t *card_data, uint32_t initial_balance, uint64_t customer_id);
-static MIFARE_Result_t token_on_card_detected(MIFARE_CardData_t *card_data);
-static MIFARE_Result_t token_on_card_removed(MIFARE_CardData_t *card_data);
-static MIFARE_Result_t token_on_transaction_start(MIFARE_CardData_t *card_data);
-static MIFARE_Result_t token_on_transaction_end(MIFARE_CardData_t *card_data);
+static MIFARE_Result_t volume_read_balance(MIFARE_CardData_t *card_data, uint32_t *balance_out);
+static MIFARE_Result_t volume_write_balance(MIFARE_CardData_t *card_data, uint32_t new_balance);
+static MIFARE_Result_t volume_deduct_balance(MIFARE_CardData_t *card_data, uint32_t amount);
+static MIFARE_Result_t volume_add_balance(MIFARE_CardData_t *card_data, uint32_t amount);
+static MIFARE_Result_t volume_format_card(MIFARE_CardData_t *card_data, uint32_t initial_balance, uint64_t customer_id);
+static MIFARE_Result_t volume_on_card_detected(MIFARE_CardData_t *card_data);
+static MIFARE_Result_t volume_on_card_removed(MIFARE_CardData_t *card_data);
+static MIFARE_Result_t volume_on_transaction_start(MIFARE_CardData_t *card_data);
+static MIFARE_Result_t volume_on_transaction_end(MIFARE_CardData_t *card_data);
 
-/* Token Interface Definition ------------------------------------------------*/
-static const MIFARE_CardInterface_t token_interface = {
-    .name = "Token",
-    .balance_unit = "tokens",
-    .continuous_updates = false,        // No continuous updates - one-time deduction
-    .fast_update_ms = 0,                // Not used for token system
+/* Volume Interface Definition ------------------------------------------------*/
+static const MIFARE_CardInterface_t volume_interface = {
+    .name = "Volume",
+    .balance_unit = "ml",
+    .continuous_updates = false,        // No continuous updates during dispense
+    .fast_update_ms = 0,                // Not used for volume system
     
     // Virtual functions
-    .read_balance = token_read_balance,
-    .write_balance = token_write_balance,
-    .deduct_balance = token_deduct_balance,
-    .add_balance = token_add_balance,
-    .format_card = token_format_card,
+    .read_balance = volume_read_balance,
+    .write_balance = volume_write_balance,
+    .deduct_balance = volume_deduct_balance,
+    .add_balance = volume_add_balance,
+    .format_card = volume_format_card,
     
     // Event callbacks
-    .on_card_detected = token_on_card_detected,
-    .on_card_removed = token_on_card_removed,
-    .on_transaction_start = token_on_transaction_start,
-    .on_transaction_end = token_on_transaction_end
+    .on_card_detected = volume_on_card_detected,
+    .on_card_removed = volume_on_card_removed,
+    .on_transaction_start = volume_on_transaction_start,
+    .on_transaction_end = volume_on_transaction_end
 };
 
 /* Virtual Function Implementations ------------------------------------------*/
 
 /**
- * @brief Read token balance from card
+ * @brief Read volume balance from card (in ml)
  */
-static MIFARE_Result_t token_read_balance(MIFARE_CardData_t *card_data, uint32_t *balance_out)
+static MIFARE_Result_t volume_read_balance(MIFARE_CardData_t *card_data, uint32_t *balance_out)
 {
     if (!card_data || !balance_out) {
         return MIFARE_RESULT_ERROR;
     }
     
     *balance_out = card_data->user_primary.balance;
-    LOG_DEBUG_TOKEN("[TOKEN] Read balance: %lu tokens\r\n", *balance_out);
+    LOG_DEBUG_VOLUME("[VOLUME] Read balance: %lu ml\r\n", *balance_out);
     return MIFARE_RESULT_OK;
 }
 
 /**
- * @brief Write token balance to card
+ * @brief Write volume balance to card (in ml)
  */
-static MIFARE_Result_t token_write_balance(MIFARE_CardData_t *card_data, uint32_t new_balance)
+static MIFARE_Result_t volume_write_balance(MIFARE_CardData_t *card_data, uint32_t new_balance)
 {
     if (!card_data) {
         return MIFARE_RESULT_ERROR;
@@ -105,25 +104,25 @@ static MIFARE_Result_t token_write_balance(MIFARE_CardData_t *card_data, uint32_
     MIFARE_Result_t result = MIFARE_WriteCardData(card_data);
     
     if (result == MIFARE_RESULT_OK) {
-        LOG_CRITICAL_TOKEN("[✓] Token balance written: %lu tokens\r\n", new_balance);
+        LOG_CRITICAL_VOLUME("[✓] Volume balance written: %lu ml\r\n", new_balance);
     } else {
-        LOG_CRITICAL_TOKEN("[✗] Token balance write failed: %s\r\n", MIFARE_GetResultString(result));
+        LOG_CRITICAL_VOLUME("[✗] Volume balance write failed: %s\r\n", MIFARE_GetResultString(result));
     }
     
     return result;
 }
 
 /**
- * @brief Deduct tokens from balance
+ * @brief Deduct ml from balance
  */
-static MIFARE_Result_t token_deduct_balance(MIFARE_CardData_t *card_data, uint32_t amount)
+static MIFARE_Result_t volume_deduct_balance(MIFARE_CardData_t *card_data, uint32_t amount)
 {
     if (!card_data) {
         return MIFARE_RESULT_ERROR;
     }
     
     if (card_data->user_primary.balance < amount) {
-        LOG_CRITICAL_TOKEN("[✗] Insufficient tokens: need %lu, have %lu\r\n", 
+        LOG_CRITICAL_VOLUME("[✗] Insufficient balance: need %lu ml, have %lu ml\r\n", 
                           amount, card_data->user_primary.balance);
         return MIFARE_RESULT_INSUFFICIENT_BALANCE;
     }
@@ -131,13 +130,13 @@ static MIFARE_Result_t token_deduct_balance(MIFARE_CardData_t *card_data, uint32
     uint32_t old_balance = card_data->user_primary.balance;
     uint32_t new_balance = old_balance - amount;
     
-    return token_write_balance(card_data, new_balance);
+    return volume_write_balance(card_data, new_balance);
 }
 
 /**
- * @brief Add tokens to balance
+ * @brief Add ml to balance (topup)
  */
-static MIFARE_Result_t token_add_balance(MIFARE_CardData_t *card_data, uint32_t amount)
+static MIFARE_Result_t volume_add_balance(MIFARE_CardData_t *card_data, uint32_t amount)
 {
     if (!card_data) {
         return MIFARE_RESULT_ERROR;
@@ -146,20 +145,20 @@ static MIFARE_Result_t token_add_balance(MIFARE_CardData_t *card_data, uint32_t 
     uint32_t new_balance = card_data->user_primary.balance + amount;
     card_data->user_primary.last_topup = amount;
     
-    LOG_CRITICAL_TOKEN("[→] Adding %lu tokens (total: %lu tokens)\r\n", amount, new_balance);
-    return token_write_balance(card_data, new_balance);
+    LOG_CRITICAL_VOLUME("[→] Adding %lu ml (total: %lu ml)\r\n", amount, new_balance);
+    return volume_write_balance(card_data, new_balance);
 }
 
 /**
- * @brief Format card with initial token balance
+ * @brief Format card with initial ml balance
  */
-static MIFARE_Result_t token_format_card(MIFARE_CardData_t *card_data, uint32_t initial_balance, uint64_t customer_id)
+static MIFARE_Result_t volume_format_card(MIFARE_CardData_t *card_data, uint32_t initial_balance, uint64_t customer_id)
 {
     if (!card_data) {
         return MIFARE_RESULT_ERROR;
     }
     
-    LOG_CRITICAL_TOKEN("[→] Formatting card: %lu tokens, customer ID: %llu\r\n", 
+    LOG_CRITICAL_VOLUME("[→] Formatting card: %lu ml, customer ID: %llu\r\n", 
                       initial_balance, customer_id);
     
     // Use core's initialization function
@@ -170,99 +169,79 @@ static MIFARE_Result_t token_format_card(MIFARE_CardData_t *card_data, uint32_t 
 
 /**
  * @brief Called when card is first detected
- * @note TOKEN BEHAVIOR: Immediately deduct 1 token and write back
+ * @note VOLUME BEHAVIOR: Check if balance is sufficient for dispensing
  */
-static MIFARE_Result_t token_on_card_detected(MIFARE_CardData_t *card_data)
+static MIFARE_Result_t volume_on_card_detected(MIFARE_CardData_t *card_data)
 {
     if (!card_data) {
         return MIFARE_RESULT_ERROR;
     }
     
-    LOG_CRITICAL_TOKEN("[→] Card detected - checking token balance\r\n");
+    LOG_CRITICAL_VOLUME("[→] Card detected - checking balance\r\n");
     
-    // Check if we have at least 1 token
+    // Check if we have any balance
     if (card_data->user_primary.balance < 1) {
-        LOG_CRITICAL_TOKEN("[✗] No tokens available (balance: %lu)\r\n", 
+        LOG_CRITICAL_VOLUME("[✗] No balance available (balance: %lu ml)\r\n", 
                           card_data->user_primary.balance);
         return MIFARE_RESULT_INSUFFICIENT_BALANCE;
     }
     
-    // Deduct 1 token immediately
-    // DISABLE: Logic moved to Car_Wash_Controller.c to prevent double deduction
-    /*
-    LOG_CRITICAL_TOKEN("[→] Deducting 1 token (current: %lu)\r\n", 
-                      card_data->user_primary.balance);
-    
-    MIFARE_Result_t result = token_deduct_balance(card_data, 1);
-    
-    if (result == MIFARE_RESULT_OK) {
-        LOG_CRITICAL_TOKEN("[✓] Token deducted - wash authorized (remaining: %lu tokens)\r\n",
-                          card_data->user_primary.balance);
-        
-        // Update usage statistics
-        card_data->usage_data.total_dispenses_completed++;
-    } else {
-        LOG_CRITICAL_TOKEN("[✗] Token deduction failed: %s\r\n", 
-                          MIFARE_GetResultString(result));
-    }
-    
-    return result;
-    */
+    // Balance deduction is handled by Dispenser_Controller based on actual ml dispensed
     return MIFARE_RESULT_OK;
 }
 
 /**
  * @brief Called when card is removed from field
  */
-static MIFARE_Result_t token_on_card_removed(MIFARE_CardData_t *card_data)
+static MIFARE_Result_t volume_on_card_removed(MIFARE_CardData_t *card_data)
 {
-    (void)card_data;  // No action needed - token already deducted
+    (void)card_data;  // Dispenser_Controller handles balance deduction on removal
     
-    LOG_DEBUG_TOKEN("[TOKEN] Card removed\r\n");
+    LOG_DEBUG_VOLUME("[VOLUME] Card removed\r\n");
     return MIFARE_RESULT_OK;
 }
 
 /**
- * @brief Called when transaction starts (wash cycle begins)
- * @note TOKEN BEHAVIOR: No-op - token already deducted on card detection
+ * @brief Called when transaction starts (dispense cycle begins)
+ * @note VOLUME BEHAVIOR: No-op - balance updated on card removal
  */
-static MIFARE_Result_t token_on_transaction_start(MIFARE_CardData_t *card_data)
+static MIFARE_Result_t volume_on_transaction_start(MIFARE_CardData_t *card_data)
 {
-    (void)card_data;  // Token already deducted - nothing to do
+    (void)card_data;  // Balance updated when card is removed
     
-    LOG_DEBUG_TOKEN("[TOKEN] Transaction started (token already deducted)\r\n");
+    LOG_DEBUG_VOLUME("[VOLUME] Transaction started\r\n");
     return MIFARE_RESULT_OK;
 }
 
 /**
- * @brief Called when transaction ends (wash cycle complete)
- * @note TOKEN BEHAVIOR: No-op - no final write needed
+ * @brief Called when transaction ends (dispense cycle complete)
+ * @note VOLUME BEHAVIOR: No-op - balance already updated
  */
-static MIFARE_Result_t token_on_transaction_end(MIFARE_CardData_t *card_data)
+static MIFARE_Result_t volume_on_transaction_end(MIFARE_CardData_t *card_data)
 {
-    (void)card_data;  // No final write needed
+    (void)card_data;  // Balance already updated
     
-    LOG_DEBUG_TOKEN("[TOKEN] Transaction ended\r\n");
+    LOG_DEBUG_VOLUME("[VOLUME] Transaction ended\r\n");
     return MIFARE_RESULT_OK;
 }
 
 /* Public API ----------------------------------------------------------------*/
 
 /**
- * @brief Initialize Token adapter and register with core
+ * @brief Initialize Volume adapter and register with core
  * @return MIFARE_Result_t Operation result
  */
 MIFARE_Result_t MIFARE_Volume_Adapter_Init(void)
 {
-    LOG_CRITICAL_TOKEN("[→] Initializing Token Adapter (BigYellow)\r\n");
+    LOG_CRITICAL_VOLUME("[→] Initializing Volume Adapter (MyWota)\r\n");
     
-    // Initialize core with token interface
-    MIFARE_Result_t result = MIFARE_TransactionManager_Init(&token_interface);
+    // Initialize core with volume interface
+    MIFARE_Result_t result = MIFARE_TransactionManager_Init(&volume_interface);
     
     if (result == MIFARE_RESULT_OK) {
-        LOG_CRITICAL_TOKEN("[✓] Token Adapter initialized successfully\r\n");
+        LOG_CRITICAL_VOLUME("[✓] Volume Adapter initialized successfully\r\n");
     } else {
-        LOG_CRITICAL_TOKEN("[✗] Token Adapter initialization failed: %s\r\n", 
+        LOG_CRITICAL_VOLUME("[✗] Volume Adapter initialization failed: %s\r\n", 
                           MIFARE_GetResultString(result));
     }
     

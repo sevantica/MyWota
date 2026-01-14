@@ -13,7 +13,7 @@
 #ifndef APPLICATION_INCLUDE_SYSTEM_CONFIG_H_
 #define APPLICATION_INCLUDE_SYSTEM_CONFIG_H_
 
-#define BUILD_TYPE_CAR_WASH
+/* #define BUILD_TYPE_CAR_WASH */
 
 /*Includes ----------------------------------------------------------*/
 #include <stdint.h>
@@ -73,7 +73,7 @@ typedef struct {
     uint32_t stability_timeout_ms;          /* Card stable detection time */
     uint32_t removal_stability_ms;          /* Card removal confirmation time */
     uint8_t auth_key[6];                    /* MIFARE authentication key */
-    uint32_t card_init_default_tokens;      /* Default token count for new cards */
+    uint32_t card_init_default_balance;     /* Default balance for new cards */
     bool auto_reinit_on_corruption;         /* Auto-reinitialize corrupt cards */
     char card_init_phone_number[16];        /* Default phone number */
     uint8_t card_init_validity;             /* Default validity level */
@@ -168,7 +168,7 @@ typedef struct {
     bool loyalty_enabled;                   /* Enable loyalty program (default true for BY, false for MY) */
     uint32_t loyalty_threshold;             /* Threshold to earn reward: washes (BY) or ml (MY, e.g., 100000) */
     uint32_t loyalty_reward;                /* Reward amount: 1 wash (BY) or ml (MY, e.g., 20000) */
-} CarWash_Config_t;
+} DispenserLogic_Config_t;
 
 /**
  * @brief Buzzer configuration
@@ -220,7 +220,7 @@ typedef struct {
 typedef struct {
     bool lcd_display_enabled;               /* Enable LCD display task */
     bool mifare_polling_enabled;            /* Enable MIFARE card polling */
-    bool carwash_enabled;                   /* Enable car wash controller */
+    bool dispenser_enabled;                 /* Enable dispenser controller */
     bool buzzer_enabled;                    /* Enable buzzer polling */
     bool io_expander_enabled;               /* Enable I/O expander control */
     bool rs485_enabled;                     /* Enable RS485 communication */
@@ -250,7 +250,7 @@ typedef struct {
     /* Module-specific configurations (grouped together) */
     MIFARE_Config_t mifare;                 /* MIFARE card reader module (contains .security nested) */
     UI_Config_t ui;                         /* UI display module */
-    CarWash_Config_t carwash;               /* Car wash controller module */
+    DispenserLogic_Config_t dispenser_logic;       /* Dispenser logic module (formerly carwash) */
     Buzzer_Config_t buzzer;                 /* Buzzer module */
     SDLogger_Config_t sd_logger;            /* SD logger module */
     IOExpander_Config_t io_expander;        /* I/O expander module */

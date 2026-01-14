@@ -114,7 +114,7 @@ void Config_InitDefaults(void)
     /* Module enable defaults */
     g_system_config.modules.lcd_display_enabled = true;
     g_system_config.modules.mifare_polling_enabled = true;
-    g_system_config.modules.carwash_enabled = true;
+    g_system_config.modules.dispenser_enabled = true;
     g_system_config.modules.buzzer_enabled = true;
     g_system_config.modules.io_expander_enabled = true;
     g_system_config.modules.rs485_enabled = true;
@@ -132,7 +132,11 @@ void Config_InitDefaults(void)
     /* Default MIFARE key: FF FF FF FF FF FF */
     memset(g_system_config.mifare.auth_key, 0xFF, 6);
     /* Card initialization defaults */
-    g_system_config.mifare.card_init_default_tokens = 10;  /* 10 tokens default */
+    #if defined(BUILD_TYPE_WATER_DISPENSER)
+    g_system_config.mifare.card_init_default_balance = 60000;  /* 60000 ml = 60L default */
+    #else
+    g_system_config.mifare.card_init_default_balance = 10;    /* 10 tokens default */
+    #endif
     g_system_config.mifare.auto_reinit_on_corruption = true;      /* Enable auto-recovery */
     strncpy(g_system_config.mifare.card_init_phone_number, "07970242024", sizeof(g_system_config.mifare.card_init_phone_number) - 1);
     g_system_config.mifare.card_init_phone_number[sizeof(g_system_config.mifare.card_init_phone_number) - 1] = '\0';
@@ -253,12 +257,18 @@ void Config_InitDefaults(void)
     g_system_config.ui.states[UI_STATE_ERROR].ring_color_pressure_active = 0x4040FF;  /* Light blue */
     g_system_config.ui.states[UI_STATE_ERROR].ring_color_pressure_inactive = 0x000040;
     
-    /* Car wash defaults */
-    g_system_config.carwash.wash_duration_seconds = 1200;  /* 20 minutes */
-    g_system_config.carwash.card_removal_delay_ms = 1000;  /* 1 second */
-    g_system_config.carwash.loyalty_enabled = true;        /* Enable loyalty by default */
-    g_system_config.carwash.loyalty_threshold = 5;         /* 5 washes = 1 free wash */
-    g_system_config.carwash.loyalty_reward = 1;            /* 1 free wash per threshold */
+    /* Dispenser defaults */
+    g_system_config.dispenser_logic.wash_duration_seconds = 1200;  /* 20 minutes */
+    g_system_config.dispenser_logic.card_removal_delay_ms = 1000;  /* 1 second */
+    g_system_config.dispenser_logic.loyalty_enabled = true;        /* Enable loyalty by default */
+    
+    #if defined(BUILD_TYPE_WATER_DISPENSER)
+    g_system_config.dispenser_logic.loyalty_threshold = 50000;     /* 50L threshold */
+    g_system_config.dispenser_logic.loyalty_reward = 1000;         /* 1L reward */
+    #else
+    g_system_config.dispenser_logic.loyalty_threshold = 5;         /* 5 washes = 1 free wash */
+    g_system_config.dispenser_logic.loyalty_reward = 1;            /* 1 free wash per threshold */
+    #endif
     
     /* Buzzer defaults */
     g_system_config.buzzer.enabled = true;
@@ -693,8 +703,8 @@ static Config_Result_t config_parse_file(FIL *file)
                     g_system_config.mifare.auth_key[i] = (uint8_t)strtol(hex, NULL, 16);
                 }
                 params_found++;
-            } else if (strcmp(k, "mifare.card_init_default_tokens") == 0) {
-                g_system_config.mifare.card_init_default_tokens = (uint32_t)atoi(v);
+            } else if (strcmp(k, "mifare.card_init_default_balance") == 0) {
+                g_system_config.mifare.card_init_default_balance = (uint32_t)atoi(v);
                 params_found++;
             } else if (strcmp(k, "mifare.auto_reinit_on_corruption") == 0) {
                 g_system_config.mifare.auto_reinit_on_corruption = (atoi(v) != 0);
@@ -846,8 +856,8 @@ static Config_Result_t config_parse_file(FIL *file)
             } else if (strcmp(k, "modules.mifare_polling_enabled") == 0) {
                 g_system_config.modules.mifare_polling_enabled = (atoi(v) != 0);
                 params_found++;
-            } else if (strcmp(k, "modules.carwash_enabled") == 0) {
-                g_system_config.modules.carwash_enabled = (atoi(v) != 0);
+            } else if (strcmp(k, "modules.dispenser_enabled") == 0) {
+                g_system_config.modules.dispenser_enabled = (atoi(v) != 0);
                 params_found++;
             } else if (strcmp(k, "modules.buzzer_enabled") == 0) {
                 g_system_config.modules.buzzer_enabled = (atoi(v) != 0);
@@ -867,21 +877,21 @@ static Config_Result_t config_parse_file(FIL *file)
                 g_system_config.ui.screen_brightness_percent = (uint8_t)atoi(v);
                 params_found++;
             }
-            /* Car wash settings */
-            else if (strcmp(k, "carwash.wash_duration_seconds") == 0) {
-                g_system_config.carwash.wash_duration_seconds = (uint32_t)atoi(v);
+            /* Dispenser settings */
+            else if (strcmp(k, "dispenser.max_dispense_duration_seconds") == 0) {
+                g_system_config.dispenser_logic.wash_duration_seconds = (uint32_t)atoi(v);
                 params_found++;
-            } else if (strcmp(k, "carwash.card_removal_delay_ms") == 0) {
-                g_system_config.carwash.card_removal_delay_ms = (uint32_t)atoi(v);
+            } else if (strcmp(k, "dispenser.card_removal_delay_ms") == 0) {
+                g_system_config.dispenser_logic.card_removal_delay_ms = (uint32_t)atoi(v);
                 params_found++;
-            } else if (strcmp(k, "carwash.loyalty_enabled") == 0) {
-                g_system_config.carwash.loyalty_enabled = (atoi(v) != 0);
+            } else if (strcmp(k, "dispenser.loyalty_enabled") == 0) {
+                g_system_config.dispenser_logic.loyalty_enabled = (atoi(v) != 0);
                 params_found++;
-            } else if (strcmp(k, "carwash.loyalty_threshold") == 0) {
-                g_system_config.carwash.loyalty_threshold = (uint32_t)strtoul(v, NULL, 10);
+            } else if (strcmp(k, "dispenser.loyalty_threshold") == 0) {
+                g_system_config.dispenser_logic.loyalty_threshold = (uint32_t)strtoul(v, NULL, 10);
                 params_found++;
-            } else if (strcmp(k, "carwash.loyalty_reward") == 0) {
-                g_system_config.carwash.loyalty_reward = (uint32_t)strtoul(v, NULL, 10);
+            } else if (strcmp(k, "dispenser.loyalty_reward") == 0) {
+                g_system_config.dispenser_logic.loyalty_reward = (uint32_t)strtoul(v, NULL, 10);
                 params_found++;
             }
             /* Buzzer settings */
@@ -1024,7 +1034,7 @@ static Config_Result_t config_write_file(FIL *file)
              g_system_config.mifare.auth_key[2], g_system_config.mifare.auth_key[3],
              g_system_config.mifare.auth_key[4], g_system_config.mifare.auth_key[5]);
     f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "mifare.card_init_default_tokens=%lu\r\n", g_system_config.mifare.card_init_default_tokens);
+    snprintf(buf, sizeof(buf), "mifare.card_init_default_balance=%lu\r\n", g_system_config.mifare.card_init_default_balance);
     f_puts(buf, file);
     snprintf(buf, sizeof(buf), "mifare.auto_reinit_on_corruption=%d\r\n", g_system_config.mifare.auto_reinit_on_corruption ? 1 : 0);
     f_puts(buf, file);
@@ -1117,7 +1127,7 @@ static Config_Result_t config_write_file(FIL *file)
     f_puts(buf, file);
     snprintf(buf, sizeof(buf), "modules.mifare_polling_enabled=%d\r\n", g_system_config.modules.mifare_polling_enabled ? 1 : 0);
     f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "modules.carwash_enabled=%d\r\n", g_system_config.modules.carwash_enabled ? 1 : 0);
+    snprintf(buf, sizeof(buf), "modules.dispenser_enabled=%d\r\n", g_system_config.modules.dispenser_enabled ? 1 : 0);
     f_puts(buf, file);
     snprintf(buf, sizeof(buf), "modules.buzzer_enabled=%d\r\n", g_system_config.modules.buzzer_enabled ? 1 : 0);
     f_puts(buf, file);
@@ -1133,17 +1143,17 @@ static Config_Result_t config_write_file(FIL *file)
     snprintf(buf, sizeof(buf), "ui.screen_brightness_percent=%u\r\n\r\n", g_system_config.ui.screen_brightness_percent);
     f_puts(buf, file);
     
-    /* Car wash settings */
-    f_puts("# === Car Wash Configuration ===\r\n", file);
-    snprintf(buf, sizeof(buf), "carwash.wash_duration_seconds=%lu\r\n", g_system_config.carwash.wash_duration_seconds);
+    /* Dispenser settings */
+    f_puts("# === Dispenser Configuration ===\r\n", file);
+    snprintf(buf, sizeof(buf), "dispenser.max_dispense_duration_seconds=%lu\r\n", g_system_config.dispenser_logic.wash_duration_seconds);
     f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "carwash.card_removal_delay_ms=%lu\r\n", g_system_config.carwash.card_removal_delay_ms);
+    snprintf(buf, sizeof(buf), "dispenser.card_removal_delay_ms=%lu\r\n", g_system_config.dispenser_logic.card_removal_delay_ms);
     f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "carwash.loyalty_enabled=%d\r\n", g_system_config.carwash.loyalty_enabled ? 1 : 0);
+    snprintf(buf, sizeof(buf), "dispenser.loyalty_enabled=%d\r\n", g_system_config.dispenser_logic.loyalty_enabled ? 1 : 0);
     f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "carwash.loyalty_threshold=%lu\r\n", g_system_config.carwash.loyalty_threshold);
+    snprintf(buf, sizeof(buf), "dispenser.loyalty_threshold=%lu\r\n", g_system_config.dispenser_logic.loyalty_threshold);
     f_puts(buf, file);
-    snprintf(buf, sizeof(buf), "carwash.loyalty_reward=%lu\r\n\r\n", g_system_config.carwash.loyalty_reward);
+    snprintf(buf, sizeof(buf), "dispenser.loyalty_reward=%lu\r\n\r\n", g_system_config.dispenser_logic.loyalty_reward);
     f_puts(buf, file);
     
     /* Buzzer settings */
@@ -1520,7 +1530,7 @@ void Config_PrintToUSB(void)
     USB_Log_Printf("mifare.auth_key=%02X%02X%02X%02X%02X%02X\r\n",
                   cfg->mifare.auth_key[0], cfg->mifare.auth_key[1], cfg->mifare.auth_key[2],
                   cfg->mifare.auth_key[3], cfg->mifare.auth_key[4], cfg->mifare.auth_key[5]);
-    USB_Log_Printf("mifare.card_init_default_tokens=%lu\r\n", cfg->mifare.card_init_default_tokens);
+    USB_Log_Printf("mifare.card_init_default_balance=%lu\r\n", cfg->mifare.card_init_default_balance);
     USB_Log_Printf("mifare.auto_reinit_on_corruption=%u\r\n", cfg->mifare.auto_reinit_on_corruption ? 1 : 0);
     USB_Log_Printf("mifare.card_init_phone_number=%s\r\n", cfg->mifare.card_init_phone_number);
     USB_Log_Printf("mifare.card_init_validity=%u\r\n", cfg->mifare.card_init_validity);
@@ -1574,7 +1584,7 @@ void Config_PrintToUSB(void)
     USB_Log_Printf("\r\n--- Module Enable/Disable ---\r\n");
     USB_Log_Printf("modules.lcd_display_enabled=%u\r\n", cfg->modules.lcd_display_enabled ? 1 : 0);
     USB_Log_Printf("modules.mifare_polling_enabled=%u\r\n", cfg->modules.mifare_polling_enabled ? 1 : 0);
-    USB_Log_Printf("modules.carwash_enabled=%u\r\n", cfg->modules.carwash_enabled ? 1 : 0);
+    USB_Log_Printf("modules.dispenser_enabled=%u\r\n", cfg->modules.dispenser_enabled ? 1 : 0);
     USB_Log_Printf("modules.buzzer_enabled=%u\r\n", cfg->modules.buzzer_enabled ? 1 : 0);
     USB_Log_Printf("modules.io_expander_enabled=%u\r\n", cfg->modules.io_expander_enabled ? 1 : 0);
     
@@ -1583,9 +1593,9 @@ void Config_PrintToUSB(void)
     USB_Log_Printf("ui.lcd_reset_delay_ms=%lu\r\n", cfg->ui.lcd_reset_delay_ms);
     USB_Log_Printf("ui.screen_brightness_percent=%u\r\n", cfg->ui.screen_brightness_percent);
     
-    USB_Log_Printf("\r\n--- Car Wash Configuration ---\r\n");
-    USB_Log_Printf("carwash.wash_duration_seconds=%lu\r\n", cfg->carwash.wash_duration_seconds);
-    USB_Log_Printf("carwash.card_removal_delay_ms=%lu\r\n", cfg->carwash.card_removal_delay_ms);
+    USB_Log_Printf("\r\n--- Dispenser Configuration ---\r\n");
+    USB_Log_Printf("dispenser.max_dispense_duration_seconds=%lu\r\n", cfg->dispenser_logic.wash_duration_seconds);
+    USB_Log_Printf("dispenser.card_removal_delay_ms=%lu\r\n", cfg->dispenser_logic.card_removal_delay_ms);
     
     USB_Log_Printf("\r\n--- Buzzer Configuration ---\r\n");
     USB_Log_Printf("buzzer.enabled=%u\r\n", cfg->buzzer.enabled ? 1 : 0);

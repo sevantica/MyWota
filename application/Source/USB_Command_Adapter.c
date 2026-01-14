@@ -26,13 +26,13 @@
 #include "FreeRTOS.h"
 #include "task.h"
 /* Private function prototypes -----------------------------------------------*/
-static USB_Command_Status_t cmd_washstart(int argc, char** argv);
-static USB_Command_Status_t cmd_washstop(int argc, char** argv);
+static USB_Command_Status_t cmd_dispense_start(int argc, char** argv);
+static USB_Command_Status_t cmd_dispense_stop(int argc, char** argv);
 
 /* Private variables ---------------------------------------------------------*/
 static const USB_Command_Adapter_Entry_t adapter_commands[] = {
-    {"washstart", cmd_washstart, "Start wash manually (no card needed)",  "washstart [seconds] [option]"},
-    {"washstop",  cmd_washstop,  "Stop wash manually",                    "washstop"},
+    {"start_dispense", cmd_dispense_start, "Start dispense manually (no card needed)",  "start_dispense [ml]"},
+    {"stop_dispense",  cmd_dispense_stop,  "Stop dispense manually",                    "stop_dispense"},
 };
 
 static const size_t adapter_command_count = sizeof(adapter_commands) / sizeof(adapter_commands[0]);
@@ -61,7 +61,7 @@ void USB_Command_Adapter_PrintStatus(void)
 
 const char* USB_Command_Adapter_GetIncludesInfo(void)
 {
-    return "Car_Wash_Controller.h";
+    return "Dispenser_Controller.h";
 }
 
 /* Private functions ---------------------------------------------------------*/
@@ -73,44 +73,30 @@ const char* USB_Command_Adapter_GetIncludesInfo(void)
  *             option: 1=vacuum, 2=brush, 3=pressure
  * @return USB_CMD_OK on success
  */
-static USB_Command_Status_t cmd_washstart(int argc, char** argv)
+static USB_Command_Status_t cmd_dispense_start(int argc, char** argv)
 {
-    uint32_t duration = 0;  /* 0 = use default */
-    WashOption_t option = WASH_OPTION_NONE;  /* NONE = use vacuum cleaner */
+    uint32_t volume_ml = 0;  /* 0 = default (20L) */
     
-    /* Parse optional duration argument */
+    /* Parse optional volume argument */
     if (argc >= 2) {
-        duration = (uint32_t)atoi(argv[1]);
-        if (duration > 3600) {
-            USB_Log_Printf("[✗] Duration too long (max 3600 seconds)\r\n");
+        volume_ml = (uint32_t)atoi(argv[1]);
+        if (volume_ml > 20000) {
+            USB_Log_Printf("[✗] Volume too large (max 20000 ml)\r\n");
             return USB_CMD_ERROR_INVALID_PARAM;
         }
     }
     
-    /* Parse optional option argument */
-    if (argc >= 3) {
-        int opt = atoi(argv[2]);
-        switch (opt) {
-            case 1: option = WASH_OPTION_VACUUM_CLEANER; break;
-            case 2: option = WASH_OPTION_WASH_BRUSH; break;
-            case 3: option = WASH_OPTION_PRESSURE_WASHER; break;
-            default:
-                USB_Log_Printf("[✗] Invalid option: %d (use 1=vacuum, 2=brush, 3=pressure)\r\n", opt);
-                return USB_CMD_ERROR_INVALID_PARAM;
-        }
-    }
+    DispenserResult_t result = MIFARE_Dispenser_ManualStart(volume_ml);
     
-    CarWashResult_t result = MIFARE_CarWash_ManualStart(option, duration);
-    
-    if (result == CARWASH_RESULT_OK) {
-        if (duration == 0) {
-            USB_Log_Printf("[✓] Manual wash started (default duration)\r\n");
+    if (result == DISPENSER_RESULT_OK) {
+        if (volume_ml == 0) {
+            USB_Log_Printf("[✓] Manual dispense started (default volume)\r\n");
         } else {
-            USB_Log_Printf("[✓] Manual wash started for %lu seconds\r\n", duration);
+            USB_Log_Printf("[✓] Manual dispense started for %lu ml\r\n", volume_ml);
         }
         return USB_CMD_OK;
     } else {
-        USB_Log_Printf("[✗] Failed to start wash (already running?)\r\n");
+        USB_Log_Printf("[✗] Failed to start dispense (already running?)\r\n");
         return USB_CMD_ERROR;
     }
 }
@@ -121,18 +107,18 @@ static USB_Command_Status_t cmd_washstart(int argc, char** argv)
  * @param argv Arguments (unused)
  * @return USB_CMD_OK on success
  */
-static USB_Command_Status_t cmd_washstop(int argc, char** argv)
+static USB_Command_Status_t cmd_dispense_stop(int argc, char** argv)
 {
     (void)argc;
     (void)argv;
     
-    CarWashResult_t result = MIFARE_CarWash_ManualStop();
+    DispenserResult_t result = MIFARE_Dispenser_ManualStop();
     
-    if (result == CARWASH_RESULT_OK) {
-        USB_Log_Printf("[✓] Wash stopped\r\n");
+    if (result == DISPENSER_RESULT_OK) {
+        USB_Log_Printf("[✓] Dispense stopped\r\n");
         return USB_CMD_OK;
     } else {
-        USB_Log_Printf("[✗] Failed to stop wash\r\n");
+        USB_Log_Printf("[✗] Failed to stop dispense\r\n");
         return USB_CMD_ERROR;
     }
 }

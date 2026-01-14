@@ -30,6 +30,9 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 message(STATUS "Build type is ${CMAKE_BUILD_TYPE}")
 
+# Define build type for conditional compilation in shared drivers
+add_compile_definitions(BUILD_TYPE_WATER_DISPENSER)
+
 # Initialize the Pico SDK
 pico_sdk_init()
 

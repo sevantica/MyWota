@@ -93,7 +93,7 @@ typedef enum {
     TASK_ID_USB_CDC,
     TASK_ID_USB_COMMAND_HANDLER,
     TASK_ID_LCD_DISPLAY,
-    TASK_ID_CARWASH,
+    TASK_ID_DISPENSER,
     TASK_ID_BUZZER_POLLING,
     TASK_ID_MIFARE_POLLING,
     TASK_ID_IO_EXPANDER,
@@ -142,7 +142,7 @@ static Task_WDT_Status_t s_task_wdt_status[TASK_ID_COUNT] = {
     {"USB_CDC",       TASK_STATUS_UNKNOWN, 0},
     {"USB_Command",   TASK_STATUS_UNKNOWN, 0},
     {"LCD_Display",   TASK_STATUS_UNKNOWN, 0},
-    {"CarWash",       TASK_STATUS_UNKNOWN, 0},
+    {"Dispenser",       TASK_STATUS_UNKNOWN, 0},
     {"Buzzer",        TASK_STATUS_UNKNOWN, 0},
     {"MIFARE",        TASK_STATUS_UNKNOWN, 0},
     {"IO_Expander",   TASK_STATUS_UNKNOWN, 0},
@@ -156,7 +156,7 @@ static bool s_watchdog_enabled = false;
 static Module_State_t s_module_states[MODULE_COUNT] = {
     MODULE_STATE_STOPPED,  /* LCD_DISPLAY */
     MODULE_STATE_STOPPED,  /* MIFARE_POLLING */
-    MODULE_STATE_STOPPED,  /* CARWASH */
+    MODULE_STATE_STOPPED,  /* DISPENSER */
     MODULE_STATE_STOPPED,  /* BUZZER */
     MODULE_STATE_STOPPED,  /* IO_EXPANDER */
     MODULE_STATE_STOPPED   /* RS485 */
@@ -165,7 +165,7 @@ static Module_State_t s_module_states[MODULE_COUNT] = {
 static const char* s_module_names[MODULE_COUNT] = {
     "LCD_Display",
     "MIFARE_Polling",
-    "CarWash",
+    "Dispenser",
     "Buzzer",
     "IO_Expander",
     "RS485"
@@ -357,8 +357,8 @@ static void system_init(void)
     MIFARE_Volume_Adapter_Init();
     LOG_CRITICAL_SYSTEM("[✓] MIFARE Volume Adapter initialized\r\n");
     
-    /* Car Wash Integration */
-    MIFARE_CarWash_Init();
+    /* Dispenser Integration */
+    MIFARE_Dispenser_Init();
     
     /* MIFARE Polling Task - check both hardware and config */
     if (pn532_status == PN532_STATUS_OK && cfg->modules.mifare_polling_enabled) {
@@ -377,13 +377,13 @@ static void system_init(void)
         LOG_CRITICAL_SYSTEM("[✗] MIFARE Polling Task FAILED - PN532 initialization error\r\n");
     }
     
-    /* Car Wash Integration Task */
-    if (cfg->modules.carwash_enabled) {
-        Task_Start_CarWash_Task();
-        s_module_states[MODULE_CARWASH] = MODULE_STATE_RUNNING;
-        LOG_CRITICAL_SYSTEM("[→] Car Wash Task started\r\n");
+    /* Dispenser Integration Task */
+    if (cfg->modules.dispenser_enabled) {
+        Task_Start_Dispenser_Task();
+        s_module_states[MODULE_DISPENSER] = MODULE_STATE_RUNNING;
+        LOG_CRITICAL_SYSTEM("[→] Dispenser Task started\r\n");
     } else {
-        LOG_CRITICAL_SYSTEM("[!] Car Wash Task DISABLED by config\r\n");
+        LOG_CRITICAL_SYSTEM("[!] Dispenser Task DISABLED by config\r\n");
     }
 
     /* Buzzer Polling Task - check both hardware and config */
@@ -526,8 +526,8 @@ static void System_Task(void* argument)
                         case TASK_ID_MIFARE_POLLING:
                             if (s_module_states[MODULE_MIFARE_POLLING] != MODULE_STATE_RUNNING) expected_running = false;
                             break;
-                        case TASK_ID_CARWASH:
-                            if (s_module_states[MODULE_CARWASH] != MODULE_STATE_RUNNING) expected_running = false;
+                        case TASK_ID_DISPENSER:
+                            if (s_module_states[MODULE_DISPENSER] != MODULE_STATE_RUNNING) expected_running = false;
                             break;
                         case TASK_ID_BUZZER_POLLING:
                             if (s_module_states[MODULE_BUZZER] != MODULE_STATE_RUNNING) expected_running = false;
@@ -765,9 +765,9 @@ bool System_StartModule(System_Module_t module)
             s_module_states[MODULE_MIFARE_POLLING] = MODULE_STATE_RUNNING;
             return true;
             
-        case MODULE_CARWASH:
-            Task_Start_CarWash_Task();
-            s_module_states[MODULE_CARWASH] = MODULE_STATE_RUNNING;
+        case MODULE_DISPENSER:
+            Task_Start_Dispenser_Task();
+            s_module_states[MODULE_DISPENSER] = MODULE_STATE_RUNNING;
             return true;
             
         case MODULE_BUZZER:
@@ -863,7 +863,7 @@ void System_PrintModuleStatus(void)
     const char* boot_enabled[MODULE_COUNT] = {
         cfg->modules.lcd_display_enabled ? "Enabled " : "Disabled",
         cfg->modules.mifare_polling_enabled ? "Enabled " : "Disabled",
-        cfg->modules.carwash_enabled ? "Enabled " : "Disabled",
+        cfg->modules.dispenser_enabled ? "Enabled " : "Disabled",
         cfg->modules.buzzer_enabled ? "Enabled " : "Disabled",
         cfg->modules.io_expander_enabled ? "Enabled " : "Disabled",
         cfg->modules.rs485_enabled ? "Enabled " : "Disabled"
@@ -880,6 +880,6 @@ void System_PrintModuleStatus(void)
     
     USB_Log_Printf("═══════════════════════════════════════════════════════════════\r\n");
     USB_Log_Printf("\r\nCommands: start <module>, stop <module>\r\n");
-    USB_Log_Printf("Modules: lcd, mifare, carwash, buzzer, ioexp, rs485\r\n");
+    USB_Log_Printf("Modules: lcd, mifare, dispenser, buzzer, ioexp, rs485\r\n");
     USB_Log_Printf("\r\n");
 }

@@ -57,7 +57,7 @@ static const Config_Key_Entry_t mywota_config_schema[] = {
     /* Module enable flags */
     {"modules.lcd_display_enabled",     CONFIG_VAL_BOOL, &g_system_config.modules.lcd_display_enabled,     0, "Enable LCD"},
     {"modules.mifare_polling_enabled",  CONFIG_VAL_BOOL, &g_system_config.modules.mifare_polling_enabled,  0, "Enable MIFARE"},
-    {"modules.carwash_enabled",         CONFIG_VAL_BOOL, &g_system_config.modules.carwash_enabled,         0, "Enable car wash"},
+    {"modules.dispenser_enabled",       CONFIG_VAL_BOOL, &g_system_config.modules.dispenser_enabled,       0, "Enable dispenser"},
     {"modules.buzzer_enabled",          CONFIG_VAL_BOOL, &g_system_config.modules.buzzer_enabled,          0, "Enable buzzer"},
     {"modules.io_expander_enabled",     CONFIG_VAL_BOOL, &g_system_config.modules.io_expander_enabled,     0, "Enable IO expander"},
     {"modules.rs485_enabled",           CONFIG_VAL_BOOL, &g_system_config.modules.rs485_enabled,           0, "Enable RS485"},
@@ -69,7 +69,7 @@ static const Config_Key_Entry_t mywota_config_schema[] = {
     {"mifare.stability_timeout_ms",    CONFIG_VAL_UINT32, &g_system_config.mifare.stability_timeout_ms,    0, "Stability timeout"},
     {"mifare.removal_stability_ms",    CONFIG_VAL_UINT32, &g_system_config.mifare.removal_stability_ms,    0, "Removal stability"},
     {"mifare.auth_key",               CONFIG_VAL_HEX_BYTES, &g_system_config.mifare.auth_key,               6, "Auth key (6 bytes)"},
-    {"mifare.card_init_default_tokens", CONFIG_VAL_UINT32, &g_system_config.mifare.card_init_default_tokens, 0, "Default tokens"},
+    {"mifare.card_init_default_balance", CONFIG_VAL_UINT32, &g_system_config.mifare.card_init_default_balance, 0, "Default balance"},
     {"mifare.auto_reinit_on_corruption", CONFIG_VAL_BOOL, &g_system_config.mifare.auto_reinit_on_corruption, 0, "Auto reinit"},
     {"mifare.card_init_phone_number",  CONFIG_VAL_STRING, &g_system_config.mifare.card_init_phone_number,  16, "Init phone"},
     {"mifare.card_init_validity",      CONFIG_VAL_UINT8,  &g_system_config.mifare.card_init_validity,       0, "Init validity"},
@@ -108,9 +108,9 @@ static const Config_Key_Entry_t mywota_config_schema[] = {
     {"ui.bg_grad_stop",             CONFIG_VAL_UINT8,  &g_system_config.ui.bg_grad_stop,             0, "Gradient end"},
     {"ui.title_bar_color",         CONFIG_VAL_HEX_COLOR, &g_system_config.ui.title_bar_color,         0, "Title bar color"},
     
-    /* Car wash settings */
-    {"carwash.wash_duration_seconds", CONFIG_VAL_UINT32, &g_system_config.carwash.wash_duration_seconds, 0, "Wash duration (sec)"},
-    {"carwash.card_removal_delay_ms", CONFIG_VAL_UINT32, &g_system_config.carwash.card_removal_delay_ms, 0, "Card removal delay"},
+    /* Dispenser settings */
+    {"dispenser.max_dispense_duration_seconds", CONFIG_VAL_UINT32, &g_system_config.dispenser_logic.wash_duration_seconds, 0, "Max dispense duration (sec)"},
+    {"dispenser.card_removal_delay_ms", CONFIG_VAL_UINT32, &g_system_config.dispenser_logic.card_removal_delay_ms, 0, "Card removal delay"},
     
     /* Buzzer settings */
     {"buzzer.enabled",                CONFIG_VAL_BOOL,   &g_system_config.buzzer.enabled,                 0, "Enable buzzer"},

@@ -47,9 +47,11 @@
 #define LCD_DISPLAY_TASK_STACK_BYTES (960u * 4)  /* 3840 bytes - CRITICAL: only 40w free! */
 #define LCD_DISPLAY_TASK_STACK_WORDS STACK_BYTES_TO_WORDS(LCD_DISPLAY_TASK_STACK_BYTES)
 
-/* Car Wash Controller Task - State machine and relay control */
-#define CARWASH_TASK_STACK_BYTES    (256u * 4)   /* 1024 bytes - optimized from 384w */
-#define CARWASH_TASK_STACK_WORDS    STACK_BYTES_TO_WORDS(CARWASH_TASK_STACK_BYTES)
+
+
+/* Dispenser Controller Task - State machine and valve control */
+#define DISPENSER_TASK_STACK_BYTES    (256u * 4)   /* 1024 bytes - same as CarWash */
+#define DISPENSER_TASK_STACK_WORDS    STACK_BYTES_TO_WORDS(DISPENSER_TASK_STACK_BYTES)
 
 /* Buzzer Polling Task - Check module states for audible feedback */
 #define BUZZER_POLLING_TASK_STACK_BYTES     (96u * 4)   /* 384 bytes - optimized: 114w free (89%) */
@@ -105,8 +107,10 @@
 /* USB Command Handler Task - Normal priority */
 #define USB_COMMAND_HANDLER_TASK_PRIORITY       (tskIDLE_PRIORITY + 1)
 
-/* Car Wash Controller Task - Normal priority */
-#define CARWASH_TASK_PRIORITY           (tskIDLE_PRIORITY + 1)
+
+
+/* Dispenser Controller Task - Normal priority */
+#define DISPENSER_TASK_PRIORITY         (tskIDLE_PRIORITY + 1)
 
 /* MIFARE Polling Task - Low priority (polling is less urgent) */
 #define MIFARE_POLLING_TASK_PRIORITY    (tskIDLE_PRIORITY + 1)
