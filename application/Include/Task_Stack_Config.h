@@ -44,13 +44,11 @@
 #define USB_COMMAND_HANDLER_TASK_STACK_WORDS STACK_BYTES_TO_WORDS(USB_COMMAND_HANDLER_TASK_STACK_BYTES)
 
 /* LCD Display Task - LVGL rendering and UI updates */
-#define LCD_DISPLAY_TASK_STACK_BYTES (960u * 4)  /* 3840 bytes - CRITICAL: only 40w free! */
+#define LCD_DISPLAY_TASK_STACK_BYTES (1024u * 4)  /* 4096 bytes - Increased for safety */
 #define LCD_DISPLAY_TASK_STACK_WORDS STACK_BYTES_TO_WORDS(LCD_DISPLAY_TASK_STACK_BYTES)
 
-
-
 /* Dispenser Controller Task - State machine and valve control */
-#define DISPENSER_TASK_STACK_BYTES    (256u * 4)   /* 1024 bytes - same as CarWash */
+#define DISPENSER_TASK_STACK_BYTES    (768u * 4)   /* 3072 bytes - Increased for MIFARE crypto ops */
 #define DISPENSER_TASK_STACK_WORDS    STACK_BYTES_TO_WORDS(DISPENSER_TASK_STACK_BYTES)
 
 /* Buzzer Polling Task - Check module states for audible feedback */
@@ -70,7 +68,7 @@
 #define RTC_TASK_STACK_WORDS        STACK_BYTES_TO_WORDS(RTC_TASK_STACK_BYTES)
 
 /* RS485 Task - RS485 communication and firmware update */
-#define RS485_TASK_STACK_BYTES      (576u * 4)   /* 2304 bytes - INCREASED: only 70w free (critical!) */
+#define RS485_TASK_STACK_BYTES      (768u * 4)   /* 3072 bytes - Increased for safety */
 #define RS485_TASK_STACK_WORDS      STACK_BYTES_TO_WORDS(RS485_TASK_STACK_BYTES)
 
 /* ============================================================================

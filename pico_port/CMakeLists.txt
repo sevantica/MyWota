@@ -168,6 +168,14 @@ set(ALL_LOCAL_SOURCES ${MAIN_SOURCES} ${APP_SOURCES})
 # Create the executable
 add_executable(UI_PICO_PORT ${ALL_LOCAL_SOURCES})
 
+# Force Firmware_Version.c to always recompile (updates __DATE__ and __TIME__)
+add_custom_command(
+    TARGET UI_PICO_PORT
+    PRE_BUILD
+    COMMAND ${CMAKE_COMMAND} -E touch_nocreate "${CMAKE_CURRENT_SOURCE_DIR}/../application/Source/Firmware_Version.c"
+    COMMENT "Forcing recompilation of Firmware_Version.c for fresh timestamp"
+)
+
 # Use custom linker script for bootloader-aware build (app at 0x10008000)
 pico_set_linker_script(UI_PICO_PORT ${CMAKE_CURRENT_SOURCE_DIR}/memmap_app.ld)
 

@@ -112,6 +112,9 @@ IO_Expander_Control_Status_t IO_Expander_Control_Init(void)
         return convert_cat9555_status(status);
     }
 
+    // Mark as initialized before configuring pins (allows wrapper functions to work)
+    s_initialized = true;
+
     // Configure output pins
     // Note: Pin 0, 1, 2 reserved for wash option buttons (inputs)
     // Main relay moved to pin 3 (was keypad row 2)
@@ -135,7 +138,6 @@ IO_Expander_Control_Status_t IO_Expander_Control_Init(void)
     // Keypad DISABLED - pins 0,1,2 used for wash buttons
     // Keypad driver configuration removed
 
-    s_initialized = true;
     IO_EXP_CTRL_CRITICAL("[✓] I/O Expander Control initialized");
 
     return IO_EXP_CTRL_OK;

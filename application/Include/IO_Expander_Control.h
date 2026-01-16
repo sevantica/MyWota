@@ -12,6 +12,7 @@
 
 #ifndef APPLICATION_INCLUDE_IO_EXPANDER_CONTROL_H_
 #define APPLICATION_INCLUDE_IO_EXPANDER_CONTROL_H_
+#define IO_EXPANDER_CONTROL_H_ /* Dependency marker for compile-time checks */
 
 /**
  * @file IO_Expander_Control.h

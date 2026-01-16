@@ -285,7 +285,13 @@ static void system_init(void)
     }
     
     /* I/O Expander Control (high-level abstraction layer) */
-    IO_Expander_Control_Init();
+    IO_Expander_Control_Status_t io_exp_ctrl_status = IO_Expander_Control_Init();
+    if (io_exp_ctrl_status != IO_EXP_CTRL_OK) {
+        LOG_CRITICAL_SYSTEM("[✗] I/O Expander Control initialization FAILED: %s\r\n",
+                            IO_Expander_Control_GetStatusString(io_exp_ctrl_status));
+    } else {
+        LOG_CRITICAL_SYSTEM("[✓] I/O Expander Control initialized\r\n");
+    }
     
     /* Register MyWota IO Expander pin mapping */
     MyWota_IO_Expander_Adapter_Init();

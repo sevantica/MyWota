@@ -29,7 +29,7 @@
 #define FW_BUILD_TIME       __TIME__
 
 /* Project Name */
-#define FW_PROJECT_NAME     "BigYellow"
+#define FW_PROJECT_NAME     "MyWota"
 
 /* Bootloader Compatibility */
 #define FW_MIN_BOOTLOADER_VERSION  "1.0.0"
