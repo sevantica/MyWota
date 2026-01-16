@@ -18,6 +18,7 @@
 /*Includes ----------------------------------------------------------*/
 #include <stdint.h>
 #include <stdbool.h>
+#include "MIFARE_Config_Structs.h"
 
 /*Defines ------------------------------------------------------------*/
 #define CONFIG_FILE_PATH            "0:/config.txt"
@@ -33,53 +34,6 @@
 #define CONFIG_FLASH_OFFSET         (CONFIG_FLASH_SIZE - CONFIG_FLASH_SECTOR_SIZE)  /* Last sector */
 
 /*Typedefs -----------------------------------------------------------*/
-
-/**
- * @brief MIFARE security configuration parameters
- */
-typedef struct {
-    /* Encryption settings */
-    bool encryption_enabled;                /* Master encryption enable/disable */
-    uint8_t master_key[32];                 /* Master secret for key derivation */
-    uint8_t hmac_key[32];                   /* Separate HMAC key */
-    uint32_t pbkdf2_iterations;             /* Key derivation iterations */
-    
-    /* Sector keys (custom MIFARE keys) */
-    uint8_t sector_keys_a[4][6];            /* Key A for sectors 1-4 */
-    uint8_t sector_keys_b[4][6];            /* Key B for sectors 1-4 */
-    bool use_custom_sector_keys;            /* Use custom keys vs factory defaults */
-    
-    /* Security feature enables */
-    bool enable_challenge_response;         /* Challenge-response anti-cloning */
-    bool enable_replay_protection;          /* Rolling counter protection */
-    bool enable_hmac_auth;                  /* HMAC authentication tags */
-    uint32_t max_timestamp_drift_sec;       /* Max clock drift allowed (86400 = 24h) */
-    uint8_t failed_challenge_lockout;       /* Failed attempts before lockout */
-    
-    /* Block encryption selection */
-    bool encrypt_user_data;                 /* Encrypt blocks 5,6 (user data) */
-    bool encrypt_transactions;              /* Encrypt blocks 9,10 (transaction log) */
-    bool encrypt_token_cache;               /* Encrypt blocks 13,14 (token cache) */
-    bool encrypt_account_data;              /* Encrypt block 16 (phone number) */
-} MIFARE_Security_Config_t;
-
-/**
- * @brief MIFARE configuration parameters
- */
-typedef struct {
-    uint32_t card_timeout_ms;               /* Card response timeout */
-    uint8_t max_retries;                    /* Maximum retry attempts */
-    uint8_t card_removal_fail_count;        /* Failures to infer card removal */
-    uint32_t stability_timeout_ms;          /* Card stable detection time */
-    uint32_t removal_stability_ms;          /* Card removal confirmation time */
-    uint8_t auth_key[6];                    /* MIFARE authentication key */
-    uint32_t card_init_default_balance;     /* Default balance for new cards */
-    bool auto_reinit_on_corruption;         /* Auto-reinitialize corrupt cards */
-    char card_init_phone_number[16];        /* Default phone number */
-    uint8_t card_init_validity;             /* Default validity level */
-    char no_card_user_id[16];               /* User ID when no card present */
-    MIFARE_Security_Config_t security;      /* Security configuration */
-} MIFARE_Config_t;
 
 /**
  * @brief UI display states for state-based configuration
@@ -173,17 +127,7 @@ typedef struct {
 /**
  * @brief Buzzer configuration
  */
-typedef struct {
-    bool enabled;                           /* Master enable/disable */
-    uint16_t default_duration_ms;           /* Default beep duration (default 200ms) */
-    uint16_t double_beep_on_ms;             /* Double beep on time (default 50ms) */
-    uint16_t double_beep_off_ms;            /* Double beep off time (default 50ms) */
-    uint16_t card_init_beep_interval_ms;    /* Card init beep interval (default 500ms) */
-    uint16_t removal_pattern_on_ms;         /* Removal pattern on time (default 50ms) */
-    uint16_t removal_pattern_off_ms;        /* Removal pattern off time (default 50ms) */
-    uint8_t removal_pattern_count;          /* Removal pattern repeat count (default 8) */
-    uint16_t removal_pattern_repeat_ms;     /* Removal pattern repeat interval (default 3000ms) */
-} Buzzer_Config_t;
+#include "Buzzer_Config_Structs.h"
 
 /**
  * @brief SD Logger configuration

@@ -21,6 +21,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "MIFARE_Transaction_Core.h"
 #include "MIFARE_Card_Interface.h"
+#include "System_Config.h"
 #include "USB_Logging.h"
 #include <string.h>
 
@@ -236,7 +237,7 @@ MIFARE_Result_t MIFARE_Volume_Adapter_Init(void)
     LOG_CRITICAL_VOLUME("[→] Initializing Volume Adapter (MyWota)\r\n");
     
     // Initialize core with volume interface
-    MIFARE_Result_t result = MIFARE_TransactionManager_Init(&volume_interface);
+    MIFARE_Result_t result = MIFARE_TransactionManager_Init(&volume_interface, &g_system_config.mifare);
     
     if (result == MIFARE_RESULT_OK) {
         LOG_CRITICAL_VOLUME("[✓] Volume Adapter initialized successfully\r\n");

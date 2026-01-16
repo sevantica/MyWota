@@ -15,6 +15,7 @@
 
 /*Includes ----------------------------------------------------------*/
 #include "FreeRTOS.h"
+#include "System_Core.h"
 #include "MIFARE_Transaction_Core.h"
 #include "task.h"
 #include "queue.h"
@@ -27,21 +28,31 @@
 
 
 
+
 /*Typedefs -----------------------------------------------------------*/
 
-/* Watchdog Task IDs - used for reporting task health */
-typedef enum {
-    SYSTEM_TASK_ID_SD_LOGGER = 0,
-    SYSTEM_TASK_ID_USB_CDC,
-    SYSTEM_TASK_ID_USB_COMMAND_HANDLER,
-    SYSTEM_TASK_ID_LCD_DISPLAY,
-    SYSTEM_TASK_ID_DISPENSER,
-    SYSTEM_TASK_ID_BUZZER_POLLING,
-    SYSTEM_TASK_ID_MIFARE_POLLING,
-    SYSTEM_TASK_ID_IO_EXPANDER,
-    SYSTEM_TASK_ID_RTC,
-    SYSTEM_TASK_ID_RS485,
-} System_Task_ID_t;
+/* Watchdog Task IDs - Application-specific tasks (System Core uses 0-9) */
+/* System Core task IDs (from System_Core.h):
+ * SYS_TASK_ID_SD_LOGGER = 0
+ * SYS_TASK_ID_USB_CDC = 1
+ * SYS_TASK_ID_USB_COMMAND = 2
+ * SYS_TASK_ID_RTC = 3
+ * SYS_TASK_ID_RS485 = 4
+ */
+
+#define SYSTEM_TASK_ID_LCD_DISPLAY          (SYS_TASK_ID_APP_START + 0)
+#define SYSTEM_TASK_ID_DISPENSER            (SYS_TASK_ID_APP_START + 1)
+#define SYSTEM_TASK_ID_BUZZER_POLLING       (SYS_TASK_ID_APP_START + 2)
+#define SYSTEM_TASK_ID_MIFARE_POLLING       (SYS_TASK_ID_APP_START + 3)
+#define SYSTEM_TASK_ID_IO_EXPANDER          (SYS_TASK_ID_APP_START + 4)
+#define SYSTEM_TASK_ID_RS485                SYS_TASK_ID_RS485  /* Use shared core ID */
+
+/* Backward compatibility for shared drivers that use old names */
+#define SYSTEM_TASK_ID_SD_LOGGER            SYS_TASK_ID_SD_LOGGER
+#define SYSTEM_TASK_ID_USB_CDC              SYS_TASK_ID_USB_CDC
+#define SYSTEM_TASK_ID_USB_COMMAND_HANDLER  SYS_TASK_ID_USB_COMMAND
+#define SYSTEM_TASK_ID_RTC                  SYS_TASK_ID_RTC
+
 
 typedef enum{
 
@@ -232,24 +243,6 @@ typedef DISPLAY_MSG_Def EVENT_MSG_Def;
 } while(0)
 
 /*Function Prototypes ------------------------------------------------*/
-
-/* Semaphore Getter Functions - modules poll these instead of direct access */
-SemaphoreHandle_t System_GetGpioSemaphore(void);
-SemaphoreHandle_t System_GetI2C0Semaphore(void);
-SemaphoreHandle_t System_GetI2C1Semaphore(void);
-SemaphoreHandle_t System_GetMuxSemaphore(void);
-SemaphoreHandle_t System_GetSPI1Semaphore(void);
-
-/* Task Handle Getter Functions */
-TaskHandle_t task_get_handle_System_Task(void);
-
-/* Driver Handle Getter Functions */
-Buzzer_Handle_t* System_GetBuzzerHandle(void);
-
-/* Watchdog Task Health Reporting - tasks call this to report they're running */
-void System_ReportTaskStatus(System_Task_ID_t task_id, bool is_running_ok);
-
-void Task_Start_System_Task();
 
 /* Module Runtime Control - Start/Stop modules dynamically */
 typedef enum {

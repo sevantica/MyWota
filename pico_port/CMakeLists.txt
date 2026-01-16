@@ -139,6 +139,7 @@ set(MAIN_SOURCES
 
 # Application source files (explicit list - no GLOB)
 set(APP_SOURCES
+    ../application/Source/MyWota_Module.c
     ../application/Source/MyWota_ui_driver.c
     ../application/Source/Dispenser_Controller.c
     ../application/Source/Firmware_Version.c
@@ -154,7 +155,7 @@ set(APP_SOURCES
     ../application/Source/RTC_Task.c
     ../application/Source/SD_Logger_Task.c
     ../application/Source/SD_Logger_Format_Adapter.c
-    ../application/Source/System.c
+    # System.c removed - now using shared System_Core.c from sevantica_drivers
     ../application/Source/RS485_Command_Adapter.c
     ../application/Source/System_Config.c
     ../application/Source/USB_Command_Adapter.c

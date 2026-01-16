@@ -308,7 +308,7 @@ static void system_init(void)
     Buzzer_Status_t buzzer_status = BUZZER_ERROR;  /* Assume failure until proven otherwise */
     
     if (cat_status == CAT9555_OK && buzzer_handle != NULL) {
-        buzzer_status = Buzzer_Init(buzzer_handle, cat9555_handle);
+        buzzer_status = Buzzer_Init(buzzer_handle, cat9555_handle, &cfg->buzzer);
     } else if (cat_status != CAT9555_OK) {
         LOG_CRITICAL_SYSTEM("[✗] Buzzer initialization SKIPPED - CAT9555 failed\r\n");
     } else {
