@@ -54,7 +54,11 @@
 #include "MyWota_IO_Expander_Adapter.h"
 #include "Log_Strings.h"
 #include "hardware/watchdog.h"
+#include "hardware/flash.h"
+#include "hardware/sync.h"
+#include "pico/flash.h"
 #include <stdio.h>
+#include <string.h>
 
 /* Logging Configuration -----------------------------------------------------*/
 #define LOG_DEBUG_SYSTEM_EN      0
@@ -152,6 +156,10 @@ static Task_WDT_Status_t s_task_wdt_status[TASK_ID_COUNT] = {
 static SemaphoreHandle_t s_wdt_status_mutex = NULL;
 static bool s_watchdog_enabled = false;
 
+/* WDT Log Storage - persists across resets */
+static uint32_t s_boot_count = 0;  /* Incremented each boot, stored in flash */
+static bool s_wdt_log_saved = false;  /* Prevent multiple saves per boot */
+
 /* Module Runtime Control State Tracking */
 static Module_State_t s_module_states[MODULE_COUNT] = {
     MODULE_STATE_STOPPED,  /* LCD_DISPLAY */
@@ -189,6 +197,10 @@ static void system_init(void);
 static void system_init(void)
 {
     LOG_CRITICAL_SYSTEM("\r\n=== System Initialization ===\r\n");
+    
+    /* Initialize boot count from WDT log (before any other flash operations) */
+    wdt_log_init_boot_count();
+    LOG_CRITICAL_SYSTEM("[✓] Boot count: %lu\r\n", s_boot_count);
     
     /* Print firmware version first */
     FW_PrintVersionInfo();
@@ -585,6 +597,9 @@ static void System_Task(void* argument)
                         xSemaphoreGive(s_wdt_status_mutex);
                     }
                 } else {
+                    /* Save WDT status to flash BEFORE logging (in case WDT triggers during log) */
+                    System_SaveWDTLogToFlash();
+                    
                     /* Log missing/failed tasks - can take 100s of ms with USB + SD */
                     LOG_CRITICAL_SYSTEM("[WDT] Not all tasks reported within 2400ms:\r\n");
                     
@@ -700,14 +715,43 @@ SemaphoreHandle_t System_GetSPI1Semaphore(void)
  */
 void System_ReportTaskStatus(System_Task_ID_t task_id, bool is_running_ok)
 {
-    Task_ID_t internal_id = (Task_ID_t)task_id;
-    static bool usb_mutex_not_ready_logged = false;
-    static bool usb_first_success_logged = false;
+    /* Map external SYSTEM_TASK_ID_* to internal TASK_ID_* */
+    Task_ID_t internal_id;
     
-    if (internal_id >= TASK_ID_COUNT) {
-        LOG_ERROR_SYSTEM("[WDT] Invalid task ID: %d (max=%d)\r\n", internal_id, TASK_ID_COUNT);
+    /* Core tasks (0-9) map directly */
+    if (task_id <= SYS_TASK_ID_RS485) {
+        switch (task_id) {
+            case SYS_TASK_ID_SD_LOGGER:    internal_id = TASK_ID_SD_LOGGER; break;
+            case SYS_TASK_ID_USB_CDC:      internal_id = TASK_ID_USB_CDC; break;
+            case SYS_TASK_ID_USB_COMMAND:  internal_id = TASK_ID_USB_COMMAND_HANDLER; break;
+            case SYS_TASK_ID_RTC:          internal_id = TASK_ID_RTC; break;
+            case SYS_TASK_ID_RS485:        internal_id = TASK_ID_RS485; break;
+            default:
+                LOG_ERROR_SYSTEM("[WDT] Unknown core task ID: %d\r\n", task_id);
+                return;
+        }
+    }
+    /* App tasks start at SYS_TASK_ID_APP_START (10) */
+    else if (task_id >= SYS_TASK_ID_APP_START) {
+        uint8_t app_offset = task_id - SYS_TASK_ID_APP_START;
+        switch (app_offset) {
+            case 0: internal_id = TASK_ID_LCD_DISPLAY; break;     /* SYSTEM_TASK_ID_LCD_DISPLAY */
+            case 1: internal_id = TASK_ID_DISPENSER; break;       /* SYSTEM_TASK_ID_DISPENSER */
+            case 2: internal_id = TASK_ID_BUZZER_POLLING; break;  /* SYSTEM_TASK_ID_BUZZER_POLLING */
+            case 3: internal_id = TASK_ID_MIFARE_POLLING; break;  /* SYSTEM_TASK_ID_MIFARE_POLLING */
+            case 4: internal_id = TASK_ID_IO_EXPANDER; break;     /* SYSTEM_TASK_ID_IO_EXPANDER */
+            default:
+                LOG_ERROR_SYSTEM("[WDT] Unknown app task ID: %d (offset=%d)\r\n", task_id, app_offset);
+                return;
+        }
+    }
+    else {
+        LOG_ERROR_SYSTEM("[WDT] Invalid task ID: %d\r\n", task_id);
         return;
     }
+    
+    static bool usb_mutex_not_ready_logged = false;
+    static bool usb_first_success_logged = false;
     
     if (!s_wdt_status_mutex) {
         /* Silently ignore during early boot before mutex created */
@@ -888,4 +932,195 @@ void System_PrintModuleStatus(void)
     USB_Log_Printf("\r\nCommands: start <module>, stop <module>\r\n");
     USB_Log_Printf("Modules: lcd, mifare, dispenser, buzzer, ioexp, rs485\r\n");
     USB_Log_Printf("\r\n");
+}
+
+/* WDT Log Flash Storage Functions ------------------------------------------- */
+
+/**
+ * @brief Simple CRC32 calculation for WDT log validation
+ */
+static uint32_t wdt_log_crc32(const uint8_t* data, size_t len)
+{
+    uint32_t crc = 0xFFFFFFFF;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (uint8_t j = 0; j < 8; j++) {
+            crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
+        }
+    }
+    return ~crc;
+}
+
+/**
+ * @brief Load WDT log from flash and extract boot count
+ * @note Called at startup to increment boot counter
+ */
+static void wdt_log_init_boot_count(void)
+{
+    const WDT_Log_t* flash_log = (const WDT_Log_t*)(XIP_BASE + WDT_LOG_FLASH_OFFSET);
+    
+    /* Check if valid log exists */
+    if (flash_log->magic == WDT_LOG_MAGIC_NUMBER && 
+        flash_log->version == WDT_LOG_VERSION) {
+        
+        /* Verify CRC (exclude CRC field itself) */
+        uint32_t calc_crc = wdt_log_crc32((const uint8_t*)flash_log, 
+                                          sizeof(WDT_Log_t) - sizeof(uint32_t));
+        if (calc_crc == flash_log->crc32) {
+            s_boot_count = flash_log->boot_count + 1;
+            LOG_DEBUG_SYSTEM("[WDT_LOG] Previous log found, boot count: %lu\r\n", s_boot_count);
+            return;
+        }
+    }
+    
+    /* No valid log - start at 1 */
+    s_boot_count = 1;
+    LOG_DEBUG_SYSTEM("[WDT_LOG] No previous log found, boot count: 1\r\n");
+}
+
+/**
+ * @brief Save WDT task status to flash before watchdog reset
+ */
+void System_SaveWDTLogToFlash(void)
+{
+    /* Prevent multiple saves per boot */
+    if (s_wdt_log_saved) {
+        return;
+    }
+    s_wdt_log_saved = true;
+    
+    /* Build the WDT log structure */
+    static WDT_Log_t wdt_log;  /* Static to avoid stack overflow */
+    memset(&wdt_log, 0, sizeof(WDT_Log_t));
+    
+    wdt_log.magic = WDT_LOG_MAGIC_NUMBER;
+    wdt_log.version = WDT_LOG_VERSION;
+    wdt_log.timestamp_tick = xTaskGetTickCount();
+    wdt_log.boot_count = s_boot_count;
+    wdt_log.task_count = (uint8_t)TASK_ID_COUNT;
+    
+    /* Copy task status - no mutex, we're in critical state */
+    TickType_t now = xTaskGetTickCount();
+    for (uint8_t i = 0; i < TASK_ID_COUNT && i < WDT_LOG_MAX_TASKS; i++) {
+        strncpy(wdt_log.tasks[i].name, s_task_wdt_status[i].name, WDT_LOG_TASK_NAME_LEN - 1);
+        wdt_log.tasks[i].name[WDT_LOG_TASK_NAME_LEN - 1] = '\0';
+        wdt_log.tasks[i].status = (uint8_t)s_task_wdt_status[i].status;
+        wdt_log.tasks[i].last_report_tick = s_task_wdt_status[i].last_report_tick;
+        wdt_log.tasks[i].time_since_report_ms = (now - s_task_wdt_status[i].last_report_tick) * portTICK_PERIOD_MS;
+    }
+    
+    /* Calculate CRC (exclude CRC field itself) */
+    wdt_log.crc32 = wdt_log_crc32((const uint8_t*)&wdt_log, sizeof(WDT_Log_t) - sizeof(uint32_t));
+    
+    /* Calculate write size - must be multiple of FLASH_PAGE_SIZE (256 bytes) */
+    size_t write_size = ((sizeof(WDT_Log_t) + FLASH_PAGE_SIZE - 1) / FLASH_PAGE_SIZE) * FLASH_PAGE_SIZE;
+    
+    /* Feed watchdog before flash operations */
+    watchdog_update();
+    
+    /* Disable interrupts for flash write */
+    uint32_t interrupts = save_and_disable_interrupts();
+    
+    /* Erase the sector first */
+    flash_range_erase(WDT_LOG_FLASH_OFFSET, WDT_LOG_FLASH_SECTOR_SIZE);
+    
+    /* Brief interrupt enable for watchdog */
+    restore_interrupts(interrupts);
+    watchdog_update();
+    interrupts = save_and_disable_interrupts();
+    
+    /* Write the log */
+    flash_range_program(WDT_LOG_FLASH_OFFSET, (const uint8_t*)&wdt_log, write_size);
+    
+    /* Restore interrupts */
+    restore_interrupts(interrupts);
+    
+    LOG_CRITICAL_SYSTEM("[WDT_LOG] Saved WDT log to flash (boot %lu, CRC: 0x%08lX)\r\n", 
+                        s_boot_count, wdt_log.crc32);
+}
+
+/**
+ * @brief Load WDT log from flash memory
+ * @param log Pointer to WDT_Log_t structure to fill
+ * @return true if valid log was loaded, false if no valid log exists
+ */
+bool System_LoadWDTLogFromFlash(WDT_Log_t* log)
+{
+    if (log == NULL) {
+        return false;
+    }
+    
+    const WDT_Log_t* flash_log = (const WDT_Log_t*)(XIP_BASE + WDT_LOG_FLASH_OFFSET);
+    
+    /* Check magic number */
+    if (flash_log->magic != WDT_LOG_MAGIC_NUMBER) {
+        return false;
+    }
+    
+    /* Check version */
+    if (flash_log->version != WDT_LOG_VERSION) {
+        return false;
+    }
+    
+    /* Verify CRC */
+    uint32_t calc_crc = wdt_log_crc32((const uint8_t*)flash_log, 
+                                      sizeof(WDT_Log_t) - sizeof(uint32_t));
+    if (calc_crc != flash_log->crc32) {
+        return false;
+    }
+    
+    /* Copy to output */
+    memcpy(log, flash_log, sizeof(WDT_Log_t));
+    return true;
+}
+
+/**
+ * @brief Print stored WDT log via USB (for diagnostics)
+ */
+void System_PrintWDTLog(void)
+{
+    static WDT_Log_t log;  /* Static to avoid stack overflow */
+    
+    if (!System_LoadWDTLogFromFlash(&log)) {
+        USB_Log_Printf("[WDT_LOG] No valid WDT log found in flash\r\n");
+        return;
+    }
+    
+    USB_Log_Printf("\r\n");
+    USB_Log_Printf("═══════════════════════════════════════════════════════════════\r\n");
+    USB_Log_Printf("                   WDT LOG FROM FLASH                           \r\n");
+    USB_Log_Printf("═══════════════════════════════════════════════════════════════\r\n");
+    USB_Log_Printf("Boot Count:        %lu\r\n", log.boot_count);
+    USB_Log_Printf("Saved at Tick:     %lu (%lu ms)\r\n", 
+                   log.timestamp_tick, log.timestamp_tick * portTICK_PERIOD_MS);
+    USB_Log_Printf("Task Count:        %u\r\n", log.task_count);
+    USB_Log_Printf("CRC32:             0x%08lX\r\n", log.crc32);
+    USB_Log_Printf("───────────────────────────────────────────────────────────────\r\n");
+    USB_Log_Printf("Task             Status      Last Report    Time Since Report\r\n");
+    USB_Log_Printf("───────────────────────────────────────────────────────────────\r\n");
+    
+    const char* status_strings[] = {"UNKNOWN", "RUNNING", "ERROR"};
+    
+    for (uint8_t i = 0; i < log.task_count && i < WDT_LOG_MAX_TASKS; i++) {
+        const char* status_str = (log.tasks[i].status < 3) ? 
+                                 status_strings[log.tasks[i].status] : "???";
+        
+        USB_Log_Printf("%-16s %-10s  %10lu     %lu ms\r\n",
+                       log.tasks[i].name,
+                       status_str,
+                       log.tasks[i].last_report_tick,
+                       log.tasks[i].time_since_report_ms);
+    }
+    
+    USB_Log_Printf("═══════════════════════════════════════════════════════════════\r\n");
+    USB_Log_Printf("\r\n");
+}
+
+/**
+ * @brief Get boot count from stored WDT log
+ * @return Current boot count
+ */
+uint32_t System_GetBootCount(void)
+{
+    return s_boot_count;
 }

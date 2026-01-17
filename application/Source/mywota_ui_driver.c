@@ -883,21 +883,22 @@ static void update_ui_from_system_state(void)
         /* Card operation in progress - show working status */
         error_text = "In Progress";
         should_show_error = true;
-    } else if (txn_state == TRANSACTION_STATE_INITIALIZED) {
-        /* Card initialized - show status message */
-        error_text = "Init Done";
-        should_show_error = true;
-    } else if (txn_state == TRANSACTION_STATE_READY_AFTER_TOPUP) {
-        /* Card topped up - show status message */
-        error_text = "Topped Up";
+    } else if (txn_state == TRANSACTION_STATE_WAITING_REMOVAL) {
+        /* Operation complete - show appropriate status based on context */
+        MIFARE_OperationContext_t ctx = MIFARE_GetOperationContext();
+        if (ctx == MIFARE_CONTEXT_INIT) {
+            error_text = "Complete";
+        } else {
+            error_text = "Topped Up";
+        }
         should_show_error = true;
     } else if (card_state == MIFARE_CARD_STATE_ABSENT && !ui_ctx.in_cooldown) {
         /* No card present (only show after cooldown expires) */
         error_text = "No Card";
         should_show_error = true;
     } else if (card_state == MIFARE_CARD_STATE_PRESENT && 
-               txn_state == TRANSACTION_STATE_WAITING_FOR_REMOVAL) {
-        /* Card topped up - keep showing balance but display status message */
+               txn_state == TRANSACTION_STATE_WAITING_REMOVAL) {
+        /* Operation complete - keep showing balance but display status message */
         should_show_error = true;
     } else if (card_state == MIFARE_CARD_STATE_ERROR) {
         /* Card failed to initialize */
@@ -985,6 +986,28 @@ static void update_ui_from_system_state(void)
             if (lv_obj_has_flag(ui_cardErrorStatus, LV_OBJ_FLAG_HIDDEN)) {
                 lv_obj_clear_flag(ui_cardErrorStatus, LV_OBJ_FLAG_HIDDEN);
             }
+        } else if (txn_state == TRANSACTION_STATE_WAITING_REMOVAL) {
+            /* Operation complete - alternate between status and "Remove Card" based on context */
+            static uint32_t last_toggle_time_waiting = 0;
+            static bool show_remove_waiting = false;
+            uint32_t now = xTaskGetTickCount();
+            
+            if ((now - last_toggle_time_waiting) >= pdMS_TO_TICKS(2000)) {
+                show_remove_waiting = !show_remove_waiting;
+                last_toggle_time_waiting = now;
+            }
+            
+            MIFARE_OperationContext_t ctx = MIFARE_GetOperationContext();
+            const char *status_msg = (ctx == MIFARE_CONTEXT_INIT) ? "Complete" : "Topped Up";
+            const char *msg = show_remove_waiting ? "Remove Card" : status_msg;
+            if (strcmp(last_error_text, msg) != 0) {
+                lv_label_set_text(ui_cardErrorStatus, msg);
+                strncpy(last_error_text, msg, sizeof(last_error_text) - 1);
+                last_error_text[sizeof(last_error_text) - 1] = '\0';
+            }
+            if (lv_obj_has_flag(ui_cardErrorStatus, LV_OBJ_FLAG_HIDDEN)) {
+                lv_obj_clear_flag(ui_cardErrorStatus, LV_OBJ_FLAG_HIDDEN);
+            }
         } else if (card_authenticated && card_balance_tokens > 0 && !is_dispensing) {
             /* Card ready with balance, not yet dispensing - show "Ready" */
             if (strcmp(last_error_text, "Ready") != 0) {
@@ -1055,39 +1078,28 @@ static void update_ui_from_system_state(void)
                 
                 error_text = show_remove_message_no_flow ? "Remove Card" : "No Flow";
                 should_show = true;
-            } else if (txn_state == TRANSACTION_STATE_INITIALIZED) {
-                /* Card initialized - alternate between "Init Done" and "Remove Card" */
-                static uint32_t last_toggle_time_initialized = 0;
-                static bool show_remove_message_initialized = false;
+            } else if (txn_state == TRANSACTION_STATE_WAITING_REMOVAL) {
+                /* Operation complete - alternate between status and "Remove Card" based on context */
+                static uint32_t last_toggle_time_waiting_lvl = 0;
+                static bool show_remove_message_waiting_lvl = false;
                 uint32_t now = xTaskGetTickCount();
                 
-                if ((now - last_toggle_time_initialized) >= pdMS_TO_TICKS(2000)) {
-                    show_remove_message_initialized = !show_remove_message_initialized;
-                    last_toggle_time_initialized = now;
+                if ((now - last_toggle_time_waiting_lvl) >= pdMS_TO_TICKS(2000)) {
+                    show_remove_message_waiting_lvl = !show_remove_message_waiting_lvl;
+                    last_toggle_time_waiting_lvl = now;
                 }
                 
-                error_text = show_remove_message_initialized ? "Remove Card" : "Init Done";
-                should_show = true;
-            } else if (txn_state == TRANSACTION_STATE_READY_AFTER_TOPUP) {
-                /* Card topped up - alternate between "Topped Up" and "Remove Card" */
-                static uint32_t last_toggle_time_topup = 0;
-                static bool show_remove_message_topup = false;
-                uint32_t now = xTaskGetTickCount();
-                
-                if ((now - last_toggle_time_topup) >= pdMS_TO_TICKS(2000)) {
-                    show_remove_message_topup = !show_remove_message_topup;
-                    last_toggle_time_topup = now;
-                }
-                
-                error_text = show_remove_message_topup ? "Remove Card" : "Topped Up";
+                MIFARE_OperationContext_t ctx = MIFARE_GetOperationContext();
+                const char *status_msg = (ctx == MIFARE_CONTEXT_INIT) ? "Complete" : "Topped Up";
+                error_text = show_remove_message_waiting_lvl ? "Remove Card" : status_msg;
                 should_show = true;
             } else if (card_state == MIFARE_CARD_STATE_ABSENT && !ui_ctx.in_cooldown) {
                 /* No card present (only show after cooldown expires) */
                 error_text = "No Card";
                 should_show = true;
             } else if (card_state == MIFARE_CARD_STATE_PRESENT && 
-                       txn_state == TRANSACTION_STATE_WAITING_FOR_REMOVAL) {
-            /* Card initialized/topped up - alternate between "Topped Up" and "Remove Card" every 2 seconds */
+                       txn_state == TRANSACTION_STATE_WAITING_REMOVAL) {
+            /* Operation complete - alternate between status and "Remove Card" based on context */
             static uint32_t last_toggle_time_flow = 0;
             static bool show_remove_message_flow = false;
             uint32_t now = xTaskGetTickCount();
@@ -1098,7 +1110,9 @@ static void update_ui_from_system_state(void)
                 last_toggle_time_flow = now;
             }
             
-            error_text = show_remove_message_flow ? "Remove Card" : "Topped Up";
+            MIFARE_OperationContext_t ctx = MIFARE_GetOperationContext();
+            const char *status_msg = (ctx == MIFARE_CONTEXT_INIT) ? "Complete" : "Topped Up";
+            error_text = show_remove_message_flow ? "Remove Card" : status_msg;
             should_show = true;
         } else if (card_state == MIFARE_CARD_STATE_ERROR) {
             /* Card failed to initialize - alternate between "No Init" and "Remove Card" every 2 seconds */
@@ -1148,45 +1162,22 @@ static void update_ui_from_system_state(void)
                 }
                 
                 error_text = show_remove_message_no_flow_cooldown ? "Remove Card" : "No Flow";
-            } else if (txn_state == TRANSACTION_STATE_INITIALIZED) {
-                /* Initialized during cooldown - alternate messages */
-                static uint32_t last_toggle_time_initialized_cooldown = 0;
-                static bool show_remove_message_initialized_cooldown = false;
+            } else if (txn_state == TRANSACTION_STATE_WAITING_REMOVAL) {
+                /* Operation complete during cooldown - alternate based on context */
+                static uint32_t last_toggle_time_waiting_cooldown = 0;
+                static bool show_remove_message_waiting_cooldown = false;
                 uint32_t now = xTaskGetTickCount();
                 
-                if ((now - last_toggle_time_initialized_cooldown) >= pdMS_TO_TICKS(2000)) {
-                    show_remove_message_initialized_cooldown = !show_remove_message_initialized_cooldown;
-                    last_toggle_time_initialized_cooldown = now;
+                if ((now - last_toggle_time_waiting_cooldown) >= pdMS_TO_TICKS(2000)) {
+                    show_remove_message_waiting_cooldown = !show_remove_message_waiting_cooldown;
+                    last_toggle_time_waiting_cooldown = now;
                 }
                 
-                error_text = show_remove_message_initialized_cooldown ? "Remove Card" : "Init Done";
-            } else if (txn_state == TRANSACTION_STATE_READY_AFTER_TOPUP) {
-                /* Topup during cooldown - alternate messages */
-                static uint32_t last_toggle_time_topup_cooldown = 0;
-                static bool show_remove_message_topup_cooldown = false;
-                uint32_t now = xTaskGetTickCount();
-                
-                if ((now - last_toggle_time_topup_cooldown) >= pdMS_TO_TICKS(2000)) {
-                    show_remove_message_topup_cooldown = !show_remove_message_topup_cooldown;
-                    last_toggle_time_topup_cooldown = now;
-                }
-                
-                error_text = show_remove_message_topup_cooldown ? "Remove Card" : "Topped Up";
+                MIFARE_OperationContext_t ctx = MIFARE_GetOperationContext();
+                const char *status_msg = (ctx == MIFARE_CONTEXT_INIT) ? "Complete" : "Topped Up";
+                error_text = show_remove_message_waiting_cooldown ? "Remove Card" : status_msg;
             } else if (card_state == MIFARE_CARD_STATE_ABSENT) {
                 error_text = "No Card";
-            } else if (card_state == MIFARE_CARD_STATE_PRESENT && 
-                       txn_state == TRANSACTION_STATE_WAITING_FOR_REMOVAL) {
-                /* Use same alternating pattern for topped up */
-                static uint32_t last_toggle_time_flow_cooldown = 0;
-                static bool show_remove_message_flow_cooldown = false;
-                uint32_t now = xTaskGetTickCount();
-                
-                if ((now - last_toggle_time_flow_cooldown) >= pdMS_TO_TICKS(2000)) {
-                    show_remove_message_flow_cooldown = !show_remove_message_flow_cooldown;
-                    last_toggle_time_flow_cooldown = now;
-                }
-                
-                error_text = show_remove_message_flow_cooldown ? "Remove Card" : "Topped Up";
             } else if (card_state == MIFARE_CARD_STATE_ERROR) {
                 /* Use same alternating pattern as above */
                 static uint32_t last_toggle_time_cooldown = 0;
@@ -1240,8 +1231,7 @@ static void update_ui_from_system_state(void)
     if (card_balance_tokens == 0 && ui_ctx.last_card_balance_ml > 0) {
         /* Balance is 0 but we have cached value - use it for these states */
         if (txn_state == TRANSACTION_STATE_ERROR_NO_FLOW ||
-            txn_state == TRANSACTION_STATE_INITIALIZED ||
-            txn_state == TRANSACTION_STATE_READY_AFTER_TOPUP ||
+            txn_state == TRANSACTION_STATE_WAITING_REMOVAL ||
             ui_ctx.in_cooldown ||
             is_dispensing ||
             ui_ctx.showing_persisted_data) {
@@ -1352,9 +1342,7 @@ static void update_ui_from_system_state(void)
             }
             
         } else if ((card_authenticated || 
-                    txn_state == TRANSACTION_STATE_WAITING_FOR_REMOVAL || 
-                    txn_state == TRANSACTION_STATE_INITIALIZED ||
-                    txn_state == TRANSACTION_STATE_READY_AFTER_TOPUP ||
+                    txn_state == TRANSACTION_STATE_WAITING_REMOVAL || 
                     txn_state == TRANSACTION_STATE_ERROR_NO_FLOW ||
                     ui_ctx.in_cooldown ||
                     ui_ctx.showing_persisted_data) && display_balance_ml > 0) {
@@ -1544,7 +1532,7 @@ static void update_ui_from_system_state(void)
                    card_state == MIFARE_CARD_STATE_NEEDS_POLLING_CYCLE ||
                    card_state == MIFARE_CARD_STATE_ERROR ||
                    (card_state == MIFARE_CARD_STATE_PRESENT && card_balance_tokens == 0) ||
-                   (card_state == MIFARE_CARD_STATE_PRESENT && txn_state == TRANSACTION_STATE_WAITING_FOR_REMOVAL)) {
+                   (card_state == MIFARE_CARD_STATE_PRESENT && txn_state == TRANSACTION_STATE_WAITING_REMOVAL)) {
             /* Card validating, error state, no balance, or no flow - flash red at 2Hz */
             current_led_state = LED_STATE_FLASH_RED;
         } else {

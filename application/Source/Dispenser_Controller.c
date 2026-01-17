@@ -475,7 +475,7 @@ static bool dispense(uint32_t elapsed_ms)
                     // Card is confirmed removed
                     DISPENSER_CRITICAL("[✗] Card removal CONFIRMED by PN532 poll");
                     g_consecutive_write_failures = 0;
-                    g_card_removal_confirmed = true;  // Skip WAITING_FOR_REMOVAL
+                    g_card_removal_confirmed = true;  // Skip DISPENSER_WAITING_FOR_REMOVAL
                     
                     // Force immediate card removal (skip stability check - already confirmed)
                     MIFARE_ForceCardRemoval();
@@ -701,7 +701,7 @@ void MIFARE_Dispenser_Task(void* argument)
                     MIFARE_TransactionState_t mifare_state = MIFARE_GetTransactionState();
                     
                     // Only auto-dispense if card is in normal READY state
-                    // Block auto-dispense for: READY_AFTER_TOPUP, INITIALIZED, WAITING_FOR_REMOVAL
+                    // Block auto-dispense for WAITING_REMOVAL (post-topup/init/deduction)
                     if (mifare_state != TRANSACTION_STATE_READY) {
                         DISPENSER_DEBUG("IDLE: Card ready but state=%d - no auto-dispense", mifare_state);
                         break;  // Don't auto-dispense

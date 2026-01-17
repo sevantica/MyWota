@@ -53,6 +53,7 @@
 #define SYSTEM_TASK_ID_USB_COMMAND_HANDLER  SYS_TASK_ID_USB_COMMAND
 #define SYSTEM_TASK_ID_RTC                  SYS_TASK_ID_RTC
 
+/* WDT Log types and functions are provided by System_Core.h */
 
 typedef enum{
 
@@ -293,6 +294,13 @@ const char* System_GetModuleName(System_Module_t module);
  * @brief Print status of all modules
  */
 void System_PrintModuleStatus(void);
+
+/* WDT log functions are provided by System_Core.h:
+ * - System_SaveWDTLogToFlash()
+ * - System_LoadWDTLogFromFlash()
+ * - System_PrintWDTLog()
+ * - System_GetBootCount()
+ */
 
 void* getUIComponent(uint8_t type);
 

@@ -21,6 +21,7 @@
 #include "USB_Logging.h"
 #include "Dispenser_Controller.h"
 #include "MIFARE_Transaction_Core.h"
+#include "System.h"
 #include <stdlib.h>
 #include <string.h>
 #include "FreeRTOS.h"
@@ -122,7 +123,5 @@ static USB_Command_Status_t cmd_dispense_stop(int argc, char** argv)
         return USB_CMD_ERROR;
     }
 }
-
-
 
 
