@@ -97,7 +97,7 @@ if ($ComPort) {
         $serial.DtrEnable = $true
         $serial.Open()
         Start-Sleep -Milliseconds 100
-        $serial.WriteLine("bootsel")
+        $serial.WriteLine("sys bootloader")
         Start-Sleep -Milliseconds 200
         $serial.Close()
         Write-Host "Bootsel command sent. Waiting for device to enumerate in BOOTSEL mode..."
