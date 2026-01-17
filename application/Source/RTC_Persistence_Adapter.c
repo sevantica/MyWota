@@ -90,7 +90,7 @@ static RTC_Persist_Result_t rtc_save_to_sd(time_t current_time)
     }
     
     /* Open file for writing */
-    FIL file;
+    static FIL file;
     FRESULT result = f_open(&file, RTC_SAVE_FILE_PATH, FA_CREATE_ALWAYS | FA_WRITE);
     if (result != FR_OK) {
         LOG_DEBUG_PERSIST("[RTC_PERSIST] ✗ Failed to open file for write: %d\\r\\n", result);
@@ -127,7 +127,7 @@ static RTC_Persist_Result_t rtc_load_from_sd(time_t* loaded_time)
     }
     
     /* Open file for reading */
-    FIL file;
+    static FIL file;
     FRESULT result = f_open(&file, RTC_SAVE_FILE_PATH, FA_READ);
     if (result != FR_OK) {
         LOG_DEBUG_PERSIST("[RTC_PERSIST] No saved time file found\\r\\n");

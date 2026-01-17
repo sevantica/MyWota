@@ -72,7 +72,8 @@
 
 /* Timing configuration */
 #define DISPENSER_DEDUCTION_INTERVAL_MS   50     /* Update in-memory balance every 50ms (faster response) */
-#define DISPENSER_CARD_WRITE_INTERVAL_MS  100    /* Write to card every 100ms (fast write ~320ms) */
+#define DISPENSER_FAST_WRITE_INTERVAL_MS    200    /* Write primary data every 200ms */
+#define DISPENSER_BACKUP_WRITE_INTERVAL_MS  500    /* Write backup data every 500ms */
 
 static Dispenser_TimerState_t g_dispense_timer = {0};
 static DispenserState_t g_dispenser_state = DISPENSER_IDLE;
@@ -80,6 +81,7 @@ static TaskHandle_t dispenser_task_handle = NULL;
 
 /* Card write timing - write less frequently to avoid slow I/O */
 static uint32_t g_last_card_write_time = 0;
+static uint32_t g_last_backup_write_time = 0;
 static uint32_t g_pending_deduction_ml = 0;  /* Accumulated deduction not yet written to card */
 
 /* Card removal detection via write failures (not polling) */
@@ -207,6 +209,7 @@ static void dispenser_start_dispense_internal(bool no_card_mode, uint32_t target
     
     // Reset card write tracking
     g_last_card_write_time = g_dispense_timer.dispense_start_time;
+    g_last_backup_write_time = g_dispense_timer.dispense_start_time;
     g_pending_deduction_ml = 0;
     g_consecutive_write_failures = 0;  // Reset failure counter for new dispense session
     g_card_removal_confirmed = false;  // Reset card removal flag
@@ -435,30 +438,49 @@ static bool dispense(uint32_t elapsed_ms)
         }
     }
     
-    // Check if we should write to card (every interval)
+    // Check if we should write to card (Dual Interval: Fast=200ms, Backup=500ms)
     {
         uint32_t current_time = xTaskGetTickCount();
-        uint32_t since_last_write = pdTICKS_TO_MS(current_time - g_last_card_write_time);
+        bool attempt_write = false;
+        bool is_fast_write = true;
         
-        if (since_last_write >= DISPENSER_CARD_WRITE_INTERVAL_MS && g_pending_deduction_ml > 0) {
+        // 1. Check Backup Trigger (Full Write = Primary + Backup)
+        if (pdTICKS_TO_MS(current_time - g_last_backup_write_time) >= DISPENSER_BACKUP_WRITE_INTERVAL_MS && g_pending_deduction_ml > 0) {
+            attempt_write = true;
+            is_fast_write = false; // Full write
+        }
+        // 2. Check Fast Trigger (Primary Only)
+        else if (pdTICKS_TO_MS(current_time - g_last_card_write_time) >= DISPENSER_FAST_WRITE_INTERVAL_MS && g_pending_deduction_ml > 0) {
+            attempt_write = true;
+            is_fast_write = true; // Fast write
+        }
+        
+        if (attempt_write) {
             // Feed watchdog before potentially long MIFARE operations
             System_ReportTaskStatus(SYSTEM_TASK_ID_DISPENSER, true);
             
-            // Simple fast write - no transaction overhead for periodic updates
-            MIFARE_Result_t result = MIFARE_UpdateCardData(true);  // Fast write (primary only, ~320ms)
+            // Perform write (Fast or Full based on interval)
+            MIFARE_Result_t result = MIFARE_UpdateCardData(is_fast_write);
             
             if (result == MIFARE_RESULT_OK) {
 #if LOG_DEBUG_DISPENSER_EN
                 MIFARE_UserData_t *written_user_data = MIFARE_GetUserData();
-                DISPENSER_DEBUG("Card write: deducted %lu ml total, remaining: %lu ml", 
+                DISPENSER_DEBUG("Card write (%s): deducted %lu ml total, remaining: %lu ml", 
+                             is_fast_write ? "fast" : "FULL",
                              g_pending_deduction_ml, written_user_data ? written_user_data->balance : 0);
 #endif
                 g_pending_deduction_ml = 0;
                 g_last_card_write_time = current_time;
                 g_consecutive_write_failures = 0;  // Reset on success
+                
+                if (!is_fast_write) {
+                    g_last_backup_write_time = current_time; // Update backup timer only on full write
+                }
             } else {
                 g_consecutive_write_failures++;
-                DISPENSER_ERROR("Write failure #%lu: %s", g_consecutive_write_failures, 
+                DISPENSER_ERROR("Write failure (%s) #%lu: %s", 
+                             is_fast_write ? "fast" : "FULL",
+                             g_consecutive_write_failures, 
                              MIFARE_GetResultString(result));
             }
             

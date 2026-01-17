@@ -616,6 +616,7 @@ static bool parse_ui_state_param(const char* key, const char* value, UI_State_t 
         cfg->ring_opacity_inactive = (uint8_t)atoi(value);
         (*params_found)++;
         return true;
+    #if !defined(BUILD_TYPE_WATER_DISPENSER)
     } else if (strcmp(key, "ring_color_vacuum_active") == 0) {
         cfg->ring_color_vacuum_active = (uint32_t)strtoul(value, NULL, 16);
         (*params_found)++;
@@ -640,6 +641,7 @@ static bool parse_ui_state_param(const char* key, const char* value, UI_State_t 
         cfg->ring_color_pressure_inactive = (uint32_t)strtoul(value, NULL, 16);
         (*params_found)++;
         return true;
+    #endif
     }
     
     return false;
@@ -1096,6 +1098,8 @@ static Config_Result_t config_write_file(FIL *file)
         f_puts(buf, file);
         snprintf(buf, sizeof(buf), "ui.%s.ring_opacity_inactive=%u\r\n", state_name, cfg->ring_opacity_inactive);
         f_puts(buf, file);
+        
+        #if !defined(BUILD_TYPE_WATER_DISPENSER)
         snprintf(buf, sizeof(buf), "ui.%s.ring_color_vacuum_active=%06lX\r\n", state_name, cfg->ring_color_vacuum_active);
         f_puts(buf, file);
         snprintf(buf, sizeof(buf), "ui.%s.ring_color_vacuum_inactive=%06lX\r\n", state_name, cfg->ring_color_vacuum_inactive);
@@ -1108,6 +1112,9 @@ static Config_Result_t config_write_file(FIL *file)
         f_puts(buf, file);
         snprintf(buf, sizeof(buf), "ui.%s.ring_color_pressure_inactive=%06lX\r\n\r\n", state_name, cfg->ring_color_pressure_inactive);
         f_puts(buf, file);
+        #else
+        f_puts("\r\n", file);
+        #endif
     }
     
     /* System settings */
@@ -1567,12 +1574,15 @@ void Config_PrintToUSB(void)
         USB_Log_Printf("  ui.%s.image_brightness_inactive=%u\r\n", state_name, state_cfg->image_brightness_inactive);
         USB_Log_Printf("  ui.%s.ring_opacity_active=%u\r\n", state_name, state_cfg->ring_opacity_active);
         USB_Log_Printf("  ui.%s.ring_opacity_inactive=%u\r\n", state_name, state_cfg->ring_opacity_inactive);
+        
+        #if !defined(BUILD_TYPE_WATER_DISPENSER)
         USB_Log_Printf("  ui.%s.ring_color_vacuum_active=%06lX\r\n", state_name, state_cfg->ring_color_vacuum_active);
         USB_Log_Printf("  ui.%s.ring_color_vacuum_inactive=%06lX\r\n", state_name, state_cfg->ring_color_vacuum_inactive);
         USB_Log_Printf("  ui.%s.ring_color_brush_active=%06lX\r\n", state_name, state_cfg->ring_color_brush_active);
         USB_Log_Printf("  ui.%s.ring_color_brush_inactive=%06lX\r\n", state_name, state_cfg->ring_color_brush_inactive);
         USB_Log_Printf("  ui.%s.ring_color_pressure_active=%06lX\r\n", state_name, state_cfg->ring_color_pressure_active);
         USB_Log_Printf("  ui.%s.ring_color_pressure_inactive=%06lX\r\n", state_name, state_cfg->ring_color_pressure_inactive);
+        #endif
     }
     
     USB_Log_Printf("\r\n--- System Configuration ---\r\n");

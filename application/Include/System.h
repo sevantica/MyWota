@@ -295,6 +295,11 @@ const char* System_GetModuleName(System_Module_t module);
  */
 void System_PrintModuleStatus(void);
 
+/**
+ * @brief Debug: Print raw flash sector headers for WDT log
+ */
+void System_DebugFlashSector(void);
+
 /* WDT log functions are provided by System_Core.h:
  * - System_SaveWDTLogToFlash()
  * - System_LoadWDTLogFromFlash()

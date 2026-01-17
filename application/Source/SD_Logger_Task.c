@@ -738,6 +738,19 @@ bool SD_Logger_PrintCardLog(const uint8_t *card_uid, uint8_t uid_length)
     USB_Log_Printf("            CARD TRANSACTION LOG: %s\r\n", filename + 3);  // Skip "0:/"
     USB_Log_Printf("═══════════════════════════════════════════════════════════════\r\n");
     
+    /* Check file size */
+    FSIZE_t file_size = f_size(&file);
+    if (file_size > 8192) {
+        FSIZE_t seek_pos = file_size - 8192;
+        USB_Log_Printf("... (skipping first %lu bytes, showing last 8KB)\r\n", (unsigned long)seek_pos);
+        
+        f_lseek(&file, seek_pos);
+        
+        /* Discard the first line as it might be partial/incomplete after random seek */
+        char discard_buffer[256];
+        f_gets(discard_buffer, sizeof(discard_buffer), &file);
+    }
+
     // Read and print file contents line by line
     char line_buffer[256];
     uint32_t line_count = 0;

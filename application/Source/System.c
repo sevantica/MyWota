@@ -158,7 +158,7 @@ static bool s_watchdog_enabled = false;
 
 /* WDT Log Storage - persists across resets */
 static uint32_t s_boot_count = 0;  /* Incremented each boot, stored in flash */
-static bool s_wdt_log_saved = false;  /* Prevent multiple saves per boot */
+/* s_wdt_log_saved removed to allow continuous logging */
 
 /* Module Runtime Control State Tracking */
 static Module_State_t s_module_states[MODULE_COUNT] = {
@@ -779,6 +779,12 @@ void System_ReportTaskStatus(System_Task_ID_t task_id, bool is_running_ok)
             USB_Log_Printf("[WDT_DBG] USB_Command report failed - mutex timeout\r\n");
         }
     }
+
+    /* Write updated status to flash immediately
+     * NOTE: This is high overhead (flash write every report), but requested for debugging freezes.
+     * We use an append-log strategy in System_SaveWDTLogToFlash to minimize erase cycles.
+     */
+    System_SaveWDTLogToFlash();
 }
 
 /* ========================================================================== */
@@ -934,21 +940,59 @@ void System_PrintModuleStatus(void)
     USB_Log_Printf("\r\n");
 }
 
-/* WDT Log Flash Storage Functions ------------------------------------------- */
+/* Helper to align size to flash page size */
+#define WDT_LOG_SIZE_ALIGNED  (((sizeof(WDT_Log_t) + FLASH_PAGE_SIZE - 1) / FLASH_PAGE_SIZE) * FLASH_PAGE_SIZE)
 
 /**
- * @brief Simple CRC32 calculation for WDT log validation
+ * @brief Find the most recent valid log entry and the next empty slot
+ * @param latest_log Pointer to store the latest log (optional)
+ * @param next_slot_offset Pointer to store the offset for the next write (optional)
+ * @return true if a valid previous log was found
  */
-static uint32_t wdt_log_crc32(const uint8_t* data, size_t len)
+static bool wdt_log_scan_sector(WDT_Log_t* latest_log, uint32_t* next_slot_offset)
 {
-    uint32_t crc = 0xFFFFFFFF;
-    for (size_t i = 0; i < len; i++) {
-        crc ^= data[i];
-        for (uint8_t j = 0; j < 8; j++) {
-            crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
+    const uint32_t sector_start = WDT_LOG_FLASH_OFFSET;
+    uint32_t max_boot = 0;
+    uint32_t max_tick = 0;
+    bool found = false;
+    uint32_t slot_offset = 0;
+    uint32_t first_empty = 0xFFFFFFFF;
+    
+    // Determine the aligned size of one log entry
+    const uint32_t slot_size = WDT_LOG_SIZE_ALIGNED;
+    const uint32_t slots_per_sector = WDT_LOG_FLASH_SECTOR_SIZE / slot_size;
+    
+    for (uint32_t i = 0; i < slots_per_sector; i++) {
+        uint32_t current_offset = i * slot_size;
+        const WDT_Log_t* log_ptr = (const WDT_Log_t*)(XIP_BASE + sector_start + current_offset);
+        
+        if (log_ptr->magic == WDT_LOG_MAGIC_NUMBER && log_ptr->version == WDT_LOG_VERSION) {
+            // Check CRC
+            uint32_t calc_crc = wdt_log_crc32((const uint8_t*)log_ptr, sizeof(WDT_Log_t) - sizeof(uint32_t));
+            if (calc_crc == log_ptr->crc32) {
+                // Valid log - check if it's newer
+                // Use boot count primarily, then timestamp
+                if (!found || log_ptr->boot_count > max_boot || 
+                   (log_ptr->boot_count == max_boot && log_ptr->timestamp_tick >= max_tick)) {
+                    max_boot = log_ptr->boot_count;
+                    max_tick = log_ptr->timestamp_tick;
+                    found = true;
+                    if (latest_log) {
+                        memcpy(latest_log, log_ptr, sizeof(WDT_Log_t));
+                    }
+                }
+            }
+        } else if (log_ptr->magic == 0xFFFFFFFF && first_empty == 0xFFFFFFFF) {
+            // Found erased slot
+            first_empty = current_offset;
         }
     }
-    return ~crc;
+    
+    if (next_slot_offset) {
+        *next_slot_offset = first_empty;
+    }
+    
+    return found;
 }
 
 /**
@@ -957,38 +1001,22 @@ static uint32_t wdt_log_crc32(const uint8_t* data, size_t len)
  */
 static void wdt_log_init_boot_count(void)
 {
-    const WDT_Log_t* flash_log = (const WDT_Log_t*)(XIP_BASE + WDT_LOG_FLASH_OFFSET);
-    
-    /* Check if valid log exists */
-    if (flash_log->magic == WDT_LOG_MAGIC_NUMBER && 
-        flash_log->version == WDT_LOG_VERSION) {
-        
-        /* Verify CRC (exclude CRC field itself) */
-        uint32_t calc_crc = wdt_log_crc32((const uint8_t*)flash_log, 
-                                          sizeof(WDT_Log_t) - sizeof(uint32_t));
-        if (calc_crc == flash_log->crc32) {
-            s_boot_count = flash_log->boot_count + 1;
-            LOG_DEBUG_SYSTEM("[WDT_LOG] Previous log found, boot count: %lu\r\n", s_boot_count);
-            return;
-        }
+    WDT_Log_t latest_log;
+    if (wdt_log_scan_sector(&latest_log, NULL)) {
+        s_boot_count = latest_log.boot_count + 1;
+        LOG_DEBUG_SYSTEM("[WDT_LOG] Previous log found, boot count: %lu\r\n", s_boot_count);
+    } else {
+        s_boot_count = 1;
+        LOG_DEBUG_SYSTEM("[WDT_LOG] No previous log found, boot count: 1\r\n");
     }
-    
-    /* No valid log - start at 1 */
-    s_boot_count = 1;
-    LOG_DEBUG_SYSTEM("[WDT_LOG] No previous log found, boot count: 1\r\n");
 }
 
 /**
- * @brief Save WDT task status to flash before watchdog reset
+ * @brief Save WDT task status to flash
+ * @note Called on every task report (high frequency!)
  */
 void System_SaveWDTLogToFlash(void)
 {
-    /* Prevent multiple saves per boot */
-    if (s_wdt_log_saved) {
-        return;
-    }
-    s_wdt_log_saved = true;
-    
     /* Build the WDT log structure */
     static WDT_Log_t wdt_log;  /* Static to avoid stack overflow */
     memset(&wdt_log, 0, sizeof(WDT_Log_t));
@@ -999,7 +1027,7 @@ void System_SaveWDTLogToFlash(void)
     wdt_log.boot_count = s_boot_count;
     wdt_log.task_count = (uint8_t)TASK_ID_COUNT;
     
-    /* Copy task status - no mutex, we're in critical state */
+    /* Copy task status - no mutex, we might be in critical state or normal run */
     TickType_t now = xTaskGetTickCount();
     for (uint8_t i = 0; i < TASK_ID_COUNT && i < WDT_LOG_MAX_TASKS; i++) {
         strncpy(wdt_log.tasks[i].name, s_task_wdt_status[i].name, WDT_LOG_TASK_NAME_LEN - 1);
@@ -1012,8 +1040,19 @@ void System_SaveWDTLogToFlash(void)
     /* Calculate CRC (exclude CRC field itself) */
     wdt_log.crc32 = wdt_log_crc32((const uint8_t*)&wdt_log, sizeof(WDT_Log_t) - sizeof(uint32_t));
     
-    /* Calculate write size - must be multiple of FLASH_PAGE_SIZE (256 bytes) */
-    size_t write_size = ((sizeof(WDT_Log_t) + FLASH_PAGE_SIZE - 1) / FLASH_PAGE_SIZE) * FLASH_PAGE_SIZE;
+    /* Determine write position */
+    uint32_t write_offset = 0xFFFFFFFF;
+    wdt_log_scan_sector(NULL, &write_offset);
+    
+    bool needs_erase = false;
+    if (write_offset == 0xFFFFFFFF) {
+        // Sector is full, must erase
+        write_offset = 0;
+        needs_erase = true;
+    }
+    
+    /* Calculate size aligned to page */
+    size_t write_size = WDT_LOG_SIZE_ALIGNED;
     
     /* Feed watchdog before flash operations */
     watchdog_update();
@@ -1021,22 +1060,42 @@ void System_SaveWDTLogToFlash(void)
     /* Disable interrupts for flash write */
     uint32_t interrupts = save_and_disable_interrupts();
     
-    /* Erase the sector first */
-    flash_range_erase(WDT_LOG_FLASH_OFFSET, WDT_LOG_FLASH_SECTOR_SIZE);
-    
-    /* Brief interrupt enable for watchdog */
-    restore_interrupts(interrupts);
-    watchdog_update();
-    interrupts = save_and_disable_interrupts();
+    if (needs_erase) {
+        flash_range_erase(WDT_LOG_FLASH_OFFSET, WDT_LOG_FLASH_SECTOR_SIZE);
+    }
     
     /* Write the log */
-    flash_range_program(WDT_LOG_FLASH_OFFSET, (const uint8_t*)&wdt_log, write_size);
+    flash_range_program(WDT_LOG_FLASH_OFFSET + write_offset, (const uint8_t*)&wdt_log, write_size);
     
     /* Restore interrupts */
     restore_interrupts(interrupts);
     
-    LOG_CRITICAL_SYSTEM("[WDT_LOG] Saved WDT log to flash (boot %lu, CRC: 0x%08lX)\r\n", 
-                        s_boot_count, wdt_log.crc32);
+    // Optional: Log primarily when meaningful changes occur, but user asked for "for each task"
+    // so we write silently to avoid recursion/spam if logging uses interrupts/USB.
+}
+
+/**
+ * @brief Debug: Print raw flash sector headers (first 5 and last 5)
+ */
+void System_DebugFlashSector(void)
+{
+    const uint32_t sector_start = WDT_LOG_FLASH_OFFSET;
+    const uint32_t aligned_size = (((sizeof(WDT_Log_t) + FLASH_PAGE_SIZE - 1) / FLASH_PAGE_SIZE) * FLASH_PAGE_SIZE);
+    const uint32_t slots = WDT_LOG_FLASH_SECTOR_SIZE / aligned_size;
+    
+    USB_Log_Printf("[WDT_RAW] Sector Start: 0x%08lX, Slot Size: %lu, Total Slots: %lu\r\n", 
+                   sector_start, aligned_size, slots);
+    
+    for (uint32_t i = 0; i < slots; i++) {
+        /* Only print first few and last few to save time */
+        if (i > 4 && i < (slots - 5)) continue;
+        if (i == 5) { USB_Log_Printf("...\r\n"); continue; }
+        
+        const WDT_Log_t* log = (const WDT_Log_t*)(XIP_BASE + sector_start + (i * aligned_size));
+        USB_Log_Printf("[%02lu] @0x%04lX | Magic:%08lX | Ver:%lu | Boot:%lu | Tick:%lu | CRC:%08lX\r\n",
+                       i, (i * aligned_size),
+                       log->magic, log->version, log->boot_count, log->timestamp_tick, log->crc32);
+    }
 }
 
 /**
@@ -1050,28 +1109,7 @@ bool System_LoadWDTLogFromFlash(WDT_Log_t* log)
         return false;
     }
     
-    const WDT_Log_t* flash_log = (const WDT_Log_t*)(XIP_BASE + WDT_LOG_FLASH_OFFSET);
-    
-    /* Check magic number */
-    if (flash_log->magic != WDT_LOG_MAGIC_NUMBER) {
-        return false;
-    }
-    
-    /* Check version */
-    if (flash_log->version != WDT_LOG_VERSION) {
-        return false;
-    }
-    
-    /* Verify CRC */
-    uint32_t calc_crc = wdt_log_crc32((const uint8_t*)flash_log, 
-                                      sizeof(WDT_Log_t) - sizeof(uint32_t));
-    if (calc_crc != flash_log->crc32) {
-        return false;
-    }
-    
-    /* Copy to output */
-    memcpy(log, flash_log, sizeof(WDT_Log_t));
-    return true;
+    return wdt_log_scan_sector(log, NULL);
 }
 
 /**

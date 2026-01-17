@@ -214,7 +214,7 @@ RTC_Status_t RTC_SaveToSD(void)
     }
     
     // Open/create RTC file
-    FIL file;
+    static FIL file;
     FRESULT result = f_open(&file, RTC_FILE_PATH, FA_CREATE_ALWAYS | FA_WRITE);
     if (result != FR_OK) {
         LOG_ERROR_RTC("[RTC] ✗ Failed to open RTC file for write: %d\r\n", result);
@@ -243,7 +243,7 @@ RTC_Status_t RTC_LoadFromSD(void)
     }
     
     // Open RTC file
-    FIL file;
+    static FIL file;
     FRESULT result = f_open(&file, RTC_FILE_PATH, FA_READ);
     if (result != FR_OK) {
         LOG_DEBUG_RTC("[RTC] No saved time found on SD card\r\n");
