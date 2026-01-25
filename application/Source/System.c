@@ -114,6 +114,8 @@ typedef struct {
 
 /* Private variables ----------------------------------------------------------*/
 static TaskHandle_t system_task_handle;
+static StaticTask_t system_task_tcb;
+static StackType_t system_task_stack[SYSTEM_TASK_STACK_WORDS];
 
 /* Static semaphores - accessed via getter functions */
 static SemaphoreHandle_t gpio_semaphore;
@@ -154,6 +156,7 @@ static Task_WDT_Status_t s_task_wdt_status[TASK_ID_COUNT] = {
     {"RS485",         TASK_STATUS_UNKNOWN, 0}
 };
 static SemaphoreHandle_t s_wdt_status_mutex = NULL;
+static StaticSemaphore_t s_wdt_status_mutex_buffer;
 static bool s_watchdog_enabled = false;
 
 /* WDT Log Storage - persists across resets */
@@ -197,6 +200,10 @@ static void system_init(void);
 static void system_init(void)
 {
     LOG_CRITICAL_SYSTEM("\r\n=== System Initialization ===\r\n");
+
+    /* Initialize defaults immediately to ensure valid state */
+    Config_InitDefaults();
+    LOG_CRITICAL_SYSTEM("[✓] Configuration defaults initialized\r\n");
     
     /* Initialize boot count from WDT log (before any other flash operations) */
     wdt_log_init_boot_count();
@@ -212,6 +219,9 @@ static void system_init(void)
     /* Register MyWota configuration schema */
     MyWota_Config_Adapter_Init();
     LOG_CRITICAL_SYSTEM("[✓] MyWota Config Adapter initialized\r\n");
+
+    /* Initialize defaults immediately to ensure valid state during boot */
+    Config_InitDefaults();
 
     /* Hardware Layer */
     Init_Hardware_Layer();
@@ -430,7 +440,7 @@ static void system_init(void)
     }
     
     /* Initialize Watchdog Status Tracking */
-    s_wdt_status_mutex = xSemaphoreCreateMutex();
+    s_wdt_status_mutex = xSemaphoreCreateMutexStatic(&s_wdt_status_mutex_buffer);
     if (s_wdt_status_mutex == NULL) {
         LOG_CRITICAL_SYSTEM("[✗] Failed to create WDT status mutex\r\n");
     } else {
@@ -667,7 +677,7 @@ static void System_Task(void* argument)
 
 void Task_Start_System_Task(void)
 {
-    xTaskCreate(System_Task, "System_Task", SYSTEM_TASK_STACK_WORDS, NULL, SYSTEM_TASK_PRIORITY, &system_task_handle);
+    system_task_handle = xTaskCreateStatic(System_Task, "System_Task", SYSTEM_TASK_STACK_WORDS, NULL, SYSTEM_TASK_PRIORITY, system_task_stack, &system_task_tcb);
 }
 
 TaskHandle_t task_get_handle_System_Task(void)

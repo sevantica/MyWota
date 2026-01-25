@@ -73,12 +73,18 @@
 
 /* Memory allocation related definitions. */
 #ifndef configSUPPORT_STATIC_ALLOCATION
-#define configSUPPORT_STATIC_ALLOCATION         0
+#define configSUPPORT_STATIC_ALLOCATION         1
 #endif
 #ifndef configSUPPORT_DYNAMIC_ALLOCATION
-#define configSUPPORT_DYNAMIC_ALLOCATION        1
+/* DISABLED: All memory is statically allocated:
+ * - FreeRTOS objects: xTaskCreateStatic, xSemaphoreCreateMutexStatic, etc.
+ * - LVGL: Built-in TLSF allocator with static pool
+ * - FatFS LFN: Stack-allocated working buffer (FF_USE_LFN=2)
+ * - No heap_X.c compiled (FREERTOS_HEAP not set in CMakeLists.txt) */
+#define configSUPPORT_DYNAMIC_ALLOCATION        0
 #endif
-#define configTOTAL_HEAP_SIZE                   (128*1024)
+/* No heap - pure static allocation */
+#define configTOTAL_HEAP_SIZE                   (0)
 #define configAPPLICATION_ALLOCATED_HEAP        0
 
 /* Hook function related definitions. */

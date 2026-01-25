@@ -34,11 +34,13 @@ message(STATUS "Build type is ${CMAKE_BUILD_TYPE}")
 add_compile_definitions(BUILD_TYPE_WATER_DISPENSER)
 
 # Initialize the Pico SDK
+set(PICO_NO_PICOTOOL 1)
 pico_sdk_init()
 
 # Set up FreeRTOS configuration (must be done BEFORE adding drivers library)
 set(FREERTOS_PORT "GCC_RP2040" CACHE STRING "" FORCE)
-set(FREERTOS_HEAP "4" CACHE STRING "" FORCE)
+# FREERTOS_HEAP disabled - using fully static allocation (no heap needed)
+# set(FREERTOS_HEAP "4" CACHE STRING "" FORCE)
 
 # Create freertos_config target BEFORE adding drivers (required by FreeRTOS)
 add_library(freertos_config INTERFACE)
@@ -139,15 +141,17 @@ set(MAIN_SOURCES
 
 # Application source files (explicit list - no GLOB)
 set(APP_SOURCES
+    ../application/Source/FreeRTOS_Static.c
     ../application/Source/MyWota_Module.c
     ../application/Source/MyWota_ui_driver.c
     ../application/Source/Dispenser_Controller.c
     ../application/Source/Firmware_Version.c
     ../application/Source/Hardware_Access.c
-    ../application/Source/IO_Expander_Control.c
+    # IO_Expander_Control.c removed - replaced by IO_Expander_Service in sevantica_drivers
     ../application/Source/MyWota_Config_Adapter.c
     ../application/Source/MyWota_Hardware_Adapter.c
     ../application/Source/MyWota_IO_Expander_Adapter.c
+    ../application/Source/Feedback_Task.c
     ../application/Source/MIFARE_Volume_Adapter.c
     ../application/Source/RS485_Task.c
     ../application/Source/RTC_Manager.c

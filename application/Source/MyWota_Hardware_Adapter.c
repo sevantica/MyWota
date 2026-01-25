@@ -70,7 +70,7 @@
 
 static const HW_Pin_Map_t mywota_pin_map = {
     /* SPI0 - Shared by LCD and SD Card */
-    .spi0 = {
+    .spi_bus0 = {
         .spi_instance = 0,
         .sck_pin = GPIO_18,
         .mosi_pin = GPIO_19,
@@ -79,24 +79,24 @@ static const HW_Pin_Map_t mywota_pin_map = {
     },
     
     /* SPI1 - Not used */
-    .spi1 = {
+    .spi_bus1 = {
         .spi_instance = 1,
-        .sck_pin = 0xFF,        /* Not used */
+        .sck_pin = 0xFF,
         .mosi_pin = 0xFF,
         .miso_pin = 0xFF,
         .default_baudrate = 0
     },
     
     /* I2C0 - NFC/RFID and IO Expander */
-    .i2c0 = {
+    .i2c_bus0 = {
         .i2c_instance = 0,
         .sda_pin = GPIO_20,
         .scl_pin = GPIO_21,
         .default_baudrate = I2C0_DEFAULT_BAUDRATE
     },
     
-    /* I2C1 - Secondary (expansion) */
-    .i2c1 = {
+    /* I2C1 - Secondary */
+    .i2c_bus1 = {
         .i2c_instance = 1,
         .sda_pin = GPIO_26,
         .scl_pin = GPIO_27,
@@ -104,15 +104,15 @@ static const HW_Pin_Map_t mywota_pin_map = {
     },
     
     /* UART0 - RS485 Communication */
-    .uart0 = {
+    .uart_bus0 = {
         .uart_instance = 0,
         .tx_pin = GPIO_0,
         .rx_pin = GPIO_1,
         .default_baudrate = UART0_DEFAULT_BAUDRATE
     },
     
-    /* UART1 - Debug (optional) */
-    .uart1 = {
+    /* UART1 - Debug */
+    .uart_bus1 = {
         .uart_instance = 1,
         .tx_pin = GPIO_4,
         .rx_pin = GPIO_5,

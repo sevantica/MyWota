@@ -58,8 +58,15 @@
 
 /* Private typedefs ----------------------------------------------------------*/
 static TaskHandle_t sd_logger_task_handle = NULL;
+static StaticTask_t sd_logger_task_tcb;
+static StackType_t sd_logger_task_stack[SD_LOGGER_TASK_STACK_WORDS];
+
 static SemaphoreHandle_t sd_file_mutex = NULL;  // Mutex for SD file operations
+static StaticSemaphore_t sd_file_mutex_buffer;
+
 static QueueHandle_t sd_log_queue = NULL;       // Queue for async log messages
+static StaticQueue_t sd_log_queue_buffer;
+static uint8_t sd_log_queue_storage[SD_LOG_QUEUE_LENGTH * sizeof(SDLogQueueMsg_t)];
 
 /* State Machine Context */
 typedef struct {
@@ -107,16 +114,18 @@ static void SD_Logger_Task(void* argument)
     TickType_t xLastWakeTime = xTaskGetTickCount();
     
     // Create mutex for SD file operations (if not already created)
+    // Create mutex for SD file operations (if not already created)
     if (sd_file_mutex == NULL) {
-        sd_file_mutex = xSemaphoreCreateMutex();
+        sd_file_mutex = xSemaphoreCreateMutexStatic(&sd_file_mutex_buffer);
         if (sd_file_mutex == NULL) {
             LOG_ERROR_SD_LOGGER("[SD_LOGGER] Failed to create file mutex!\r\n");
         }
     }
     
     // Create queue for async log messages
+    // Create queue for async log messages
     if (sd_log_queue == NULL) {
-        sd_log_queue = xQueueCreate(SD_LOG_QUEUE_LENGTH, sizeof(SDLogQueueMsg_t));
+        sd_log_queue = xQueueCreateStatic(SD_LOG_QUEUE_LENGTH, sizeof(SDLogQueueMsg_t), sd_log_queue_storage, &sd_log_queue_buffer);
         if (sd_log_queue == NULL) {
             LOG_ERROR_SD_LOGGER("[SD_LOGGER] Failed to create log queue!\r\n");
         }
@@ -255,15 +264,15 @@ static void state_mount_fs(void)
         
         // Get filesystem info
         FATFS *fs;
-        DWORD fre_clust, fre_sect, tot_sect;
+        DWORD fre_clust; /* fre_sect, tot_sect; */
         
         result = f_getfree("0:", &fre_clust, &fs);
         if (result == FR_OK) {
-            tot_sect = (fs->n_fatent - 2) * fs->csize;
-            fre_sect = fre_clust * fs->csize;
+            /* tot_sect = (fs->n_fatent - 2) * fs->csize; */
+            /* fre_sect = fre_clust * fs->csize; */
             
-            LOG_DEBUG_SD_LOGGER("[SD_LOGGER] Total: %lu KB, Free: %lu KB\r\n",
-                           tot_sect / 2, fre_sect / 2);
+            LOG_DEBUG_SD_LOGGER("[SD_LOGGER] Free: %lu KB\r\n",
+                           (DWORD)(fre_clust * fs->csize) / 2);
         }
         
         // Load system configuration from SD card
@@ -455,12 +464,13 @@ static FRESULT log_startup_event(void)
  */
 void Task_Start_SD_Logger_Task(void)
 {
-    xTaskCreate(SD_Logger_Task, 
+    sd_logger_task_handle = xTaskCreateStatic(SD_Logger_Task, 
                 "SD_Logger", 
                 SD_LOGGER_TASK_STACK_WORDS, 
                 NULL, 
                 SD_LOGGER_TASK_PRIORITY, 
-                &sd_logger_task_handle);
+                sd_logger_task_stack,
+                &sd_logger_task_tcb);
 }
 
 /**

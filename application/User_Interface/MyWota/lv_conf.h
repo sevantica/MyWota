@@ -39,9 +39,10 @@
  * - LV_STDLIB_MICROPYTHON: MicroPython implementation
  * - LV_STDLIB_RTTHREAD:    RT-Thread implementation
  * - LV_STDLIB_CUSTOM:      Implement the functions externally
- * CHANGED: Use system malloc (FreeRTOS heap_4) instead of LVGL's TLSF allocator
+ * CHANGED: Use LVGL's built-in TLSF allocator with static memory pool
+ * (FreeRTOS heap is disabled for pure static allocation)
  */
-#define LV_USE_STDLIB_MALLOC    LV_STDLIB_CLIB
+#define LV_USE_STDLIB_MALLOC    LV_STDLIB_BUILTIN
 #define LV_USE_STDLIB_STRING    LV_STDLIB_CLIB
 #define LV_USE_STDLIB_SPRINTF   LV_STDLIB_CLIB
 
@@ -54,7 +55,7 @@
 
 #if LV_USE_STDLIB_MALLOC == LV_STDLIB_BUILTIN
     /*Size of the memory available for `lv_malloc()` in bytes (>= 2kB)*/
-    #define LV_MEM_SIZE (12* 1024U)          /*[bytes]*/
+    #define LV_MEM_SIZE (24 * 1024U)          /*[bytes] - 24KB for UI rendering*/
 
     /*Size of the memory expand for `lv_malloc()` in bytes*/
     #define LV_MEM_POOL_EXPAND_SIZE 0

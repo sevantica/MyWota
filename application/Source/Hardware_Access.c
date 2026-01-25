@@ -136,14 +136,7 @@
 #define UART_1_TXD_PIN      UART_1_TX
 #define UART_1_RXD_PIN      UART_1_RX
 
-/* Application-Specific GPIO Pins */
-#define SYSTEM_COMM_LED_PIN 6//////////
-#define EXP_INTR_PIN        8///////////
-#define RS485_DATA_EN_PIN   9
-#define LIGHT_SENSOR_PIN    28
-#define FLOW_SENSOR_PIN     22
-#define VALVE_CONTROL_PIN   15
-#define PICO_LED_PIN        25///////////
+
 
 /* I/O Expander Module Pins */
 #define IO_EXPANDER_I2C_ADDRESS     0x27
@@ -166,10 +159,13 @@ static int spi_0_dma_tx_channel = -1;
 
 /* SPI mutex for thread-safe access */
 static SemaphoreHandle_t spi_0_mutex = NULL;
+static StaticSemaphore_t spi_0_mutex_buffer;
 
 /* I2C mutexes for thread-safe access */
 static SemaphoreHandle_t i2c_0_mutex = NULL;
+static StaticSemaphore_t i2c_0_mutex_buffer;
 static SemaphoreHandle_t i2c_1_mutex = NULL;
+static StaticSemaphore_t i2c_1_mutex_buffer;
 
 /**
  * @brief Initialize hardware abstraction layer resources
@@ -180,15 +176,15 @@ void Init_Hardware_Layer(void)
 {
     // Create SPI mutex for thread-safe bus access
     if (spi_0_mutex == NULL) {
-        spi_0_mutex = xSemaphoreCreateMutex();
+        spi_0_mutex = xSemaphoreCreateMutexStatic(&spi_0_mutex_buffer);
     }
     
     // Create I2C mutexes for thread-safe bus access
     if (i2c_0_mutex == NULL) {
-        i2c_0_mutex = xSemaphoreCreateMutex();
+        i2c_0_mutex = xSemaphoreCreateMutexStatic(&i2c_0_mutex_buffer);
     }
     if (i2c_1_mutex == NULL) {
-        i2c_1_mutex = xSemaphoreCreateMutex();
+        i2c_1_mutex = xSemaphoreCreateMutexStatic(&i2c_1_mutex_buffer);
     }
 }
 
@@ -198,8 +194,13 @@ void Init_Hardware_Layer(void)
  */
 void Init_SPI_0(uint32_t baudrate)
 {
+    /* Use a critical section to prevent multiple tasks from claiming DMA channels
+     * or initializing the peripheral simultaneously. */
+    uint32_t ints = save_and_disable_interrupts();
+    
     if (spi_0_initialized) {
-        return;  // Already initialized
+        restore_interrupts(ints);
+        return; 
     }
     
     spi_init(SPI_0, baudrate);
@@ -207,10 +208,13 @@ void Init_SPI_0(uint32_t baudrate)
     gpio_set_function(SPI_0_MOSI, GPIO_FUNC_SPI);
     gpio_set_function(SPI_0_MISO, GPIO_FUNC_SPI);
     
-    // Claim a DMA channel for SPI TX
+    // Claim a DMA channel for SPI TX (panics if none available)
     spi_0_dma_tx_channel = dma_claim_unused_channel(true);
     
-    // Configure DMA channel for SPI TX
+    spi_0_initialized = true;
+    restore_interrupts(ints);
+    
+    // Configure DMA channel for SPI TX (non-critical section part)
     dma_channel_config c = dma_channel_get_default_config(spi_0_dma_tx_channel);
     channel_config_set_transfer_data_size(&c, DMA_SIZE_8);
     channel_config_set_dreq(&c, spi_get_dreq(SPI_0, true));  // TX DREQ
@@ -384,6 +388,38 @@ void Init_I2C_0(uint32_t baudrate)
 void Init_I2C_1(uint32_t baudrate)
 {
     Init_I2C_Generic(I2C_1, I2C_1_SDA, I2C_1_SCL, &i2c_1_initialized, baudrate);
+}
+
+/**
+ * @brief Initialize UART0 peripheral and return handle
+ * @param baudrate UART baudrate
+ * @return Pointer to UART hardware instance
+ */
+void* Init_UART_0(uint32_t baudrate)
+{
+    uart_init(uart0, baudrate);
+    gpio_set_function(UART_0_TX, GPIO_FUNC_UART);
+    gpio_set_function(UART_0_RX, GPIO_FUNC_UART);
+    uart_set_hw_flow(uart0, false, false);
+    uart_set_format(uart0, 8, 1, UART_PARITY_NONE);
+    uart_set_fifo_enabled(uart0, true);
+    return (void*)uart0;
+}
+
+/**
+ * @brief Initialize UART1 peripheral and return handle
+ * @param baudrate UART baudrate
+ * @return Pointer to UART hardware instance
+ */
+void* Init_UART_1(uint32_t baudrate)
+{
+    uart_init(uart1, baudrate);
+    gpio_set_function(UART_1_TX, GPIO_FUNC_UART);
+    gpio_set_function(UART_1_RX, GPIO_FUNC_UART);
+    uart_set_hw_flow(uart1, false, false);
+    uart_set_format(uart1, 8, 1, UART_PARITY_NONE);
+    uart_set_fifo_enabled(uart1, true);
+    return (void*)uart1;
 }
 
 /**
@@ -583,7 +619,7 @@ void Hardware_GPIO_Set_State(uint32_t gpio, bool state)
  */
 void Hardware_LED_On(void)
 {
-    gpio_put(PICO_DEFAULT_LED_PIN, 1);
+    gpio_put(PICO_LED_PIN, 1);
 }
 
 /**
@@ -591,7 +627,7 @@ void Hardware_LED_On(void)
  */
 void Hardware_LED_Off(void)
 {
-    gpio_put(PICO_DEFAULT_LED_PIN, 0);
+    gpio_put(PICO_LED_PIN, 0);
 }
 
 /**
@@ -882,7 +918,8 @@ void init_io_expander_hw(void)
     Init_I2C_0(I2C_0_BAUDRATE);  // 400kHz for I/O expander
     
     // Initialize interrupt pin as input with pull-up
-    Init_GPIO_Input_PullUp(IO_EXPANDER_INT_PIN);
+    // DISABLED: Conflict with UART0 RX (RS485) on GPIO 1
+    // Init_GPIO_Input_PullUp(IO_EXPANDER_INT_PIN);
 }
 
 /**

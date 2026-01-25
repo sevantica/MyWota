@@ -32,7 +32,7 @@
 #define SYSTEM_TASK_STACK_WORDS     STACK_BYTES_TO_WORDS(SYSTEM_TASK_STACK_BYTES)
 
 /* SD Logger Task - File I/O with fatfs library (high memory usage) */
-#define SD_LOGGER_TASK_STACK_BYTES  (896u * 4)   /* 3584 bytes - increased: 68w free → need 25% margin */
+#define SD_LOGGER_TASK_STACK_BYTES  (1536u * 4)  /* 6144 bytes - increased for exFAT/LFN support */
 #define SD_LOGGER_TASK_STACK_WORDS  STACK_BYTES_TO_WORDS(SD_LOGGER_TASK_STACK_BYTES)
 
 /* USB CDC Task - USB communication and logging */
@@ -40,7 +40,8 @@
 #define USB_CDC_TASK_STACK_WORDS    STACK_BYTES_TO_WORDS(USB_CDC_TASK_STACK_BYTES)
 
 /* USB Command Handler Task - Parse and execute commands */
-#define USB_COMMAND_HANDLER_TASK_STACK_BYTES (224u * 4)  /* 896 bytes - increased: 66w free → need safer margin */
+/* Increased for WiFi Scan operations which require significant stack depth */
+#define USB_COMMAND_HANDLER_TASK_STACK_BYTES (1024u * 4)  /* 4096 bytes */
 #define USB_COMMAND_HANDLER_TASK_STACK_WORDS STACK_BYTES_TO_WORDS(USB_COMMAND_HANDLER_TASK_STACK_BYTES)
 
 /* LCD Display Task - LVGL rendering and UI updates */
@@ -70,6 +71,10 @@
 /* RS485 Task - RS485 communication and firmware update */
 #define RS485_TASK_STACK_BYTES      (768u * 4)   /* 3072 bytes - Increased for safety */
 #define RS485_TASK_STACK_WORDS      STACK_BYTES_TO_WORDS(RS485_TASK_STACK_BYTES)
+
+/* Network Task - WiFi and LwIP handling */
+#define NETWORK_TASK_STACK_BYTES    (3072u * 4)  /* 12288 bytes - Massive stack for safety */
+#define NETWORK_TASK_STACK_WORDS    STACK_BYTES_TO_WORDS(NETWORK_TASK_STACK_BYTES)
 
 /* ============================================================================
  * Task Priorities
@@ -123,6 +128,9 @@
 #define RTC_TASK_PRIORITY               (tskIDLE_PRIORITY + 1)
 
 /* RS485 Task - Normal priority (communication is time-sensitive) */
-#define RS485_TASK_PRIORITY             (tskIDLE_PRIORITY + 1)
+#define RS485_TASK_PRIORITY             (tskIDLE_PRIORITY + 2)
+
+/* Network Task - Higher priority for network responsiveness */
+#define NETWORK_TASK_PRIORITY           (tskIDLE_PRIORITY + 2)
 
 #endif /* TASK_STACK_CONFIG_H */

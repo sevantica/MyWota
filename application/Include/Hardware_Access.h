@@ -45,6 +45,15 @@
 
 /* Hardware Pin Definitions for Driver Access */
 #define PCD_RST_PIN                    14  // GPIO 14 - NFC/RFID Reset Pin
+#define RS485_DATA_EN_PIN              9   // GPIO 9  - RS485 Data Enable
+
+/* Application-Specific GPIO Pins */
+#define SYSTEM_COMM_LED_PIN            6
+#define EXP_INTR_PIN                   8
+#define LIGHT_SENSOR_PIN               28
+#define FLOW_SENSOR_PIN                22
+#define VALVE_CONTROL_PIN              15
+#define PICO_LED_PIN                   25
 
 /* ===================================================================== */
 /* END PIN DEFINITIONS                                                   */
@@ -124,7 +133,8 @@ void Init_Hardware_Layer(void);
 void Init_SPI_0(uint32_t baudrate);
 void Init_I2C_0(uint32_t baudrate);
 void Init_I2C_1(uint32_t baudrate);
-void Init_UART_0(uint32_t baudrate);
+void* Init_UART_0(uint32_t baudrate);
+void* Init_UART_1(uint32_t baudrate);
 
 /* GPIO Initialization Functions */
 void Init_GPIO_Output(uint32_t gpio);

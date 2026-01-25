@@ -106,9 +106,9 @@ void Config_InitDefaults(void)
     /* System defaults */
     g_system_config.system.test_mode_enabled = false;
     g_system_config.system.log_level = 3;  /* Debug level */
-    strncpy(g_system_config.system.device_id, "BIGYELLOW-001", sizeof(g_system_config.system.device_id) - 1);
+    strncpy(g_system_config.system.device_id, "MyWota-001", sizeof(g_system_config.system.device_id) - 1);
     g_system_config.system.device_id[sizeof(g_system_config.system.device_id) - 1] = '\0';
-    strncpy(g_system_config.system.site_id, "SITE-001", sizeof(g_system_config.system.site_id) - 1);
+    strncpy(g_system_config.system.site_id, "MyWota-Site-001", sizeof(g_system_config.system.site_id) - 1);
     g_system_config.system.site_id[sizeof(g_system_config.system.site_id) - 1] = '\0';
     
     /* Module enable defaults */
@@ -141,7 +141,7 @@ void Config_InitDefaults(void)
     strncpy(g_system_config.mifare.card_init_phone_number, "07970242024", sizeof(g_system_config.mifare.card_init_phone_number) - 1);
     g_system_config.mifare.card_init_phone_number[sizeof(g_system_config.mifare.card_init_phone_number) - 1] = '\0';
     g_system_config.mifare.card_init_validity = 2;  /* CARD_VALIDITY_NORMAL */
-    strncpy(g_system_config.mifare.no_card_user_id, "BigYellow", sizeof(g_system_config.mifare.no_card_user_id) - 1);
+    strncpy(g_system_config.mifare.no_card_user_id, "CCH", sizeof(g_system_config.mifare.no_card_user_id) - 1);
     g_system_config.mifare.no_card_user_id[sizeof(g_system_config.mifare.no_card_user_id) - 1] = '\0';
     
     /* MIFARE Security defaults (nested inside mifare struct) */
@@ -182,7 +182,7 @@ void Config_InitDefaults(void)
     
     strncpy(g_system_config.ui.init_customer_id, "Welcome", sizeof(g_system_config.ui.init_customer_id) - 1);
     g_system_config.ui.init_customer_id[sizeof(g_system_config.ui.init_customer_id) - 1] = '\0';
-    strncpy(g_system_config.ui.no_card_customer_id, "Big Yellow", sizeof(g_system_config.ui.no_card_customer_id) - 1);
+    strncpy(g_system_config.ui.no_card_customer_id, "CCH", sizeof(g_system_config.ui.no_card_customer_id) - 1);
     g_system_config.ui.no_card_customer_id[sizeof(g_system_config.ui.no_card_customer_id) - 1] = '\0';
     
     /* Background color defaults (from SquareLine design) */
@@ -280,6 +280,7 @@ void Config_InitDefaults(void)
     g_system_config.buzzer.removal_pattern_off_ms = 50;
     g_system_config.buzzer.removal_pattern_count = 5;       /* 5 fast beeps */
     g_system_config.buzzer.removal_pattern_repeat_ms = 1000; /* Repeat every 1s */
+    g_system_config.buzzer.pin = 11;                        /* IO Expander Pin 11 (Default) */
     
     /* SD Logger defaults */
     g_system_config.sd_logger.init_retry_delay_ms = 5000;
@@ -1014,7 +1015,7 @@ static Config_Result_t config_write_file(FIL *file)
     
     /* Write header */
     LOG_DEBUG_CONFIG("[CONFIG] Writing header...\r\n");
-    f_puts("# BigYellow System Configuration\r\n", file);
+    f_puts("# CCH System Configuration\r\n", file);
     f_puts("# Auto-generated - edit with care\r\n", file);
     snprintf(buf, sizeof(buf), "# Version: %d\r\n\r\n", CONFIG_VERSION);
     f_puts(buf, file);
@@ -1494,6 +1495,18 @@ static Config_Result_t config_load_with_upgrade(void)
     if (found_version < CONFIG_VERSION) {
         LOG_CRITICAL_CONFIG("[CONFIG] Upgrading config from v%d to v%d\r\n", 
                            found_version, CONFIG_VERSION);
+                           
+        /* V9 Upgrade: Force Water Dispenser defaults over old values */
+        #if defined(BUILD_TYPE_WATER_DISPENSER)
+        if (found_version < 9) {
+            LOG_CRITICAL_CONFIG("[CONFIG] V9 Upgrade: Enforcing Water Dispenser Defaults\r\n");
+            g_system_config.mifare.card_init_default_balance = 60000;
+            g_system_config.dispenser_logic.loyalty_threshold = 50000;
+            g_system_config.dispenser_logic.loyalty_reward = 1000;
+            g_system_config.dispenser_logic.wash_duration_seconds = 1200;
+        }
+        #endif
+        
         config_params_missing = true;  /* Force write to update to new version */
     }
     

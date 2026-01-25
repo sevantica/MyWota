@@ -43,12 +43,6 @@ TaskHandle_t RS485_Task_GetHandle(void);
  */
 bool RS485_Task_IsReady(void);
 
-/**
- * @brief Send RS485 frame (for use by command adaptors)
- * @param frame Frame to send
- * @note Thread-safe, can be called from command handlers
- */
-void RS485_SendFrame(const RS485_Frame_t *frame);
 
 #ifdef __cplusplus
 }

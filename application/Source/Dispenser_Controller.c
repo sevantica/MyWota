@@ -25,7 +25,7 @@
 #include "Dispenser_Controller.h"
 #include "Application_Interface.h"
 #include "MIFARE_Transaction_Core.h"
-#include "IO_Expander_Control.h"
+#include "MyWota_IO_Expander_Adapter.h"
 #include "USB_Logging.h"
 #include "USB_Command_Handler.h"
 #include "System.h"
@@ -78,6 +78,8 @@
 static Dispenser_TimerState_t g_dispense_timer = {0};
 static DispenserState_t g_dispenser_state = DISPENSER_IDLE;
 static TaskHandle_t dispenser_task_handle = NULL;
+static StaticTask_t dispenser_task_tcb;
+static StackType_t dispenser_task_stack[DISPENSER_TASK_STACK_WORDS];
 
 /* Card write timing - write less frequently to avoid slow I/O */
 static uint32_t g_last_card_write_time = 0;
@@ -828,12 +830,15 @@ void Task_Start_Dispenser_Task(void)
         return;
     }
 
-    BaseType_t result = xTaskCreate(MIFARE_Dispenser_Task, 
+    dispenser_task_handle = xTaskCreateStatic(MIFARE_Dispenser_Task, 
                                     "Dispenser",  // Must match WDT tracking name in System.c
                                     DISPENSER_TASK_STACK_WORDS,
                                     NULL, 
                                     tskIDLE_PRIORITY + 1, 
-                                    &dispenser_task_handle);
+                                    dispenser_task_stack,
+                                    &dispenser_task_tcb);
+    
+    BaseType_t result = (dispenser_task_handle != NULL) ? pdPASS : pdFAIL;
     
     if (result != pdPASS) {
         DISPENSER_ERROR("[✗] Task creation FAILED (result=%d)", result);

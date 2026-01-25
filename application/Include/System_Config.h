@@ -14,6 +14,18 @@
 #define APPLICATION_INCLUDE_SYSTEM_CONFIG_H_
 
 /* #define BUILD_TYPE_CAR_WASH */
+#define BUILD_TYPE_WATER_DISPENSER
+
+/* Driver Feature Toggles (Read by sevantica_drivers CMake) */
+#define USE_DRIVERS_NFC           1
+#define USE_DRIVERS_RS485         1
+#define USE_DRIVERS_FATFS         1
+#define USE_DRIVERS_USB           1
+#define USE_DRIVERS_CRYPTO        1
+#define USE_DRIVERS_IO_EXPANDER   1
+#define USE_DRIVERS_CONNECTIVITY  0
+#define USE_DRIVERS_DISPLAY       1
+#define USE_DRIVERS_FEEDBACK      1
 
 /*Includes ----------------------------------------------------------*/
 #include <stdint.h>
@@ -25,8 +37,8 @@
 #define CONFIG_FILE_PATH_FORMAT     "0:/config_v%d.txt"
 #define CONFIG_MAX_VERSION_SEARCH   10      /* Search up to version 10 */
 #define CONFIG_SD_TIMEOUT_MS        3000    /* 3 second timeout for SD card */
-#define CONFIG_MAGIC_NUMBER         0x42594C57  /* "BYLW" - BigYellow config marker */
-#define CONFIG_VERSION              6       /* Current config version */
+#define CONFIG_MAGIC_NUMBER         0x42594C57  /* "BYLW" - CCH config marker */
+#define CONFIG_VERSION              9       /* Bump to 9 to force refresh of defaults in flash */
 
 /* Flash storage configuration - use last 4KB sector of 2MB flash */
 #define CONFIG_FLASH_SIZE           (2 * 1024 * 1024)           /* 2MB flash */
@@ -108,20 +120,16 @@ typedef struct {
 /**
  * @brief Car wash / loyalty configuration parameters
  * 
- * For BigYellow (car wash):
- *   - loyalty_threshold = washes to earn 1 free wash (e.g., 5)
- *   - loyalty_reward = 1 (1 free wash per threshold)
- * 
- * For MyWota (water dispenser):
- *   - loyalty_threshold = liters purchased to earn reward (e.g., 100)
- *   - loyalty_reward = free liters earned (e.g., 20)
+ * For CCH (Central Control Hub):
+ *   - loyalty_threshold = liters purchased to earn reward (e.g., 100) or washes
+ *   - loyalty_reward = free liters earned (e.g., 20) or free wash
  */
 typedef struct {
     uint32_t wash_duration_seconds;         /* Wash timer duration in seconds (default 1200 = 20 min) */
     uint32_t card_removal_delay_ms;         /* Delay after card removal before starting (default 1000) */
-    bool loyalty_enabled;                   /* Enable loyalty program (default true for BY, false for MY) */
-    uint32_t loyalty_threshold;             /* Threshold to earn reward: washes (BY) or ml (MY, e.g., 100000) */
-    uint32_t loyalty_reward;                /* Reward amount: 1 wash (BY) or ml (MY, e.g., 20000) */
+    bool loyalty_enabled;                   /* Enable loyalty program (default true for CCH) */
+    uint32_t loyalty_threshold;             /* Threshold to earn reward: washes or ml */
+    uint32_t loyalty_reward;                /* Reward amount: 1 wash or ml */
 } DispenserLogic_Config_t;
 
 /**
@@ -178,6 +186,10 @@ typedef struct {
     uint8_t log_level;                      /* Log verbosity (0=none, 1=error, 2=critical, 3=debug) */
     char device_id[16];                     /* Device serial number */
     char site_id[16];                       /* Site identifier */
+    /* Network configuration (for Pico W) */
+    char wifi_ssid[33];                     /* Last connected SSID (32 chars + null) */
+    char wifi_password[65];                 /* Last connected Password (64 chars + null) */
+    bool wifi_auto_connect;                 /* Auto connect on boot */
 } System_Config_t;
 
 /**

@@ -40,13 +40,10 @@ void print_memory_stats(void)
 int main()
 {
     // Initialize UART for early debug (USB requires FreeRTOS task)
-    stdio_uart_init();
+    // stdio_uart_init(); /* Commented out: May conflict with peripheral pins */
     
     // Initialize TinyUSB stack
     tusb_init();
-    
-    // Small delay to allow USB to start
-    sleep_ms(1000);
     
     // Initialize SD CS pin HIGH (inactive) to prevent SPI bus conflicts
     // SD card shares SPI0 with LCD, so keep SD CS high until SD is initialized
@@ -81,9 +78,9 @@ void vApplicationIdleHook( void )
     idle_count++;
     if (idle_count % 500000 == 0) {
         // Quick LED blink in idle to show system is running
-        gpio_put(PICO_DEFAULT_LED_PIN, 1);
+        Hardware_LED_On();
         busy_wait_us(50000);
-        gpio_put(PICO_DEFAULT_LED_PIN, 0);
+        Hardware_LED_Off();
     }
 }
 
@@ -143,10 +140,11 @@ void HardFault_Handler_C(HardFaultStackFrame_t *stack_frame)
     // watchdog_disable();
     
     // Light up the LED to indicate hard fault
-    const uint LED_PIN = PICO_DEFAULT_LED_PIN;
-    gpio_init(LED_PIN);
-    gpio_set_dir(LED_PIN, GPIO_OUT);
-    gpio_put(LED_PIN, 1);
+    // Note: Direct GPIO access during HardFault can be unsafe.
+    // const uint LED_PIN = PICO_DEFAULT_LED_PIN;
+    // gpio_init(LED_PIN);
+    // gpio_set_dir(LED_PIN, GPIO_OUT);
+    // gpio_put(LED_PIN, 1);
     
     // Print debug information if stdio is available
     printf("\n=== HARD FAULT DETECTED ===\n");
@@ -166,33 +164,14 @@ void HardFault_Handler_C(HardFaultStackFrame_t *stack_frame)
         printf("Stack High Water Mark: %lu words\n", uxTaskGetStackHighWaterMark(current_task));
     }
     
-    printf("Free Heap: %lu bytes\n", xPortGetFreeHeapSize());
-    printf("Min Free Heap: %lu bytes\n", xPortGetMinimumEverFreeHeapSize());
+    // Heap monitoring disabled - using pure static allocation
+    // printf("Free Heap: %lu bytes\n", xPortGetFreeHeapSize());
+    // printf("Min Free Heap: %lu bytes\n", xPortGetMinimumEverFreeHeapSize());
     printf("===========================\n");
     
     // Flash LED to indicate hard fault (SOS pattern)
+    // Disabled for stability during hard fault
     while (1) {
-        // SOS pattern: ... --- ...
-        for (int i = 0; i < 3; i++) {
-            gpio_put(LED_PIN, 1);
-            busy_wait_ms(200);
-            gpio_put(LED_PIN, 0);
-            busy_wait_ms(200);
-        }
-        busy_wait_ms(500);
-        for (int i = 0; i < 3; i++) {
-            gpio_put(LED_PIN, 1);
-            busy_wait_ms(600);
-            gpio_put(LED_PIN, 0);
-            busy_wait_ms(200);
-        }
-        busy_wait_ms(500);
-        for (int i = 0; i < 3; i++) {
-            gpio_put(LED_PIN, 1);
-            busy_wait_ms(200);
-            gpio_put(LED_PIN, 0);
-            busy_wait_ms(200);
-        }
         busy_wait_ms(2000);
     }
 }
@@ -202,9 +181,9 @@ void MemManage_Handler(void)
 {
     printf("Memory Management Fault!\n");
     while (1) {
-        gpio_put(PICO_DEFAULT_LED_PIN, 1);
+        Hardware_LED_On();
         sleep_ms(100);
-        gpio_put(PICO_DEFAULT_LED_PIN, 0);
+        Hardware_LED_Off();
         sleep_ms(100);
     }
 }
@@ -214,9 +193,9 @@ void BusFault_Handler(void)
 {
     printf("Bus Fault!\n");
     while (1) {
-        gpio_put(PICO_DEFAULT_LED_PIN, 1);
+        Hardware_LED_On();
         sleep_ms(50);
-        gpio_put(PICO_DEFAULT_LED_PIN, 0);
+        Hardware_LED_Off();
         sleep_ms(50);
     }
 }
@@ -226,9 +205,9 @@ void UsageFault_Handler(void)
 {
     printf("Usage Fault!\n");
     while (1) {
-        gpio_put(PICO_DEFAULT_LED_PIN, 1);
+        Hardware_LED_On();
         sleep_ms(25);
-        gpio_put(PICO_DEFAULT_LED_PIN, 0);
+        Hardware_LED_Off();
         sleep_ms(25);
     }
 }

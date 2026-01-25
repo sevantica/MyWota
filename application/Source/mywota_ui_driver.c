@@ -121,9 +121,12 @@ typedef struct {
 
 /* Synchronization */
 static SemaphoreHandle_t lvgl_mutex = NULL;
+static StaticSemaphore_t lvgl_mutex_buffer;
 
 /* Task Handle */
 static TaskHandle_t lcd_task_handle;
+static StaticTask_t lcd_task_tcb;
+static StackType_t lcd_task_stack[LCD_DISPLAY_TASK_STACK_WORDS];
 
 /* Performance Monitoring - removed unused frame_count variable */
 
@@ -234,7 +237,7 @@ static void lcd_display_task(void *argument)
     LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: GPIO initialized\r\n");
     
     /* Initialize synchronization primitives */
-    lvgl_mutex = xSemaphoreCreateMutex();
+    lvgl_mutex = xSemaphoreCreateMutexStatic(&lvgl_mutex_buffer);
     if (lvgl_mutex == NULL) {
         LOG_ERROR_LCD_DISPLAY_DRIVER("LCD: ERROR - Failed to create LVGL mutex\r\n");
         LOG_CRITICAL_LCD_DISPLAY_DRIVER("[✗] LCD Display Task initialization FAILED\r\n");
@@ -313,7 +316,7 @@ static void lcd_display_task(void *argument)
     init_ui_visibility_from_config();
     
     /* Keep backlight off initially - will fade in after full screen render */
-    lcd_backlight_on(0);
+    LCD_Driver_SetBacklight(0);
     
     /* Reset lines rendered counter before initial render */
     lcd_reset_lines_rendered();
@@ -339,10 +342,10 @@ static void lcd_display_task(void *argument)
     /* Now fade in backlight smoothly after UI is fully rendered to screen */
     LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: Fading in backlight...\r\n");
     for (uint8_t brightness = 0; brightness <= 100; brightness += 5) {
-        lcd_backlight_on(brightness);
+        LCD_Driver_SetBacklight(brightness);
         vTaskDelay(pdMS_TO_TICKS(30)); /* 30ms per step = 600ms total fade time */
     }
-    lcd_backlight_on(100); /* Ensure we end at exactly 100% */
+    LCD_Driver_SetBacklight(100); /* Ensure we end at exactly 100% */
     LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: Backlight at 100%%, initialization complete\r\n");
     
     LOG_CRITICAL_LCD_DISPLAY_DRIVER("[✓] LCD Display Task initialized successfully\r\n");
@@ -425,7 +428,7 @@ void Task_Start_LCD_Display_Driver_Task()
         LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: Task already running\r\n");
         return;
     }
-    (void)xTaskCreate(lcd_display_task, "LCD_Task", lcd_display_task_stack_size_words, NULL, LCD_DISPLAY_TASK_PRIORITY, &lcd_task_handle);
+    lcd_task_handle = xTaskCreateStatic(lcd_display_task, "LCD_Task", lcd_display_task_stack_size_words, NULL, LCD_DISPLAY_TASK_PRIORITY, lcd_task_stack, &lcd_task_tcb);
 }
 
 /**

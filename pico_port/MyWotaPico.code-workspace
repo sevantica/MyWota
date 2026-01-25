@@ -9,10 +9,10 @@
             "name": "application (Source Library)"
         },
         {
-            "path": "../../../../Big Yellow/BigYellow_FW/BigYellow"
+            "path": "../../../../Cross Project/VS Code Common/sevantica_drivers"
         },
         {
-            "path": "../../../../Cross Project/VS Code Common/sevantica_drivers"
+            "path": "../../../../Central Control Hub/Central Control Hub_FW/Central-Control-Hub/pico_port/.agent"
         }
     ],
     "settings": {

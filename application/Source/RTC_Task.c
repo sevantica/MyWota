@@ -48,6 +48,8 @@
 
 /* Private Variables ---------------------------------------------------------*/
 static TaskHandle_t rtc_task_handle = NULL;
+static StaticTask_t rtc_task_tcb;
+static StackType_t rtc_task_stack[RTC_TASK_STACK_WORDS];
 static uint32_t last_save_time = 0;
 
 /* Private Function Prototypes -----------------------------------------------*/
@@ -67,14 +69,17 @@ void Task_Start_RTC_Task(void)
         return;
     }
     
-    BaseType_t result = xTaskCreate(
+    rtc_task_handle = xTaskCreateStatic(
         RTC_Task,
         "RTC_Task",
         RTC_TASK_STACK_WORDS,
         NULL,
         RTC_TASK_PRIORITY,
-        &rtc_task_handle
+        rtc_task_stack,
+        &rtc_task_tcb
     );
+    
+    BaseType_t result = (rtc_task_handle != NULL) ? pdPASS : pdFAIL;
     
     if (result != pdPASS) {
         LOG_ERROR_RTC_TASK("[RTC_TASK] Failed to create task\r\n");
