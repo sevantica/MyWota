@@ -1,13 +1,16 @@
 #include <stdio.h>
 #include "FreeRTOS.h"
 #include "task.h"
-#include "../application/Include/Hardware_Access.h"
+#include "Hardware_Access.h"
 #include "USB_Logging.h"
-#include "../application/Include/System.h"
+#include "Module_Interface.h"
+#include "MyWota_System.h"
 #include "pico/stdlib.h"
 #include "hardware/gpio.h"
 #include "hardware/watchdog.h"
 #include "tusb.h"
+#include "MyWota_Hardware_Adapter.h"
+#include "RP2040_HAL.h"
 
 // Hard fault register structure
 typedef struct {
@@ -56,6 +59,9 @@ int main()
  
     printf("Starting FreeRTOS scheduler...\n");
 
+    /* Register Hardware Interface before starting System task */
+    MyWota_Hardware_Adapter_Init();
+
     Task_Start_System_Task();
 
     vTaskStartScheduler();
@@ -64,9 +70,9 @@ int main()
     printf("ERROR: Scheduler returned!\n");
     while (1)
     {
-        Hardware_LED_On();
+        HAL_GPIO_Write(SYSTEM_COMM_LED_PIN, 1);
         sleep_ms(50);
-        Hardware_LED_Off();
+        HAL_GPIO_Write(SYSTEM_COMM_LED_PIN, 0);
         sleep_ms(50);
     }
 }
@@ -76,12 +82,6 @@ void vApplicationIdleHook( void )
 {
     static uint32_t idle_count = 0;
     idle_count++;
-    if (idle_count % 500000 == 0) {
-        // Quick LED blink in idle to show system is running
-        Hardware_LED_On();
-        busy_wait_us(50000);
-        Hardware_LED_Off();
-    }
 }
 
 void vApplicationMallocFailedHook( void )
@@ -181,10 +181,7 @@ void MemManage_Handler(void)
 {
     printf("Memory Management Fault!\n");
     while (1) {
-        Hardware_LED_On();
-        sleep_ms(100);
-        Hardware_LED_Off();
-        sleep_ms(100);
+        sleep_ms(200);
     }
 }
 
@@ -193,10 +190,7 @@ void BusFault_Handler(void)
 {
     printf("Bus Fault!\n");
     while (1) {
-        Hardware_LED_On();
-        sleep_ms(50);
-        Hardware_LED_Off();
-        sleep_ms(50);
+        sleep_ms(100);
     }
 }
 
@@ -205,9 +199,6 @@ void UsageFault_Handler(void)
 {
     printf("Usage Fault!\n");
     while (1) {
-        Hardware_LED_On();
-        sleep_ms(25);
-        Hardware_LED_Off();
-        sleep_ms(25);
+        sleep_ms(50);
     }
 }

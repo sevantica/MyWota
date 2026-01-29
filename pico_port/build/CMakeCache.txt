@@ -49,12 +49,11 @@ CMAKE_ASM_FLAGS_RELEASE:STRING=-g -O3 -DNDEBUG
 //Flags used by the ASM compiler during RELWITHDEBINFO builds.
 CMAKE_ASM_FLAGS_RELWITHDEBINFO:STRING=-O2 -g -DNDEBUG
 
-//Choose the type of build, options are: None Debug Release RelWithDebInfo
-// MinSizeRel ...
+//No help, variable specified on the command line.
 CMAKE_BUILD_TYPE:STRING=Debug
 
-//CXX compiler
-CMAKE_CXX_COMPILER:STRING=C:/Users/bchir/.pico-sdk/toolchain/14_2_Rel1/bin/arm-none-eabi-g++.exe
+//No help, variable specified on the command line.
+CMAKE_CXX_COMPILER:FILEPATH=C:/Users/bchir/.pico-sdk/toolchain/14_2_Rel1/bin/arm-none-eabi-g++.exe
 
 //A wrapper around 'ar' adding the appropriate '--plugin' option
 // for the GCC compiler
@@ -79,8 +78,8 @@ CMAKE_CXX_FLAGS_RELEASE:STRING=-g -O3 -DNDEBUG
 //Flags used by the CXX compiler during RELWITHDEBINFO builds.
 CMAKE_CXX_FLAGS_RELWITHDEBINFO:STRING=-O2 -g -DNDEBUG
 
-//C compiler
-CMAKE_C_COMPILER:STRING=C:/Users/bchir/.pico-sdk/toolchain/14_2_Rel1/bin/arm-none-eabi-gcc.exe
+//No help, variable specified on the command line.
+CMAKE_C_COMPILER:FILEPATH=C:/Users/bchir/.pico-sdk/toolchain/14_2_Rel1/bin/arm-none-eabi-gcc.exe
 
 //A wrapper around 'ar' adding the appropriate '--plugin' option
 // for the GCC compiler
@@ -126,8 +125,8 @@ CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO:STRING=
 //Enable/Disable output of build database during the build.
 CMAKE_EXPORT_BUILD_DATABASE:BOOL=
 
-//Enable/Disable output of compile commands during generation.
-CMAKE_EXPORT_COMPILE_COMMANDS:BOOL=
+//No help, variable specified on the command line.
+CMAKE_EXPORT_COMPILE_COMMANDS:BOOL=TRUE
 
 //Value Computed by CMake.
 CMAKE_FIND_PACKAGE_REDIRECTS_DIR:STATIC=C:/Business/MyWota/MyWota_FW/MyWota/pico_port/build/CMakeFiles/pkgRedirects
@@ -138,8 +137,8 @@ CMAKE_INSTALL_PREFIX:PATH=C:/Program Files (x86)/UI_PICO_PORT
 //Path to a program.
 CMAKE_LINKER:FILEPATH=C:/Users/bchir/.pico-sdk/toolchain/14_2_Rel1/bin/arm-none-eabi-ld.exe
 
-//No help, variable specified on the command line.
-CMAKE_MAKE_PROGRAM:UNINITIALIZED=C:/Users/bchir/.pico-sdk/ninja/v1.12.1/ninja.exe
+//Program used to build from build.ninja files.
+CMAKE_MAKE_PROGRAM:FILEPATH=C:/ST/STM32CubeCLT_1.18.0/Ninja/bin/ninja.exe
 
 //Flags used by the linker during the creation of modules during
 // all build types.
@@ -266,6 +265,9 @@ DRIVERS_ENABLE_FATFS:BOOL=ON
 //Enable Buzzer/Feedback services
 DRIVERS_ENABLE_FEEDBACK:BOOL=ON
 
+//Enable Flash Task for centralized flash operations
+DRIVERS_ENABLE_FLASH:BOOL=ON
+
 //Enable CAT9555 and IO Expander services
 DRIVERS_ENABLE_IO_EXPANDER:BOOL=ON
 
@@ -290,7 +292,7 @@ LV_LVGL_H_INCLUDE_SIMPLE:BOOL=ON
 PICOTOOL_FETCH_FROM_GIT_PATH:STRING=C:/Users/bchir/.pico-sdk/picotool
 
 //PICO target board (e.g. pico, pico2)
-PICO_BOARD:STRING=pico_w
+PICO_BOARD:STRING=pico
 
 //PICO board header directories
 PICO_BOARD_HEADER_DIRS:STRING=
@@ -352,6 +354,9 @@ PICO_STDIO_UART:BOOL=ON
 //Globally enable stdio USB
 PICO_STDIO_USB:BOOL=OFF
 
+//No help, variable specified on the command line.
+Python3_EXECUTABLE:STRING=c:/Users/bchir/AppData/Local/Programs/Python/Python313/python.exe
+
 //Value Computed by CMake
 UI_PICO_PORT_BINARY_DIR:STATIC=C:/Business/MyWota/MyWota_FW/MyWota/pico_port/build
 
@@ -405,6 +410,8 @@ CMAKE_ASM_FLAGS_MINSIZEREL-ADVANCED:INTERNAL=1
 CMAKE_ASM_FLAGS_RELEASE-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: CMAKE_ASM_FLAGS_RELWITHDEBINFO
 CMAKE_ASM_FLAGS_RELWITHDEBINFO-ADVANCED:INTERNAL=1
+//STRINGS property for variable: CMAKE_BUILD_TYPE
+CMAKE_BUILD_TYPE-STRINGS:INTERNAL=Debug;Release;MinSizeRel;RelWithDebInfo
 //This is the directory where this CMakeCache.txt was created
 CMAKE_CACHEFILE_DIR:INTERNAL=c:/Business/MyWota/MyWota_FW/MyWota/pico_port/build
 //Major version of cmake used to create the current loaded cache
@@ -454,7 +461,7 @@ CMAKE_C_FLAGS_RELWITHDEBINFO-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: CMAKE_DLLTOOL
 CMAKE_DLLTOOL-ADVANCED:INTERNAL=1
 //Path to cache edit program executable.
-CMAKE_EDIT_COMMAND:INTERNAL=C:/Users/bchir/.pico-sdk/cmake/v3.31.5/bin/cmake-gui.exe
+CMAKE_EDIT_COMMAND:INTERNAL=C:/ST/STM32CubeCLT_1.18.0/CMake/bin/cmake-gui.exe
 //Executable file format
 CMAKE_EXECUTABLE_FORMAT:INTERNAL=ELF
 //ADVANCED property for variable: CMAKE_EXE_LINKER_FLAGS
@@ -486,6 +493,8 @@ CMAKE_GENERATOR_TOOLSET:INTERNAL=
 CMAKE_HOME_DIRECTORY:INTERNAL=C:/Business/MyWota/MyWota_FW/MyWota/pico_port
 //ADVANCED property for variable: CMAKE_LINKER
 CMAKE_LINKER-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: CMAKE_MAKE_PROGRAM
+CMAKE_MAKE_PROGRAM-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: CMAKE_MODULE_LINKER_FLAGS
 CMAKE_MODULE_LINKER_FLAGS-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: CMAKE_MODULE_LINKER_FLAGS_DEBUG
@@ -548,7 +557,7 @@ DOXYGEN_DOT_EXECUTABLE-ADVANCED:INTERNAL=1
 DOXYGEN_EXECUTABLE-ADVANCED:INTERNAL=1
 FAMILY_MCUS:INTERNAL=RP2040
 //Details about finding Python3
-FIND_PACKAGE_MESSAGE_DETAILS_Python3:INTERNAL=[C:/Users/bchir/AppData/Local/Programs/Python/Python313/python.exe][cfound components: Interpreter ][v3.13.6()]
+FIND_PACKAGE_MESSAGE_DETAILS_Python3:INTERNAL=[c:/Users/bchir/AppData/Local/Programs/Python/Python313/python.exe][cfound components: Interpreter ][v3.13.6()]
 PICO_32BIT:INTERNAL=1
 PICO_ARM:INTERNAL=1
 PICO_BOOT_STAGE2_DIR:INTERNAL=C:/Users/bchir/.pico-sdk/sdk/2.2.0/src/rp2040/boot_stage2
@@ -580,11 +589,10 @@ PICO_TOOLS_DIR:INTERNAL=C:/Users/bchir/.pico-sdk/sdk/2.2.0/tools
 _Python3_Compiler_REASON_FAILURE:INTERNAL=
 //Development reason failure
 _Python3_Development_REASON_FAILURE:INTERNAL=
-//Path to a program.
-_Python3_EXECUTABLE:INTERNAL=C:/Users/bchir/AppData/Local/Programs/Python/Python313/python.exe
+_Python3_EXECUTABLE:INTERNAL=c:/Users/bchir/AppData/Local/Programs/Python/Python313/python.exe
 //Python3 Properties
-_Python3_INTERPRETER_PROPERTIES:INTERNAL=Python;3;13;6;32;64;;;abi3;C:\Users\bchir\AppData\Local\Programs\Python\Python313\Lib;C:\Users\bchir\AppData\Local\Programs\Python\Python313\Lib;C:\Users\bchir\AppData\Local\Programs\Python\Python313\Lib\site-packages;C:\Users\bchir\AppData\Local\Programs\Python\Python313\Lib\site-packages
-_Python3_INTERPRETER_SIGNATURE:INTERNAL=575f761ef3e330ca3c6fddfcf02b1f9f
+_Python3_INTERPRETER_PROPERTIES:INTERNAL=Python;3;13;6;32;64;;;abi3;c:\Users\bchir\AppData\Local\Programs\Python\Python313\Lib;c:\Users\bchir\AppData\Local\Programs\Python\Python313\Lib;c:\Users\bchir\AppData\Local\Programs\Python\Python313\Lib\site-packages;c:\Users\bchir\AppData\Local\Programs\Python\Python313\Lib\site-packages
+_Python3_INTERPRETER_SIGNATURE:INTERNAL=6e10465e0980646bee181f3d57b8625c
 //NumPy reason failure
 _Python3_NumPy_REASON_FAILURE:INTERNAL=
 

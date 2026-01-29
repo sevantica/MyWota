@@ -61,6 +61,10 @@ add_subdirectory(../application/User_Interface/MyWota/lvgl ${CMAKE_CURRENT_BINAR
 # Set additional include directories for drivers library (needed for Hardware_Access.h, lv_conf.h, etc.)
 set(PARENT_INCLUDE_DIRS 
     ${CMAKE_CURRENT_SOURCE_DIR}/../application/Include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../application/Include/Adapters
+    ${CMAKE_CURRENT_SOURCE_DIR}/../application/Include/Controllers
+    ${CMAKE_CURRENT_SOURCE_DIR}/../application/Include/System
+    ${CMAKE_CURRENT_SOURCE_DIR}/../application/Include/Tasks
     ${CMAKE_CURRENT_SOURCE_DIR}/../application/User_Interface/MyWota
 )
 
@@ -121,6 +125,10 @@ include_directories(
     ../application/User_Interface/MyWota/lvgl/src
     ../application/User_Interface/MyWota/lvgl/src/drivers
     ../application/Include
+    ../application/Include/Adapters
+    ../application/Include/Controllers
+    ../application/Include/System
+    ../application/Include/Tasks
     "${COMMON_PROJECT_DIR}/sevantica_drivers/Include"
     ../application/User_Interface/MyWota/ui
     ../application/User_Interface/MyWota/ui/screens
@@ -141,28 +149,28 @@ set(MAIN_SOURCES
 
 # Application source files (explicit list - no GLOB)
 set(APP_SOURCES
-    ../application/Source/FreeRTOS_Static.c
-    ../application/Source/MyWota_Module.c
-    ../application/Source/MyWota_ui_driver.c
-    ../application/Source/Dispenser_Controller.c
-    ../application/Source/Firmware_Version.c
-    ../application/Source/Hardware_Access.c
+    ../application/Source/System/FreeRTOS_Static.c
+    ../application/Source/System/MyWota_Module.c
+    ../application/Source/System/MyWota_ui_driver.c
+    ../application/Source/Controllers/Dispenser_Controller.c
+    ../application/Source/System/Firmware_Version.c
+    ../application/Source/System/Hardware_Access.c
     # IO_Expander_Control.c removed - replaced by IO_Expander_Service in sevantica_drivers
-    ../application/Source/MyWota_Config_Adapter.c
-    ../application/Source/MyWota_Hardware_Adapter.c
-    ../application/Source/MyWota_IO_Expander_Adapter.c
-    ../application/Source/Feedback_Task.c
-    ../application/Source/MIFARE_Volume_Adapter.c
-    ../application/Source/RS485_Task.c
-    ../application/Source/RTC_Manager.c
-    ../application/Source/RTC_Persistence_Adapter.c
-    ../application/Source/RTC_Task.c
-    ../application/Source/SD_Logger_Task.c
-    ../application/Source/SD_Logger_Format_Adapter.c
+    ../application/Source/Adapters/MyWota_Config_Adapter.c
+    ../application/Source/Adapters/MyWota_Hardware_Adapter.c
+    ../application/Source/Adapters/MyWota_IO_Expander_Adapter.c
+    ../application/Source/Tasks/Feedback_Task.c
+    ../application/Source/Adapters/MIFARE_Volume_Adapter.c
+    ../application/Source/Tasks/RS485_Task.c
+    ../application/Source/System/RTC_Manager.c
+    ../application/Source/Adapters/RTC_Persistence_Adapter.c
+    ../application/Source/Tasks/RTC_Task.c
+    ../application/Source/Tasks/SD_Logger_Task.c
+    ../application/Source/Adapters/SD_Logger_Format_Adapter.c
     # System.c removed - now using shared System_Core.c from sevantica_drivers
-    ../application/Source/RS485_Command_Adapter.c
-    ../application/Source/System_Config.c
-    ../application/Source/USB_Command_Adapter.c
+    ../application/Source/Adapters/RS485_Command_Adapter.c
+    # System_Config.c removed - now part of Drivers library
+    ../application/Source/Adapters/USB_Command_Adapter.c
     # Note: MIFARE core and USB Command Handler in sevantica_drivers, adapters in this project
 )
 
@@ -176,7 +184,7 @@ add_executable(UI_PICO_PORT ${ALL_LOCAL_SOURCES})
 add_custom_command(
     TARGET UI_PICO_PORT
     PRE_BUILD
-    COMMAND ${CMAKE_COMMAND} -E touch_nocreate "${CMAKE_CURRENT_SOURCE_DIR}/../application/Source/Firmware_Version.c"
+    COMMAND ${CMAKE_COMMAND} -E touch_nocreate "${CMAKE_CURRENT_SOURCE_DIR}/../application/Source/System/Firmware_Version.c"
     COMMENT "Forcing recompilation of Firmware_Version.c for fresh timestamp"
 )
 
