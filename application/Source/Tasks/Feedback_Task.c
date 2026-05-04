@@ -30,7 +30,7 @@ static StaticTask_t feedback_task_tcb;
 static StackType_t feedback_task_stack[FEEDBACK_TASK_STACK_SIZE];
 
 /* Implementaiton */
-static void Feedback_TaskFunc(void *pvParameters)
+static void Feedback_Task(void *pvParameters)
 {
     (void)pvParameters;
     
@@ -142,7 +142,7 @@ void Feedback_Task_Start(void)
     if (s_feedback_task_handle != NULL) return;
 
     s_feedback_task_handle = xTaskCreateStatic(
-        Feedback_TaskFunc,
+        Feedback_Task,
         "FeedbackTask",
         FEEDBACK_TASK_STACK_SIZE,
         NULL,

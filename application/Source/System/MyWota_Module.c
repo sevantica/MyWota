@@ -131,7 +131,7 @@ void Module_Init(void)
     
     /* Display */
     if (cfg->modules.lcd_display_enabled) {
-        Task_Start_LCD_Display_Driver_Task();
+        Task_Start_LCD_Display_Task();
         s_module_states[MODULE_LCD_DISPLAY] = MODULE_STATE_RUNNING;
         System_RegisterTask(SYSTEM_TASK_ID_LCD_DISPLAY, "LCD_Display");
     }
@@ -186,7 +186,7 @@ bool System_StartModule(System_Module_t module)
     
     switch (module) {
         case MODULE_LCD_DISPLAY:
-            Task_Start_LCD_Display_Driver_Task();
+            Task_Start_LCD_Display_Task();
             s_module_states[MODULE_LCD_DISPLAY] = MODULE_STATE_RUNNING;
             System_RegisterTask(SYSTEM_TASK_ID_LCD_DISPLAY, "LCD_Display");
             return true;

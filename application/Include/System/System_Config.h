@@ -21,6 +21,7 @@
 /* Driver Feature Toggles (Read by sevantica_drivers CMake) */
 #define USE_DRIVERS_NFC           1
 #define USE_DRIVERS_RS485         1
+#define USE_DRIVERS_RS485_SLAVE   1
 #define USE_DRIVERS_FATFS         1
 #define USE_DRIVERS_USB           1
 #define USE_DRIVERS_CRYPTO        1
@@ -41,7 +42,7 @@
 #define CONFIG_MAX_VERSION_SEARCH   10      /* Search up to version 10 */
 #define CONFIG_SD_TIMEOUT_MS        3000    /* 3 second timeout for SD card */
 #define CONFIG_MAGIC_NUMBER         0x42594C57  /* "BYLW" - CCH config marker */
-#define CONFIG_VERSION              9       /* Bump to 9 to force refresh of defaults in flash */
+#define CONFIG_VERSION              13      /* Bump to 13: max_wash_volume_ml */
 
 /* Flash storage configuration - use last 4KB sector of 2MB flash */
 #define CONFIG_FLASH_SIZE           (2 * 1024 * 1024)           /* 2MB flash */
@@ -135,7 +136,31 @@ typedef struct {
     bool loyalty_enabled;                   /* Enable loyalty program (default true for CCH) */
     uint32_t loyalty_threshold;             /* Threshold to earn reward: washes or ml */
     uint32_t loyalty_reward;                /* Reward amount: 1 wash or ml */
+    /* Self-clean (CCH-orchestrated periodic flush) */
+    uint32_t self_clean_volume_ml;          /* Default target volume per clean cycle (mL) */
+    uint32_t self_clean_max_duration_sec;   /* Hard time cap per clean cycle (seconds) */
+    bool     self_clean_safety_boot_enabled;/* If true, slave runs its own clean on boot when stale */
+    uint32_t self_clean_safety_max_hours;   /* Threshold (hours) for boot-time safety clean */
+    uint32_t last_clean_unix_time;          /* RTC time of last successful clean (0 = never) */
+    /* Filter life tracking (slave-side, persisted in flash) */
+    uint32_t filter_capacity_ml;            /* Filter rated capacity in mL (0 = disabled) */
+    uint32_t filter_used_ml;                /* Cumulative mL through filter since reset */
+    /* Hard cap on water per wash session (mL). BigYellow only; MyWota leaves
+     * this at 0 since dispenser balance already gates volume. */
+    uint32_t max_wash_volume_ml;
 } DispenserLogic_Config_t;
+
+/**
+ * @brief CCH-side periodic clean scheduler config (unused on slaves but
+ *        kept here for binary-compat with the shared System_Config.c).
+ */
+typedef struct {
+    bool     enabled;
+    uint32_t interval_hours;
+    uint32_t target_volume_ml;
+    uint32_t max_duration_sec;
+    uint32_t failure_backoff_min;
+} CleanScheduler_Config_t;
 
 /**
  * @brief Buzzer configuration
@@ -212,6 +237,7 @@ typedef struct {
     MIFARE_Config_t mifare;                 /* MIFARE card reader module (contains .security nested) */
     UI_Config_t ui;                         /* UI display module */
     DispenserLogic_Config_t dispenser_logic;       /* Dispenser logic module (formerly carwash) */
+    CleanScheduler_Config_t clean_scheduler;       /* CCH-orchestrated periodic clean (unused on slave) */
     Buzzer_Config_t buzzer;                 /* Buzzer module */
     SDLogger_Config_t sd_logger;            /* SD logger module */
     IOExpander_Config_t io_expander;        /* I/O expander module */
@@ -308,6 +334,18 @@ uint32_t Config_CalculateCRC32(const SystemConfig_t* config);
  * @return Config_Result_t Result of save operation
  */
 Config_Result_t Config_SaveToFlash(void);
+
+/**
+ * @brief Update last self-clean timestamp and persist to flash (single-field write).
+ * @param unix_ts RTC unix time of the just-completed clean cycle.
+ */
+Config_Result_t Config_UpdateLastCleanTime(uint32_t unix_ts);
+
+/**
+ * @brief Update filter usage counter and persist to flash.
+ * @param used_ml New cumulative used-mL value (since last reset).
+ */
+Config_Result_t Config_UpdateFilterUsedMl(uint32_t used_ml);
 
 /**
  * @brief Load configuration from flash memory

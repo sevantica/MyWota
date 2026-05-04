@@ -50,6 +50,7 @@ typedef struct {
     uint8_t dispense_bay_id;               // Which dispense bay is in use
     ValveState_t valve_state;              // Current valve state (open/closed)
     uint32_t balance_deducted_ml;      // Total ml deducted this session (for logging)
+    bool transaction_counted;          // True after transaction_counter incremented this session
 } Dispenser_TimerState_t;
 
 /**
@@ -58,7 +59,8 @@ typedef struct {
 typedef enum {
     DISPENSER_IDLE,                            /* No card present */
     DISPENSER_DISPENSE_IN_PROGRESS,            /* Card present and dispensing (deducting time) */
-    DISPENSER_WAITING_FOR_REMOVAL              /* Dispense stopped, waiting for card to be removed */
+    DISPENSER_WAITING_FOR_REMOVAL,             /* Dispense stopped, waiting for card to be removed */
+    DISPENSER_SELF_CLEANING                    /* CCH-commanded self-clean cycle in progress */
 } DispenserState_t;
 
 /**
@@ -146,13 +148,6 @@ DispenserResult_t MIFARE_Dispenser_InitializeNewCustomer(uint32_t initial_balanc
 DispenserResult_t MIFARE_Dispenser_TopupCard(uint32_t topup_ml);
 
 /**
- * @brief Dispenser polling task - manages dispense timer and card updates
- * @note This task polls MIFARE_Transaction_Manager for card data,
- *       manages the 20-minute dispense timer, and updates the card
- */
-void MIFARE_Dispenser_Task(void* argument);
-
-/**
  * @brief Start the dispenser polling task
  */
 void Task_Start_Dispenser_Task(void);
@@ -171,6 +166,18 @@ uint32_t Dispenser_GetTotalDispensesCompleted(void); // Lifetime dispenses
 uint32_t Dispenser_GetTotalVolumePurchasedMl(void); // Lifetime volume purchased in ml
 ValveState_t Dispenser_GetValveState(void);       // Get current valve state (OPEN/CLOSED)
 float Dispenser_GetFlowRateLPM(void);             // Get current flow rate in liters per minute
+
+/**
+ * @brief Get this dispenser's current pump request for the CCH master.
+ * @details MyWota dispensers only ever request a BOOSTER pump (never a
+ *          pressure washer). The request is asserted from "card validated
+ *          with balance" through dispense completion, and aggregated by
+ *          the master across all slaves so the pump only stops when no
+ *          dispenser still needs it.
+ * @param[out] out_pump_id    RS485_Peripheral_ID_t. RS485_PERIPHERAL_NONE if not requesting.
+ * @param[out] out_level      0 = off, 255 = max. >0 means pump ON.
+ */
+void Dispenser_GetPeripheralRequest(uint8_t *out_pump_id, uint8_t *out_level);
 
 /**
  * @brief Manually start dispense without card (for testing/debugging)
@@ -211,6 +218,48 @@ void MIFARE_Dispenser_ResetTestMode(void);
  * @details Available only when TEST_MODE_ENABLED is defined
  */
 void MIFARE_Dispenser_GetTestModeStatus(void);
+
+/* ===========================================================================
+ * Self-Clean (CCH-orchestrated periodic flush)
+ * ===========================================================================
+ *
+ * The CCH master commands one slave at a time to self-clean so the cleaning
+ * valve gets full booster pressure (no concurrent cleans). The slave opens
+ * its valve until either the target volume has flowed (per the YS-S201 flow
+ * sensor) or max_duration_sec elapses, then closes the valve and persists
+ * the new last-clean timestamp to flash.
+ */
+
+/**
+ * @brief Begin a self-clean cycle.
+ * @param volume_ml          Target volume to flush (mL). 0 uses config default.
+ * @param max_duration_sec   Hard time cap (seconds). 0 uses config default.
+ * @return DISPENSER_RESULT_OK if started, DISPENSER_RESULT_BUSY if not idle,
+ *         DISPENSER_RESULT_ERROR otherwise.
+ * @note Refused if a card is currently present or a dispense is active.
+ */
+DispenserResult_t Dispenser_StartSelfClean(uint32_t volume_ml, uint32_t max_duration_sec);
+
+/**
+ * @brief Abort an in-progress self-clean cycle (closes valve immediately).
+ */
+void Dispenser_StopSelfClean(void);
+
+/**
+ * @brief Check whether a self-clean cycle is currently running.
+ */
+bool Dispenser_IsSelfCleaning(void);
+
+/**
+ * @brief Get the timestamp (RTC unix seconds) of the last successful clean.
+ * @return 0 if never cleaned.
+ */
+uint32_t Dispenser_GetLastCleanUnixTime(void);
+
+/**
+ * @brief Get current dispenser state (for RS485 status reporting).
+ */
+DispenserState_t Dispenser_GetControllerState(void);
 
 /**
  * @brief Get the application interface for dispenser

@@ -77,6 +77,7 @@ typedef struct {
     uint32_t time_in_state;
     uint32_t retry_count;
     bool filesystem_ready;
+    bool error_notified;                    // Track if system task was notified of error
     FATFS fatfs;                            // FAT filesystem object
 } SDLoggerContext_t;
 
@@ -86,7 +87,8 @@ static SDLoggerContext_t sd_logger_context = {
     .state_entry_time = 0,
     .time_in_state = 0,
     .retry_count = 0,
-    .filesystem_ready = false
+    .filesystem_ready = false,
+    .error_notified = false
 };
 
 /* Private function prototypes -----------------------------------------------*/
@@ -115,7 +117,6 @@ static void SD_Logger_Task(void* argument)
     TickType_t xLastWakeTime = xTaskGetTickCount();
     
     // Create mutex for SD file operations (if not already created)
-    // Create mutex for SD file operations (if not already created)
     if (sd_file_mutex == NULL) {
         sd_file_mutex = xSemaphoreCreateMutexStatic(&sd_file_mutex_buffer);
         if (sd_file_mutex == NULL) {
@@ -123,7 +124,6 @@ static void SD_Logger_Task(void* argument)
         }
     }
     
-    // Create queue for async log messages
     // Create queue for async log messages
     if (sd_log_queue == NULL) {
         sd_log_queue = xQueueCreateStatic(SD_LOG_QUEUE_LENGTH, sizeof(SDLogQueueMsg_t), sd_log_queue_storage, &sd_log_queue_buffer);
@@ -194,6 +194,11 @@ static void change_state(SDLoggerState_t new_state)
     if (sd_logger_context.current_state != new_state) {
         LOG_DEBUG_SD_LOGGER("[SD_LOGGER] State: %d -> %d (time: %lu ms)\r\n", 
                        sd_logger_context.current_state, new_state, sd_logger_context.time_in_state);
+        
+        /* Reset error_notified when leaving ERROR state so re-entry will re-notify */
+        if (sd_logger_context.current_state == SD_LOGGER_STATE_ERROR) {
+            sd_logger_context.error_notified = false;
+        }
         
         sd_logger_context.previous_state = sd_logger_context.current_state;
         sd_logger_context.current_state = new_state;
@@ -342,20 +347,18 @@ static void state_ready(void)
  */
 static void state_error(void)
 {
-    static bool error_notified = false;
-    
     // Mark filesystem as not ready
     sd_logger_context.filesystem_ready = false;
     
     // Notify System task once when entering error state
-    if (!error_notified) {
+    if (!sd_logger_context.error_notified) {
         extern TaskHandle_t task_get_handle_System_Task(void);
         TaskHandle_t system_handle = task_get_handle_System_Task();
         if (system_handle != NULL) {
             xTaskNotifyGive(system_handle);
             LOG_DEBUG_SD_LOGGER("[SD_LOGGER] Notified System task of mount failure\r\n");
         }
-        error_notified = true;
+        sd_logger_context.error_notified = true;
     }
     
     // Stay in error state indefinitely
@@ -435,15 +438,15 @@ static FRESULT log_startup_event(void)
     f_write(&file, log_buffer, strlen(log_buffer), &bytes_written);
     
     // Log config info from loaded configuration
-    extern SystemConfig_t g_system_config;
+    const SystemConfig_t* sys_cfg = Config_Get();
     snprintf(log_buffer, sizeof(log_buffer), 
              "[%s] Config: Device=%s Site=%s\r\n", 
-             time_str, g_system_config.system.device_id, g_system_config.system.site_id);
+             time_str, sys_cfg->system.device_id, sys_cfg->system.site_id);
     f_write(&file, log_buffer, strlen(log_buffer), &bytes_written);
     
     snprintf(log_buffer, sizeof(log_buffer), 
              "[%s] Mode: %s\r\n", 
-             time_str, g_system_config.system.test_mode_enabled ? "TEST" : "PRODUCTION");
+             time_str, sys_cfg->system.test_mode_enabled ? "TEST" : "PRODUCTION");
     result = f_write(&file, log_buffer, strlen(log_buffer), &bytes_written);
     
     // Close file

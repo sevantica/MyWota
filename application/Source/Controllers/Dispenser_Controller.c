@@ -33,9 +33,11 @@
 #include "MyWota_System.h"
 #include "System_Config.h"
 #include "Heartbeat_Task.h"
+#include "Fault_Manager.h"
 #include "Task_Stack_Config.h"
 #include "YS_S201_Driver.h"
 #include "Hardware_Access.h"
+#include "RTC_Manager.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include <string.h>
@@ -117,6 +119,17 @@ static float g_last_flow_volume_ml = 0.0f;
 static uint32_t g_card_last_seen_tick = 0;
 static uint32_t g_last_flow_change_tick = 0;
 
+/* Self-clean (CCH-orchestrated periodic flush) ------------------------------*/
+static bool     g_self_clean_active = false;
+static bool     g_self_clean_pending_safety = false;  /* one-shot boot fallback */
+static uint32_t g_self_clean_target_ml = 0;
+static uint32_t g_self_clean_max_duration_ms = 0;
+static uint32_t g_self_clean_start_tick = 0;
+static float    g_self_clean_start_volume_ml = 0.0f;
+static float    g_self_clean_last_flow_ml = 0.0f;
+static uint32_t g_self_clean_last_flow_tick = 0;
+#define DISPENSER_SELF_CLEAN_FLOW_WATCHDOG_MS  3000
+
 /*Private function prototypes ---------------------------------------*/
 static void dispenser_start_dispense(void);
 static void dispenser_start_dispense_internal(bool no_card_mode, uint32_t target_ml);
@@ -126,6 +139,8 @@ static bool dispenser_has_balance(void);
 static void dispenser_valve_open(void);
 static void dispenser_valve_close(void);
 static const char* dispenser_get_valve_state_name(ValveState_t state);
+static void dispenser_self_clean_finish(bool success, const char* reason);
+static void dispenser_self_clean_step(void);
 
 /*Public Functions ---------------------------------------------------*/
 
@@ -148,6 +163,10 @@ DispenserResult_t MIFARE_Dispenser_Init(void)
     
     // Ensure valve is closed initially
     dispenser_valve_close();
+
+    // Fault subsystem (idempotent). Filter life is tracked at the CCH side
+    // because the site shares a single physical filter across all dispensers.
+    Fault_Manager_Init();
     
     // Initialize YS-S201 water flow sensor (GPIO 22)
     App_GPIO_Pins_t gpio_pins = Get_App_GPIO_Pins();
@@ -175,6 +194,25 @@ DispenserResult_t MIFARE_Dispenser_Init(void)
     }
     
     DISPENSER_CRITICAL("[✓] Dispenser system initialized");
+
+    /* Arm boot-time safety self-clean if configured and last clean is stale.
+     * Only fires when CCH appears absent (i.e. no clean has been commanded
+     * within self_clean_safety_max_hours). The actual cycle runs on first
+     * IDLE tick of the task loop. */
+    {
+        const DispenserLogic_Config_t* dcfg = &g_system_config.dispenser_logic;
+        if (dcfg->self_clean_safety_boot_enabled) {
+            time_t now = RTC_GetUnixTime();
+            uint32_t last = dcfg->last_clean_unix_time;
+            uint32_t threshold_sec = dcfg->self_clean_safety_max_hours * 3600u;
+            if ((now > 0) && (last == 0 || ((uint32_t)now - last) > threshold_sec)) {
+                g_self_clean_pending_safety = true;
+                DISPENSER_CRITICAL("[→] Boot safety self-clean armed (last=%lu, now=%lu)",
+                                   (unsigned long)last, (unsigned long)now);
+            }
+        }
+    }
+
     return DISPENSER_RESULT_OK;
 }
 
@@ -216,6 +254,7 @@ static void dispenser_start_dispense_internal(bool no_card_mode, uint32_t target
     g_dispense_timer.last_deduction_time = g_dispense_timer.dispense_start_time;
     g_dispense_timer.dispense_active = true;
     g_dispense_timer.balance_deducted_ml = 0;
+    g_dispense_timer.transaction_counted = false;  /* Will increment counter on first deduction */
     g_dispenser_state = DISPENSER_DISPENSE_IN_PROGRESS;
     
     // Reset card write tracking
@@ -317,6 +356,34 @@ static void dispenser_stop_dispense(const char* reason, uint8_t error_code)
     g_flow_started = false;
     
     g_dispense_timer.valve_state = VALVE_CLOSED;
+
+    /* Filter usage is tracked at the CCH (single shared filter per site).
+     * The CCH derives volume from RS485 status (status.total_dispensed delta
+     * on dispense session-end), so the slave does not persist anything here. */
+
+    /* Fault state machine: map error_code -> reason. Successful sessions
+     * (RS485_ERR_NONE) and benign stops (CARD_REMOVED, EMERGENCY_STOP) count
+     * toward recovery; flow / valve / sensor errors trigger Fault_Report. */
+    switch (error_code) {
+        case RS485_ERR_NO_FLOW:
+            Fault_Manager_Report(RS485_FAULT_REASON_NO_FLOW);
+            break;
+        case RS485_ERR_VALVE_FAULT:
+            Fault_Manager_Report(RS485_FAULT_REASON_VALVE);
+            break;
+        case RS485_ERR_SENSOR_FAULT:
+            Fault_Manager_Report(RS485_FAULT_REASON_FLOW_SENSOR);
+            break;
+        case RS485_ERR_NONE:
+        case RS485_ERR_CARD_REMOVED:
+        case RS485_ERR_EMERGENCY_STOP:
+            Fault_Manager_NoteSuccess();
+            break;
+        default:
+            /* Other errors (LOW_BALANCE, CARD_WR_FAILED, GENERAL,
+             * DAILY_LIMIT) are not hardware faults - leave state alone. */
+            break;
+    }
 }
 
 /**
@@ -433,7 +500,11 @@ static bool dispense(uint32_t elapsed_ms)
         MIFARE_UserData_t updated_user_data;
         memcpy(&updated_user_data, user_data, sizeof(MIFARE_UserData_t));
         updated_user_data.balance -= to_deduct;
-        updated_user_data.transaction_counter++;
+        /* Increment transaction counter only once per dispense session (not every deduction cycle) */
+        if (!g_dispense_timer.transaction_counted) {
+            updated_user_data.transaction_counter++;
+            g_dispense_timer.transaction_counted = true;
+        }
         MIFARE_SetUserData(&updated_user_data);
         
         // Track total deducted this session (in ml)
@@ -705,7 +776,7 @@ uint32_t Dispenser_GetDispensedAmountML(void)
  * 
  * @param argument Task argument (unused)
  */
-void MIFARE_Dispenser_Task(void* argument)
+static void MIFARE_Dispenser_Task(void* argument)
 {
     (void)argument;
     
@@ -803,6 +874,7 @@ void MIFARE_Dispenser_Task(void* argument)
                             } else {
                                 // No-card mode OR card already confirmed removed - go to IDLE
                                 g_dispenser_state = DISPENSER_IDLE;
+                                g_last_error = RS485_ERR_NONE;
                                 g_card_removal_confirmed = false;  // Reset flag
                             }
                             break;
@@ -815,23 +887,41 @@ void MIFARE_Dispenser_Task(void* argument)
                 // Wait for card removal before returning to IDLE
                 // This prevents automatic retry on flow timeout - user must remove and re-tap
                 {
-                    // Check if card is no longer ready (removed by user or MIFARE)
-                    bool card_is_ready = MIFARE_IsCardReady();
+                    // Check if card is no longer present (removed by user)
+                    bool card_is_present = MIFARE_IsCardPresent();
                     
-                    if (card_is_ready) {
+                    if (card_is_present) {
                         // Card still present - keep waiting for removal
                         DISPENSER_DEBUG("WAITING_FOR_REMOVAL: Card still present");
                     } else {
                         // Card removed - return to IDLE immediately
                         DISPENSER_CRITICAL("[✓] Card removed - returning to IDLE");
                         g_dispenser_state = DISPENSER_IDLE;
+                        g_last_error = RS485_ERR_NONE;
                     }
                 }
                 break;
+
+            case DISPENSER_SELF_CLEANING:
+                /* Drives valve + flow watchdog until target / timeout / abort. */
+                dispenser_self_clean_step();
+                break;
         }
         
-        // Adaptive polling: faster when IDLE (waiting for card), slower when dispensing
-        uint32_t poll_delay_ms = (g_dispenser_state == DISPENSER_IDLE) ? 20 : 100;
+        /* Run any pending boot-time safety self-clean exactly once, only when
+         * truly idle (no card, no dispense). */
+        if (g_self_clean_pending_safety &&
+            g_dispenser_state == DISPENSER_IDLE &&
+            !MIFARE_IsCardPresent()) {
+            g_self_clean_pending_safety = false;
+            DISPENSER_CRITICAL("[→] Running boot safety self-clean");
+            (void)Dispenser_StartSelfClean(0, 0);  /* use config defaults */
+        }
+
+        // Adaptive polling: faster when dispensing or cleaning (timing-critical), slower when IDLE
+        uint32_t poll_delay_ms =
+            (g_dispenser_state == DISPENSER_DISPENSE_IN_PROGRESS ||
+             g_dispenser_state == DISPENSER_SELF_CLEANING) ? 20 : 100;
         vTaskDelay(pdMS_TO_TICKS(poll_delay_ms));
     }
 }
@@ -908,6 +998,45 @@ bool Dispenser_IsDispenseActive(void)
     return g_dispense_timer.dispense_active;
 }
 
+/* MyWota dispensers always drive booster pump #1 when active.
+ * TODO: expose this as a config item (e.g. dispenser.pump_id) so multiple
+ *       MyWota slaves on the same bus can be assigned different boosters. */
+#ifndef MYWOTA_PERIPHERAL_ID
+#define MYWOTA_PERIPHERAL_ID  RS485_PERIPHERAL_BOOSTER_1
+#endif
+
+void Dispenser_GetPeripheralRequest(uint8_t *out_pump_id, uint8_t *out_level)
+{
+    if (out_pump_id == NULL || out_level == NULL) {
+        return;
+    }
+
+    bool wants_pump = false;
+
+    /* Active dispense always needs the booster pressurized. */
+    if (g_dispense_timer.dispense_active) {
+        wants_pump = true;
+    }
+    /* Self-clean cycle drives water through the line - same booster needed. */
+    else if (g_self_clean_active) {
+        wants_pump = true;
+    }
+    /* Card validated with balance: prime the booster so water flows
+     * immediately when the valve opens. Once balance hits zero or the
+     * card is removed, the MIFARE state leaves READY and this clears. */
+    else if (MIFARE_IsCardReady() && dispenser_has_balance()) {
+        wants_pump = true;
+    }
+
+    if (wants_pump) {
+        *out_pump_id = (uint8_t)MYWOTA_PERIPHERAL_ID;
+        *out_level   = RS485_PERIPHERAL_LEVEL_MAX;  /* Boosters are ON/OFF; max = ON */
+    } else {
+        *out_pump_id = (uint8_t)RS485_PERIPHERAL_NONE;
+        *out_level   = RS485_PERIPHERAL_LEVEL_OFF;
+    }
+}
+
 uint32_t Dispenser_GetTotalDispensesCompleted(void)
 {
     MIFARE_UsageData_t *usage_data = MIFARE_GetUsageData();
@@ -932,6 +1061,164 @@ float Dispenser_GetFlowRateLPM(void)
     }
     
     return 0.0f;
+}
+
+/* ---------------------------------------------------------------------------
+ * Self-Clean (CCH-orchestrated periodic flush)
+ * ------------------------------------------------------------------------ */
+
+bool Dispenser_IsSelfCleaning(void)
+{
+    return g_self_clean_active;
+}
+
+uint32_t Dispenser_GetLastCleanUnixTime(void)
+{
+    return g_system_config.dispenser_logic.last_clean_unix_time;
+}
+
+DispenserState_t Dispenser_GetControllerState(void)
+{
+    return g_dispenser_state;
+}
+
+DispenserResult_t Dispenser_StartSelfClean(uint32_t volume_ml, uint32_t max_duration_sec)
+{
+    /* Reject if any "real" activity is in progress. Card-present check covers
+     * both READY and INITIALIZING states; we never want to flush while a
+     * customer's card is on the reader. */
+    if (g_self_clean_active) {
+        DISPENSER_CRITICAL("[!] Self-clean already in progress");
+        return DISPENSER_RESULT_BUSY;
+    }
+    if (g_dispense_timer.dispense_active || g_dispenser_state != DISPENSER_IDLE) {
+        DISPENSER_ERROR("[✗] Self-clean refused: dispenser not idle (state=%d)", g_dispenser_state);
+        return DISPENSER_RESULT_BUSY;
+    }
+    if (MIFARE_IsCardPresent()) {
+        DISPENSER_ERROR("[✗] Self-clean refused: card present");
+        return DISPENSER_RESULT_BUSY;
+    }
+    if (!g_flow_sensor_initialized) {
+        DISPENSER_ERROR("[✗] Self-clean refused: flow sensor not initialised");
+        return DISPENSER_RESULT_ERROR;
+    }
+
+    const DispenserLogic_Config_t* dcfg = &g_system_config.dispenser_logic;
+    uint32_t target = (volume_ml > 0) ? volume_ml : dcfg->self_clean_volume_ml;
+    uint32_t max_sec = (max_duration_sec > 0) ? max_duration_sec : dcfg->self_clean_max_duration_sec;
+    if (target == 0) {
+        target = 100;   /* hard-coded floor */
+    }
+    if (max_sec == 0) {
+        max_sec = 30;
+    }
+
+    /* Snapshot flow baseline */
+    YS_S201_FlowData_t flow_data;
+    g_self_clean_start_volume_ml = 0.0f;
+    if (YS_S201_GetFlowData(&g_flow_sensor_handle, &flow_data) == YS_S201_OK) {
+        g_self_clean_start_volume_ml = flow_data.total_volume_ml;
+    }
+    g_self_clean_last_flow_ml = g_self_clean_start_volume_ml;
+    g_self_clean_target_ml = target;
+    g_self_clean_max_duration_ms = max_sec * 1000u;
+    g_self_clean_start_tick = xTaskGetTickCount();
+    g_self_clean_last_flow_tick = g_self_clean_start_tick;
+    g_self_clean_active = true;
+    g_dispenser_state = DISPENSER_SELF_CLEANING;
+
+    dispenser_valve_open();
+    DISPENSER_CRITICAL("[→] Self-clean STARTED (target=%lu mL, max=%lu s)",
+                       (unsigned long)target, (unsigned long)max_sec);
+    return DISPENSER_RESULT_OK;
+}
+
+void Dispenser_StopSelfClean(void)
+{
+    if (g_self_clean_active) {
+        dispenser_self_clean_finish(false, "manual stop");
+    }
+}
+
+/**
+ * @brief One iteration of the self-clean state.
+ * @details Called from the dispenser task while g_dispenser_state ==
+ *          DISPENSER_SELF_CLEANING. Stops on target volume, max duration,
+ *          flow watchdog, or card-detect (real dispense pre-empts).
+ */
+static void dispenser_self_clean_step(void)
+{
+    if (!g_self_clean_active) {
+        g_dispenser_state = DISPENSER_IDLE;
+        return;
+    }
+
+    /* Card pre-empts a clean cycle so a real customer never waits. */
+    if (MIFARE_IsCardPresent()) {
+        dispenser_self_clean_finish(false, "card detected");
+        return;
+    }
+
+    uint32_t now = xTaskGetTickCount();
+    uint32_t elapsed_ms = pdTICKS_TO_MS(now - g_self_clean_start_tick);
+
+    /* Hard time cap */
+    if (elapsed_ms >= g_self_clean_max_duration_ms) {
+        dispenser_self_clean_finish(false, "max duration");
+        return;
+    }
+
+    /* Read flow */
+    YS_S201_FlowData_t flow_data;
+    if (YS_S201_GetFlowData(&g_flow_sensor_handle, &flow_data) != YS_S201_OK) {
+        return;  /* transient sensor read failure - try again next tick */
+    }
+    float dispensed_ml = flow_data.total_volume_ml - g_self_clean_start_volume_ml;
+
+    /* Flow watchdog: closed upstream / dry pipe */
+    if (flow_data.total_volume_ml > g_self_clean_last_flow_ml) {
+        g_self_clean_last_flow_ml = flow_data.total_volume_ml;
+        g_self_clean_last_flow_tick = now;
+    } else if (pdTICKS_TO_MS(now - g_self_clean_last_flow_tick) >= DISPENSER_SELF_CLEAN_FLOW_WATCHDOG_MS) {
+        dispenser_self_clean_finish(false, "no flow");
+        return;
+    }
+
+    /* Target reached */
+    if (dispensed_ml >= (float)g_self_clean_target_ml) {
+        dispenser_self_clean_finish(true, "target reached");
+        return;
+    }
+}
+
+static void dispenser_self_clean_finish(bool success, const char* reason)
+{
+    if (!g_self_clean_active) {
+        return;
+    }
+
+    dispenser_valve_close();
+
+    float dispensed_ml = 0.0f;
+    YS_S201_FlowData_t flow_data;
+    if (g_flow_sensor_initialized &&
+        YS_S201_GetFlowData(&g_flow_sensor_handle, &flow_data) == YS_S201_OK) {
+        dispensed_ml = flow_data.total_volume_ml - g_self_clean_start_volume_ml;
+    }
+
+    g_self_clean_active = false;
+    g_dispenser_state = DISPENSER_IDLE;
+
+    if (success) {
+        time_t now = RTC_GetUnixTime();
+        if (now > 0) {
+            Config_UpdateLastCleanTime((uint32_t)now);
+        }
+        DISPENSER_CRITICAL("[✓] Self-clean COMPLETE - %s (%.0f mL)", reason, dispensed_ml);
+    } else {
+        DISPENSER_CRITICAL("[✗] Self-clean ABORTED - %s (%.0f mL)", reason, dispensed_ml);
+    }
 }
 
 /**

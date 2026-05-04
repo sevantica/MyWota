@@ -15,7 +15,7 @@
 
 /**
  * @file SD_Logger_Format_Adapter.h
- * @brief BigYellow SD Logger Format Adapter
+ * @brief MyWota SD Logger Format Adapter
  * @details Implements log formatting for MIFARE transactions and car wash events
  */
 
@@ -27,7 +27,7 @@ extern "C" {
 
 /**
  * @brief Initialize SD Logger format adapter
- * @details Registers BigYellow-specific log formatters
+ * @details Registers MyWota-specific log formatters
  * @return SD_LOG_OK on success
  */
 SD_Log_Result_t SD_Logger_Format_Adapter_Init(void);

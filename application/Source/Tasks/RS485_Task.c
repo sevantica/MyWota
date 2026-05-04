@@ -1,5 +1,6 @@
 #include "RS485_Task.h"
 #include "RS485_Protocol.h"
+#include "RS485_Discovery.h"
 #include "RS485_FW_Update.h"
 #include "RS485_Command_Adapter.h"
 #include "RS485_Command_Interface.h"
@@ -8,6 +9,7 @@
 #include "Task_Stack_Config.h"
 #include "USB_Logging.h"
 #include "USB_Command_Handler.h"
+#include "Firmware_Version.h"
 #include "Module_Interface.h"
 #include "MyWota_System.h"
 #include "Hardware_Access.h"
@@ -15,6 +17,8 @@
 #include "MIFARE_Card_Interface.h"
 #include "MIFARE_Transaction_Core.h"
 #include "PN532_Driver.h"
+#include "Dispenser_Controller.h"
+#include "Fault_Manager.h"
 #include <string.h>
 #include "RP2040_HAL.h"
 
@@ -45,10 +49,13 @@ static struct {
     bool overflow;
 } rs485_system_log = {0};
 
+#define RS485_CMD_CAPTURE_SIZE 2048
 static struct {
-    char buffer[RS485_MAX_PAYLOAD];
-    size_t length;
-    bool active;
+    char     buffer[RS485_CMD_CAPTURE_SIZE];
+    uint16_t length;          /* Total captured output length */
+    uint8_t  num_chunks;      /* Precomputed chunk count */
+    bool     active;          /* Capture in progress */
+    bool     ready;           /* Output captured, ready for fetch */
 } rs485_cmd_capture = {0};
 
 /* Private Function Prototypes -----------------------------------------------*/
@@ -61,6 +68,8 @@ static RS485_Result_t handle_sync_time(const RS485_Frame_t* req, RS485_Frame_t* 
 static RS485_Result_t handle_fw_update(const RS485_Frame_t* req, RS485_Frame_t* resp);
 static RS485_Result_t handle_debug_log(const RS485_Frame_t* req, RS485_Frame_t* resp);
 static RS485_Result_t handle_debug_cmd(const RS485_Frame_t* req, RS485_Frame_t* resp);
+static RS485_Result_t handle_debug_fetch(const RS485_Frame_t* req, RS485_Frame_t* resp);
+static RS485_Result_t handle_trigger_clean(const RS485_Frame_t* req, RS485_Frame_t* resp);
 
 /* ========================================================================== */
 /*                            PUBLIC API                                      */
@@ -86,7 +95,6 @@ static void RS485_Task(void* argument)
     
     /* 1. Initialize Hardware (UART0 for MyWota Slave) */
     /* This sets up the GPIO pins correctly */
-    /* This sets up the GPIO pins correctly */
     void* uart_handle = (void*)HAL_UART_Init(0, RS485_BAUDRATE, 0, 1, RS485_DATA_EN_PIN);
     if (uart_handle == NULL) {
         vTaskDelete(NULL);
@@ -94,11 +102,14 @@ static void RS485_Task(void* argument)
     }
     
     /* 2. Initialize Standard RS485 Service (Slave Mode) */
-    /* Note: UART0 = Index 0, RS485_DATA_EN_PIN = Direction Enable */
-    if (RS485_Slave_Init(0, RS485_BAUDRATE, RS485_DATA_EN_PIN, RS485_MY_ADDRESS) != RS485_OK) {
+    if (RS485_Slave_Init(uart_handle, RS485_MY_ADDRESS) != RS485_OK) {
         vTaskDelete(NULL);
         return;
     }
+    
+    /* 2b. Initialize Discovery so slave responds to CMD_DISCOVER broadcasts */
+    RS485_Discovery_Slave_Init(RS485_DEVICE_TYPE_WATER_DISPENSER,
+                               FW_VERSION_MAJOR, FW_VERSION_MINOR, FW_VERSION_PATCH);
     
     /* 3. Initialize Firmware Update Driver */
     RS485_FW_Update_Init(RS485_FW_FLASH_OFFSET, RS485_FW_MAX_SIZE);
@@ -114,6 +125,8 @@ static void RS485_Task(void* argument)
     RS485_Slave_RegisterHandler(RS485_CMD_FW_VERIFY, handle_fw_update);
     RS485_Slave_RegisterHandler(RS485_CMD_DEBUG_LOG, handle_debug_log);
     RS485_Slave_RegisterHandler(RS485_CMD_DEBUG_CMD, handle_debug_cmd);
+    RS485_Slave_RegisterHandler(RS485_CMD_DEBUG_FETCH, handle_debug_fetch);
+    RS485_Slave_RegisterHandler(RS485_CMD_TRIGGER_CLEAN, handle_trigger_clean);
     
     /* 5. Initialize Command Adapter (Legacy dispatcher fallback) */
     RS485_Command_Adapter_Init();
@@ -124,7 +137,7 @@ static void RS485_Task(void* argument)
     for(;;)
     {
         TASK_HEARTBEAT_EVERY_SECOND("RS485_Task");
-        System_ReportTaskStatus(SYS_TASK_ID_RS485, true);
+        System_ReportTaskStatus(SYSTEM_TASK_ID_RS485, true);
         
         /* Update application status for polling */
         update_device_status();
@@ -135,7 +148,7 @@ static void RS485_Task(void* argument)
         /* Service timeouts */
         RS485_FW_Update_CheckTimeout();
         
-        vTaskDelay(pdMS_TO_TICKS(2));
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
 
@@ -232,42 +245,103 @@ static RS485_Result_t handle_debug_log(const RS485_Frame_t* req, RS485_Frame_t* 
 
 static RS485_Result_t handle_debug_cmd(const RS485_Frame_t* req, RS485_Frame_t* resp)
 {
-    if (req->header.length > 0) {
-        char cmd[RS485_MAX_PAYLOAD + 1];
-        size_t len = (req->header.length > RS485_MAX_PAYLOAD) ? RS485_MAX_PAYLOAD : req->header.length;
-        memcpy(cmd, req->payload, len);
-        cmd[len] = '\0';
-        
-        rs485_cmd_capture.length = 0;
-        rs485_cmd_capture.active = true;
-        USB_Command_Status_t st = USB_Command_HandleString(cmd);
-        rs485_cmd_capture.active = false;
-        
-        if (st != USB_CMD_OK && rs485_cmd_capture.length == 0) {
-            /* If command failed and produced no output, send generic NAK */
-             uint8_t reason = RS485_NAK_INVALID_PARAM; // Or generic error
-             RS485_BuildFrame(resp, RS485_ADDR_MASTER, RS485_CMD_ACK, req->header.sequence, NULL, 0);
-             // Actually, user wants to know it failed. But ACK with "OK" on master is confusing.
-             // Master prints "OK" on ACK.
-             // If we send DEBUG_CMD with empty string? Master prints nothing.
-             // If we send captured output, Master prints it.
-        }
-        
-        if (rs485_cmd_capture.length > 0) {
-             /* Send captured output even if command 'failed' (e.g. unknown command print) */
-            RS485_BuildFrame(resp, RS485_ADDR_MASTER, RS485_CMD_DEBUG_CMD, req->header.sequence, 
-                             rs485_cmd_capture.buffer, rs485_cmd_capture.length);
-        } else {
-             /* No output. If st was error, strictly we should NAK? 
-                But 'remote' command on master says "OK" if ACK.
-                Let's stick to ACK for now to mean "Executed (silently)". */
-             RS485_BuildFrame(resp, RS485_ADDR_MASTER, RS485_CMD_ACK, req->header.sequence, NULL, 0);
-        }
+    if (req->header.length == 0) {
+        uint8_t reason = RS485_NAK_INVALID_PARAM;
+        RS485_BuildFrame(resp, RS485_ADDR_MASTER, RS485_CMD_NAK, req->header.sequence, &reason, 1);
         return RS485_OK;
     }
-    
-    uint8_t reason = RS485_NAK_INVALID_PARAM;
-    RS485_BuildFrame(resp, RS485_ADDR_MASTER, RS485_CMD_NAK, req->header.sequence, &reason, 1);
+
+    char cmd[RS485_MAX_PAYLOAD + 1];
+    size_t len = (req->header.length > RS485_MAX_PAYLOAD) ? RS485_MAX_PAYLOAD : req->header.length;
+    memcpy(cmd, req->payload, len);
+    cmd[len] = '\0';
+
+    USB_Log_Printf("[RS485] Executing Remote Cmd: '%s'\r\n", cmd);
+
+    /* Capture all command output into the dedicated buffer */
+    rs485_cmd_capture.length = 0;
+    rs485_cmd_capture.active = true;
+    USB_Command_HandleString(cmd);
+    rs485_cmd_capture.active = false;
+
+    /* Compute chunk count (RS485_MAX_PAYLOAD bytes per chunk) */
+    rs485_cmd_capture.num_chunks = (rs485_cmd_capture.length > 0)
+        ? (uint8_t)((rs485_cmd_capture.length + RS485_MAX_PAYLOAD - 1) / RS485_MAX_PAYLOAD)
+        : 0;
+    rs485_cmd_capture.ready = true;
+
+    /* Respond with metadata: total_size(2B LE) + num_chunks(1B) */
+    uint8_t meta[3];
+    meta[0] = (uint8_t)(rs485_cmd_capture.length & 0xFF);
+    meta[1] = (uint8_t)(rs485_cmd_capture.length >> 8);
+    meta[2] = rs485_cmd_capture.num_chunks;
+    RS485_BuildFrame(resp, RS485_ADDR_MASTER, RS485_CMD_DEBUG_CMD, req->header.sequence, meta, 3);
+    return RS485_OK;
+}
+
+static RS485_Result_t handle_debug_fetch(const RS485_Frame_t* req, RS485_Frame_t* resp)
+{
+    /* Payload must contain 1 byte: chunk_index */
+    if (req->header.length < 1 || !rs485_cmd_capture.ready) {
+        uint8_t reason = RS485_NAK_INVALID_PARAM;
+        RS485_BuildFrame(resp, RS485_ADDR_MASTER, RS485_CMD_NAK, req->header.sequence, &reason, 1);
+        return RS485_OK;
+    }
+
+    uint8_t chunk_idx = req->payload[0];
+    if (chunk_idx >= rs485_cmd_capture.num_chunks) {
+        uint8_t reason = RS485_NAK_INVALID_PARAM;
+        RS485_BuildFrame(resp, RS485_ADDR_MASTER, RS485_CMD_NAK, req->header.sequence, &reason, 1);
+        return RS485_OK;
+    }
+
+    uint16_t offset = (uint16_t)chunk_idx * RS485_MAX_PAYLOAD;
+    uint16_t remaining = rs485_cmd_capture.length - offset;
+    uint16_t chunk_len = (remaining > RS485_MAX_PAYLOAD) ? RS485_MAX_PAYLOAD : remaining;
+
+    RS485_BuildFrame(resp, RS485_ADDR_MASTER, RS485_CMD_DEBUG_FETCH,
+                     req->header.sequence,
+                     &rs485_cmd_capture.buffer[offset], chunk_len);
+    return RS485_OK;
+}
+
+/**
+ * @brief Handle CCH-issued TRIGGER_CLEAN command.
+ *
+ * Payload: RS485_TriggerClean_Payload_t { uint16_t target_volume_ml;
+ *                                         uint16_t max_duration_sec; }
+ * - target_volume_ml == 0 → abort any in-progress self-clean
+ * - non-zero            → start a clean cycle with given parameters
+ *                         (0 in either field uses config defaults)
+ *
+ * Replies ACK on success, NAK with reason byte otherwise.
+ */
+static RS485_Result_t handle_trigger_clean(const RS485_Frame_t* req, RS485_Frame_t* resp)
+{
+    if (req->header.length < sizeof(RS485_TriggerClean_Payload_t)) {
+        uint8_t reason = RS485_NAK_INVALID_PARAM;
+        RS485_BuildFrame(resp, RS485_ADDR_MASTER, RS485_CMD_NAK, req->header.sequence, &reason, 1);
+        return RS485_OK;
+    }
+
+    RS485_TriggerClean_Payload_t payload;
+    memcpy(&payload, req->payload, sizeof(payload));
+
+    /* volume == 0 means "abort" */
+    if (payload.target_volume_ml == 0) {
+        Dispenser_StopSelfClean();
+        RS485_BuildFrame(resp, RS485_ADDR_MASTER, RS485_CMD_ACK, req->header.sequence, NULL, 0);
+        return RS485_OK;
+    }
+
+    DispenserResult_t r = Dispenser_StartSelfClean(payload.target_volume_ml,
+                                                   payload.max_duration_sec);
+    if (r == DISPENSER_RESULT_OK) {
+        RS485_BuildFrame(resp, RS485_ADDR_MASTER, RS485_CMD_ACK, req->header.sequence, NULL, 0);
+    } else {
+        uint8_t reason = (r == DISPENSER_RESULT_BUSY) ? RS485_NAK_BUSY : RS485_NAK_INVALID_PARAM;
+        RS485_BuildFrame(resp, RS485_ADDR_MASTER, RS485_CMD_NAK, req->header.sequence, &reason, 1);
+    }
     return RS485_OK;
 }
 
@@ -278,7 +352,6 @@ static RS485_Result_t handle_debug_cmd(const RS485_Frame_t* req, RS485_Frame_t* 
 /**
  * @brief Update standard device status structure from application variables
  */
-#include "Dispenser_Controller.h"
 
 // ...
 
@@ -309,9 +382,23 @@ static void update_device_status(void)
     
     /* Get last error from Dispenser Controller directly */
     status.error_code = Dispenser_GetLastError();
+
+    /* Self-clean reporting (CCH-orchestrated periodic flush) */
+    if (Dispenser_IsSelfCleaning()) {
+        status.flags |= RS485_STATUS_FLAG_SELF_CLEANING;
+    }
+    status.last_clean_unix_time = Dispenser_GetLastCleanUnixTime();
+
+    /* Fault state machine. Filter life is tracked at CCH (shared filter per site). */
+    status.fault_state          = (uint8_t)Fault_Manager_GetState();
+    status.fault_reason         = (uint8_t)Fault_Manager_GetReason();
+    status.filter_remaining_pct = 0xFF;  /* N/A from slave; CCH derives it */
+
+    /* Pump request (CCH aggregates across all slaves to drive shared pumps) */
+    Dispenser_GetPeripheralRequest(&status.peripheral_request_id, &status.peripheral_request_level);
     
     /* Get card information */
-    status.flags |= (MIFARE_IsCardReady() ? RS485_STATUS_FLAG_CARD_PRESENT : 0);
+    status.flags |= (MIFARE_IsCardPresent() ? RS485_STATUS_FLAG_CARD_PRESENT : 0);
     
     if (MIFARE_IsCardReady()) {
         PN532_CardInfo_t card_info;
@@ -340,12 +427,16 @@ static void rs485_global_log_handler(const char* message, size_t length)
     
     /* Capture for command response */
     if (rs485_cmd_capture.active) {
-        size_t space = sizeof(rs485_cmd_capture.buffer) - rs485_cmd_capture.length - 1;
-        size_t to_copy = (length < space) ? length : space;
-        if (to_copy > 0) {
-            memcpy(&rs485_cmd_capture.buffer[rs485_cmd_capture.length], message, to_copy);
-            rs485_cmd_capture.length += to_copy;
-            rs485_cmd_capture.buffer[rs485_cmd_capture.length] = '\0';
+        /* Only capture output generated by THIS task (the one running the command) */
+        /* This prevents logs from other tasks (e.g. LCD, Dispenser) from corrupting the command output */
+        if (xTaskGetCurrentTaskHandle() == rs485_task_handle) {
+            size_t space = sizeof(rs485_cmd_capture.buffer) - rs485_cmd_capture.length - 1;
+            size_t to_copy = (length < space) ? length : space;
+            if (to_copy > 0) {
+                memcpy(&rs485_cmd_capture.buffer[rs485_cmd_capture.length], message, to_copy);
+                rs485_cmd_capture.length += to_copy;
+                rs485_cmd_capture.buffer[rs485_cmd_capture.length] = '\0';
+            }
         }
     }
 }

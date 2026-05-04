@@ -15,8 +15,8 @@
 
 /**
  * @file RTC_Persistence_Adapter.h
- * @brief BigYellow RTC Persistence Adapter - SD Card Storage
- * @details Implements RTC time persistence using SD card for BigYellow project
+ * @brief MyWota RTC Persistence Adapter - SD Card Storage
+ * @details Implements RTC time persistence using SD card for MyWota project
  */
 
 #include "RTC_Persistence_Interface.h"

@@ -222,7 +222,7 @@ When functionality differs between projects (BigYellow vs MyWota), use the **ada
 **Core files (in sevantica_drivers/):**
 - Shared implementation used by both projects
 - Contains common logic, state management, and interfaces
-- Auto-included via GLOB in sevantica_drivers/CMakeLists.txt
+- Auto-included via per-feature CMake blocks in sevantica_drivers/CMakeLists.txt
 
 **Adapter files (in application/):**
 - Project-specific implementations
@@ -267,7 +267,7 @@ const char* USB_Command_Adapter_GetIncludesInfo(void);
 ✅ **Easy updates** - Bug fixes automatically apply to both projects  
 ✅ **Clear separation** - Project differences isolated in small adapter files  
 ✅ **No duplication** - Common code isn't copied between projects  
-✅ **Build efficiency** - Core files auto-included via GLOB  
+✅ **Build efficiency** - Core files added once to the library CMake feature blocks  
 
 ### When to Use Adapters
 
@@ -285,7 +285,7 @@ Use this pattern when:
 
 This ensures:
 - Single file to maintain (not duplicated per project)
-- Automatic inclusion via sevantica_drivers GLOB
+- Inclusion via sevantica_drivers feature toggles
 - Clear separation of shared vs project-specific code
 
 ## FreeRTOS Task Patterns
@@ -779,16 +779,17 @@ This project uses **explicit source file lists** in project-specific CMakeLists.
 
 ### Shared vs Project-Specific CMakeLists.txt
 
-| Location | Uses GLOB? | Reason |
-|----------|------------|--------|
-| `pico_port/CMakeLists.txt` | **No** - Explicit lists | Project-specific, we control all files |
-| `sevantica_drivers/CMakeLists.txt` | **Yes** - GLOB allowed | Shared library across multiple projects |
+| Location | Source selection | Reason |
+|----------|------------------|--------|
+| `pico_port/CMakeLists.txt` | **Explicit `APP_SOURCES` list** | Project-specific, we control all files |
+| `sevantica_drivers/CMakeLists.txt` | **Explicit, feature-toggled** via `USE_DRIVERS_*` macros read from the parent project's `System_Config.h` | Shared library; each project enables only the drivers it needs |
 
 **Why the difference?**
-- `sevantica_drivers` is in `Common/` and shared by multiple projects
-- Each project may need different driver files
-- GLOB provides flexibility for shared libraries
-- Project-specific files should use explicit lists for reliability
+- `sevantica_drivers` is shared by multiple projects (MyWota, BigYellow, Central Control Hub)
+- Each project enables a different driver set via `USE_DRIVERS_<FEATURE>` macros in its `System_Config.h`
+- The library's CMake reads those macros and conditionally appends sources to `DRIVERS_SOURCES`
+- Headers in the shared library are GLOB'd, but **sources are not** — adding a new `.c` to a feature group requires editing `sevantica_drivers/CMakeLists.txt`
+- Project-specific files use an explicit list for reliability
 
 ### Adding/Removing Application Source Files
 
@@ -812,9 +813,14 @@ set(APP_SOURCES
 ### Adding/Removing Driver Source Files
 
 For the shared `sevantica_drivers` library:
-1. Simply add/remove the `.c` or `.h` file in the appropriate directory
-2. Run CMake configure (`Configure Build` task) to pick up changes
-3. The GLOB pattern will automatically include new files
+1. Add the `.c` file under the appropriate `Source/<Group>/` directory.
+2. **Edit `sevantica_drivers/CMakeLists.txt`** and append the new source to the matching
+   feature-toggled block (e.g. inside the `if(USE_DRIVERS_NFC)` block for an NFC file).
+3. If the file belongs to a brand-new feature, add a new `USE_DRIVERS_<FEATURE>` macro in
+   each project's `System_Config.h` and a matching `if()` block in the library CMake.
+4. Run the `Configure Build` task to pick up the changes.
+
+> Note: only headers are GLOB'd in `sevantica_drivers/CMakeLists.txt`; sources are explicit.
 
 ### Why No GLOB in Project Files?
 

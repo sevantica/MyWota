@@ -15,7 +15,7 @@
 
 /**
  * @file RS485_Command_Adapter.h
- * @brief BigYellow-specific RS485 command handlers
+ * @brief MyWota-specific RS485 command handlers
  * @details Implements car wash control and status commands for RS485 protocol
  */
 
@@ -27,7 +27,7 @@ extern "C" {
 
 /**
  * @brief Initialize RS485 command adapter
- * @details Registers BigYellow-specific RS485 command handlers with the core RS485 task
+ * @details Registers MyWota-specific RS485 command handlers with the core RS485 task
  * @return RS485_OK on success
  */
 RS485_Result_t RS485_Command_Adapter_Init(void);

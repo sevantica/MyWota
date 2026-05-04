@@ -151,8 +151,9 @@ set(MAIN_SOURCES
 set(APP_SOURCES
     ../application/Source/System/FreeRTOS_Static.c
     ../application/Source/System/MyWota_Module.c
-    ../application/Source/System/MyWota_ui_driver.c
+    ../application/Source/System/mywota_ui_driver.c
     ../application/Source/Controllers/Dispenser_Controller.c
+    ../application/Source/Controllers/Fault_Manager.c
     ../application/Source/System/Firmware_Version.c
     ../application/Source/System/Hardware_Access.c
     # IO_Expander_Control.c removed - replaced by IO_Expander_Service in sevantica_drivers
@@ -278,6 +279,7 @@ target_include_directories(UI_PICO_PORT PUBLIC
 target_compile_definitions(UI_PICO_PORT PRIVATE
     LIB_TINYUSB_DEVICE=1
     CFG_TUSB_MCU=OPT_MCU_RP2040
+    USE_DRIVERS_USB=1
 )
 
 # Enable UART output only (USB CDC handled by TinyUSB)

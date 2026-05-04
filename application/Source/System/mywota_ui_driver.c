@@ -137,7 +137,7 @@ static unsigned long elapsed_seconds = 0;            /* Elapsed seconds */
 static uint8_t  screen_switched = 0;
 static uint8_t  card_present = 0;
 static unsigned long start_tick_ms = 0;              /* Start tick */
-static unsigned long last_fps_update_ms = 0;         /* Last FPS tick */
+/* (FPS tracking removed - was unused) */
 static unsigned long last_data_poll_ms = 0;          /* Last data poll tick */
 
 /* UI Display Context */
@@ -202,11 +202,11 @@ static void apply_background_colors_from_config(void);
 /* ========================================================================== */
 /*                         CORE TASK FUNCTION PROTOTYPES                     */
 /* ========================================================================== */
-static void lcd_display_task(void *argument);
+static void LCD_Display_Task(void *argument);
 
 
 
-/* lcd_test_init() and lcd_fill_test() declared in header */
+/* (removed dead lcd_fill_test) */
 
 /* ========================================================================== */
 /*                           MAIN TASK FUNCTION                              */
@@ -228,7 +228,7 @@ static void lvgl_freertos_delay(uint32_t ms)
  * @brief Main LCD Display Driver Task
  * @param argument Task argument (unused)
  */
-static void lcd_display_task(void *argument)
+static void LCD_Display_Task(void *argument)
 {
     (void)argument;
     
@@ -355,7 +355,6 @@ static void lcd_display_task(void *argument)
     /* MAIN TASK LOOP */
     TickType_t xLastWakeTime = xTaskGetTickCount();
     start_tick_ms = xTaskGetTickCount();
-    last_fps_update_ms = start_tick_ms;
     last_data_poll_ms = start_tick_ms;
 
     for(;;) {
@@ -383,8 +382,17 @@ static void lcd_display_task(void *argument)
             continue;
         }
 
-        /* Update LVGL tick counter - must be called regularly for LVGL timing */
-        lv_tick_inc(LVGL_TASK_PERIOD_MS);
+        /* Update LVGL tick counter using actual elapsed time to avoid clock drift
+         * (the loop sleeps a variable amount based on lv_timer_handler) */
+        static TickType_t last_tick_inc = 0;
+        TickType_t tick_now = xTaskGetTickCount();
+        if (last_tick_inc != 0) {
+            uint32_t elapsed_ms = (uint32_t)((tick_now - last_tick_inc) * portTICK_PERIOD_MS);
+            if (elapsed_ms > 0) {
+                lv_tick_inc(elapsed_ms);
+            }
+        }
+        last_tick_inc = tick_now;
 
         /* Handle screen switching - happens only once after defined delay */
         uint32_t screen_switch_delay_seconds = Config_Get()->ui.screen_switch_delay_ms / 1000U;
@@ -424,13 +432,13 @@ static void lcd_display_task(void *argument)
 /**
  * @brief Start the LCD Display Driver Task
  */
-void Task_Start_LCD_Display_Driver_Task()
+void Task_Start_LCD_Display_Task(void)
 {
     if (lcd_task_handle != NULL) {
         LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: Task already running\r\n");
         return;
     }
-    lcd_task_handle = xTaskCreateStatic(lcd_display_task, "LCD_Task", lcd_display_task_stack_size_words, NULL, LCD_DISPLAY_TASK_PRIORITY, lcd_task_stack, &lcd_task_tcb);
+    lcd_task_handle = xTaskCreateStatic(LCD_Display_Task, "LCD_Task", lcd_display_task_stack_size_words, NULL, LCD_DISPLAY_TASK_PRIORITY, lcd_task_stack, &lcd_task_tcb);
 }
 
 /**
@@ -450,37 +458,6 @@ void Task_Stop_LCD_Display_Driver_Task(void)
  * @return Task handle
  */
 TaskHandle_t task_get_handle_LCD_Display_Driver_Task(void) { return lcd_task_handle; }
-
-/**
- * @brief Fill screen with test colors to verify LCD hardware
- */
-void lcd_fill_test(void)
-{
-    LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: Testing screen fill...\r\n");
-    
-    // Create a simple test screen with red color
-    lv_obj_t *scr = lv_screen_active();
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0xFF0000), 0);  // Red
-    lv_obj_invalidate(scr);
-    
-    LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: Screen set to RED, calling lv_timer_handler()...\r\n");
-    lv_timer_handler();
-    vTaskDelay(pdMS_TO_TICKS(500));
-    
-    LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: Changing to GREEN...\r\n");
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x00FF00), 0);  // Green
-    lv_obj_invalidate(scr);
-    lv_timer_handler();
-    vTaskDelay(pdMS_TO_TICKS(500));
-    
-    LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: Changing to BLUE...\r\n");
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x0000FF), 0);  // Blue
-    lv_obj_invalidate(scr);
-    lv_timer_handler();
-    vTaskDelay(pdMS_TO_TICKS(500));
-    
-    LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: Fill test complete\r\n");
-}
 
 /* ========================================================================== */
 /*                           LVGL INTERFACE FUNCTIONS                        */
@@ -787,6 +764,20 @@ static void update_ui_from_system_state(void)
     /* Update legacy variable */
     card_present = card_present_now ? 1 : 0;
     
+    /* DEBUG LOGGING */
+    static uint32_t last_debug_log_time = 0;
+    if ((current_time - last_debug_log_time) > 1000) {
+        last_debug_log_time = current_time;
+        if (is_dispensing) {
+            USB_Log_Printf("UI_DEBUG: Dispensing=1, Card=%d, RemLabel=%p\r\n", 
+                          card_present_now, ui_cardRemaining);
+            if (ui_cardRemaining) {
+                 USB_Log_Printf("UI_DEBUG: Label Hidden=%d\r\n", 
+                               lv_obj_has_flag(ui_cardRemaining, LV_OBJ_FLAG_HIDDEN));
+            }
+        }
+    }
+    
     /* ===== Track dispense stop for cooldown period ===== */
     if (ui_ctx.was_dispensing && !is_dispensing) {
         /* Dispense just stopped - start cooldown period */
@@ -857,8 +848,18 @@ static void update_ui_from_system_state(void)
                 new_customer_id = ui_ctx.last_phone_number;
             }
         } else if (!ui_ctx.showing_persisted_data) {
-            /* No card and not persisting - show configured default */
-            new_customer_id = config->ui.no_card_customer_id;
+            /* No card and not persisting */
+            if (is_dispensing) {
+                /* Manual dispense active - show "Manual" */
+                new_customer_id = "Manual";
+                /* Force visibility for manual mode */
+                if (lv_obj_has_flag(ui_customerID, LV_OBJ_FLAG_HIDDEN)) {
+                    lv_obj_clear_flag(ui_customerID, LV_OBJ_FLAG_HIDDEN);
+                }
+            } else {
+                /* Show configured default */
+                new_customer_id = config->ui.no_card_customer_id;
+            }
         }
         
         /* Only update label if text changed */
@@ -1266,8 +1267,9 @@ static void update_ui_from_system_state(void)
             current_mode = TIMER_MODE_EMPTY;
         }
         
-        /* Force refresh if mode changed */
-        if (current_mode != last_timer_mode || ui_ctx.force_refresh_on_next_update) {
+        /* Force refresh if mode changed OR manual dispense active (to ensure visibility) */
+        if (current_mode != last_timer_mode || ui_ctx.force_refresh_on_next_update ||
+            (is_dispensing && !card_present_now && last_timer_mode != TIMER_MODE_TIME)) {  /* Manual dispense start */
             last_dispense_timer_seconds = 0xFFFFFFFF;  /* Reset all caches */
             last_dispense_token_count = 0xFFFFFFFF;
             last_timer_mode = current_mode;
@@ -1321,6 +1323,12 @@ static void update_ui_from_system_state(void)
             /* Dispense active without card - show remaining volume */
             uint32_t remaining_ml;
             
+            /* Force visibility for manual dispense */
+            if (lv_obj_has_flag(ui_cardRemaining, LV_OBJ_FLAG_HIDDEN)) {
+                lv_obj_clear_flag(ui_cardRemaining, LV_OBJ_FLAG_HIDDEN);
+                LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: Manual dispense - Unhiding ui_cardRemaining\r\n");
+            }
+            
             /* If card was just removed during dispense (persisting), use cached balance */
             if (ui_ctx.showing_persisted_data && ui_ctx.last_card_balance_ml > 0) {
                 remaining_ml = ui_ctx.last_card_balance_ml;
@@ -1343,6 +1351,7 @@ static void update_ui_from_system_state(void)
                     snprintf(balance_str, sizeof(balance_str), "%lu L", 
                              remaining_ml / 1000);
                 }
+                LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: Manual dispense - Updating text to '%s' (ml=%lu)\r\n", balance_str, remaining_ml);
                 lv_label_set_text(ui_cardRemaining, balance_str);
             }
             

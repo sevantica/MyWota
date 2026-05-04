@@ -12,8 +12,8 @@
 
 /**
  * @file RS485_Command_Adapter.c
- * @brief BigYellow RS485 Command Handlers
- * @details Implements project-specific RS485 commands for car wash control
+ * @brief MyWota RS485 Command Handlers
+ * @details Implements project-specific RS485 commands for water dispenser control
  */
 
 /* Includes ------------------------------------------------------------------*/
@@ -26,7 +26,13 @@
 #include "Application_Interface.h"
 #include "USB_Logging.h"
 #include "Firmware_Version.h"
+#include "pico/unique_id.h"
 #include <string.h>
+
+/* Hardware Revision --------------------------------------------------------*/
+#ifndef RS485_ADAPTER_HW_REVISION
+#define RS485_ADAPTER_HW_REVISION  1u
+#endif
 
 /* Logging Configuration -----------------------------------------------------*/
 #define LOG_DEBUG_RS485_ADAPTER_EN  1
@@ -50,7 +56,7 @@ static void rs485_send_response(uint8_t sequence, RS485_Command_t command,
 
 /* Command Table -------------------------------------------------------------*/
 static const RS485_Command_Entry_t adapter_commands[] = {
-    {RS485_CMD_POLL_STATUS,    cmd_poll_status,      "Poll car wash status"},
+    {RS485_CMD_POLL_STATUS,    cmd_poll_status,      "Poll dispenser status"},
     {RS485_CMD_GET_INFO,       cmd_get_device_info,  "Get device information"},
     {RS485_CMD_GET_CONFIG,     cmd_get_config,       "Get configuration"},
 };
@@ -58,7 +64,7 @@ static const RS485_Command_Entry_t adapter_commands[] = {
 static const RS485_Command_Interface_t command_interface = {
     .commands = adapter_commands,
     .command_count = sizeof(adapter_commands) / sizeof(adapter_commands[0]),
-    .project_name = "BigYellow Car Wash"
+    .project_name = "MyWota Water Dispenser"
 };
 
 /* Public Functions ----------------------------------------------------------*/
@@ -68,7 +74,7 @@ static const RS485_Command_Interface_t command_interface = {
  */
 RS485_Result_t RS485_Command_Adapter_Init(void)
 {
-    LOG_DEBUG_ADAPTER("[RS485_ADAPTER] Registering %zu BigYellow commands\r\n", 
+    LOG_DEBUG_ADAPTER("[RS485_ADAPTER] Registering %zu MyWota commands\r\n", 
                       command_interface.command_count);
     
     RS485_Result_t result = RS485_RegisterCommandInterface(&command_interface);
@@ -118,6 +124,9 @@ static bool cmd_poll_status(const RS485_Frame_t *rx_frame, uint8_t sequence)
             }
         }
     }
+
+    /* Pressure / booster pump request (CCH aggregates across all slaves). */
+    Dispenser_GetPeripheralRequest(&status.peripheral_request_id, &status.peripheral_request_level);
     
     /* Get card information if available */
     if (MIFARE_IsCardReady()) {
@@ -164,11 +173,17 @@ static bool cmd_get_device_info(const RS485_Frame_t *rx_frame, uint8_t sequence)
     info.fw_version_minor = FW_VERSION_MINOR;
     info.fw_version_patch = FW_VERSION_PATCH;
     
-    /* Serial number (could be from flash or unique ID) */
-    info.serial_number = 0x12345678;  /* TODO: Get from unique chip ID */
-    
+    /* Serial number from RP2040/RP2350 unique flash board ID (folded to 32 bits) */
+    pico_unique_board_id_t board_id;
+    pico_get_unique_board_id(&board_id);
+    uint32_t lo = ((uint32_t)board_id.id[0])       | ((uint32_t)board_id.id[1] << 8) |
+                  ((uint32_t)board_id.id[2] << 16) | ((uint32_t)board_id.id[3] << 24);
+    uint32_t hi = ((uint32_t)board_id.id[4])       | ((uint32_t)board_id.id[5] << 8) |
+                  ((uint32_t)board_id.id[6] << 16) | ((uint32_t)board_id.id[7] << 24);
+    info.serial_number = lo ^ hi;
+
     /* Hardware revision */
-    info.hw_revision = 1;  /* TODO: Define hardware revision */
+    info.hw_revision = RS485_ADAPTER_HW_REVISION;
     
     /* Capabilities */
     info.capabilities = 0;

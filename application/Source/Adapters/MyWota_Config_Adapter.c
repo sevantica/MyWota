@@ -11,9 +11,9 @@
  */
 
 /**
- * @file BigYellow_Config_Adapter.c
- * @brief BigYellow System Configuration Adapter
- * @details Defines the configuration schema, defaults, and callbacks for BigYellow
+ * @file MyWota_Config_Adapter.c
+ * @brief MyWota System Configuration Adapter
+ * @details Defines the configuration schema, defaults, and callbacks for MyWota
  */
 
 /* Includes ------------------------------------------------------------------*/

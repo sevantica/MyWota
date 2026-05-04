@@ -12,7 +12,7 @@
 
 /**
  * @file SD_Logger_Format_Adapter.c
- * @brief BigYellow SD Logger Format Adapter
+ * @brief MyWota SD Logger Format Adapter
  * @details Implements log formatting for MIFARE transactions and car wash events
  */
 
@@ -216,12 +216,12 @@ static int get_card_log_filename(const void* data, char* buffer, size_t buffer_s
 /*                          Interface Definition                              */
 /*===========================================================================*/
 
-static const SD_Log_Format_Interface_t bigyellow_format_interface = {
+static const SD_Log_Format_Interface_t mywota_format_interface = {
     .format_transaction = format_transaction,
     .format_card_scan = format_card_scan,
     .format_system_event = format_system_event,
     .get_card_log_filename = get_card_log_filename,
-    .project_name = "BigYellow"
+    .project_name = "MyWota"
 };
 
 /*===========================================================================*/
@@ -233,12 +233,12 @@ static const SD_Log_Format_Interface_t bigyellow_format_interface = {
  */
 SD_Log_Result_t SD_Logger_Format_Adapter_Init(void)
 {
-    LOG_DEBUG_FORMAT("[SD_FORMAT] Registering BigYellow log formatters...\r\n");
+    LOG_DEBUG_FORMAT("[SD_FORMAT] Registering MyWota log formatters...\r\n");
     
-    SD_Log_Result_t result = SD_Log_RegisterFormat(&bigyellow_format_interface);
+    SD_Log_Result_t result = SD_Log_RegisterFormat(&mywota_format_interface);
     
     if (result == SD_LOG_OK) {
-        LOG_DEBUG_FORMAT("[SD_FORMAT] BigYellow log formatters registered\r\n");
+        LOG_DEBUG_FORMAT("[SD_FORMAT] MyWota log formatters registered\r\n");
     } else {
         USB_Log_Printf("[SD_FORMAT] Failed to register log formatters\r\n");
     }

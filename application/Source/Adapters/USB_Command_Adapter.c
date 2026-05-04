@@ -12,8 +12,8 @@
 
 /**
  * @file USB_Command_Adapter.c
- * @brief BigYellow project-specific USB commands (car wash system)
- * @details Implements token-based wash commands and status display
+ * @brief MyWota project-specific USB commands (water dispenser system)
+ * @details Implements volume-based dispenser commands and status display
  */
 
 /* Includes ------------------------------------------------------------------*/
@@ -23,6 +23,8 @@
 #include "MIFARE_Transaction_Core.h"
 #include "Module_Interface.h"
 #include "MyWota_System.h"
+#include "Fault_Manager.h"
+#include "System_Config.h"
 #include <stdlib.h>
 #include <string.h>
 #include "FreeRTOS.h"
@@ -30,10 +32,14 @@
 
 /* Private function prototypes -----------------------------------------------*/
 static USB_Command_Status_t cmd_dispenser(int argc, char** argv);
+static USB_Command_Status_t cmd_clean(int argc, char** argv);
+static USB_Command_Status_t cmd_fault(int argc, char** argv);
 
 /* Private variables ---------------------------------------------------------*/
 static const USB_Command_Adapter_Entry_t adapter_commands[] = {
     {"dispenser", cmd_dispenser, "Dispenser commands (start, stop, topup)", "dispenser <cmd>"},
+    {"clean",     cmd_clean,     "Self-clean (start [vol_ml] [max_sec] | stop | status)", "clean <cmd>"},
+    {"fault",     cmd_fault,     "Fault state machine (status | clear)",                   "fault <cmd>"},
 };
 
 static const size_t adapter_command_count = sizeof(adapter_commands) / sizeof(adapter_commands[0]);
@@ -169,4 +175,80 @@ static USB_Command_Status_t cmd_dispenser(int argc, char** argv)
     return USB_CMD_ERROR_UNKNOWN_COMMAND;
 }
 
+/**
+ * @brief Self-clean command handler.
+ *
+ * Subcommands:
+ *   start [vol_ml] [max_sec]   - Start a clean cycle (config defaults if 0/missing)
+ *   stop                       - Abort an in-progress clean
+ *   status                     - Show current clean state
+ */
+static USB_Command_Status_t cmd_clean(int argc, char** argv)
+{
+    if (argc < 2) {
+        USB_Log_Printf("Usage: clean <start [vol_ml] [max_sec] | stop | status>\r\n");
+        return USB_CMD_ERROR_INVALID_PARAM;
+    }
+    const char* sub = argv[1];
+
+    if (strcmp(sub, "start") == 0) {
+        uint32_t vol = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 0;
+        uint32_t sec = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 0;
+        DispenserResult_t r = Dispenser_StartSelfClean(vol, sec);
+        if (r == DISPENSER_RESULT_OK) {
+            USB_Log_Printf("[→] Self-clean started\r\n");
+            return USB_CMD_OK;
+        }
+        USB_Log_Printf("[✗] Self-clean refused (result=%d)\r\n", r);
+        return USB_CMD_ERROR;
+    }
+    if (strcmp(sub, "stop") == 0) {
+        Dispenser_StopSelfClean();
+        USB_Log_Printf("[→] Self-clean stop requested\r\n");
+        return USB_CMD_OK;
+    }
+    if (strcmp(sub, "status") == 0) {
+        USB_Log_Printf("Self-clean active: %s\r\n",
+                       Dispenser_IsSelfCleaning() ? "YES" : "no");
+        USB_Log_Printf("Last clean (unix): %lu\r\n",
+                       (unsigned long)Dispenser_GetLastCleanUnixTime());
+        return USB_CMD_OK;
+    }
+
+    USB_Log_Printf("[✗] Unknown clean subcommand: %s\r\n", sub);
+    return USB_CMD_ERROR_UNKNOWN_COMMAND;
+}
+
+
+/**
+ * @brief Fault state machine inspection / clear.
+ *   fault status   - print current state and reason
+ *   fault clear    - clear latched FAULT (operator action)
+ */
+static USB_Command_Status_t cmd_fault(int argc, char** argv)
+{
+    if (argc < 2) {
+        USB_Log_Printf("Usage: fault <status|clear>\r\n");
+        return USB_CMD_ERROR_INVALID_PARAM;
+    }
+    const char* sub = argv[1];
+
+    if (strcmp(sub, "status") == 0) {
+        USB_Log_Printf("Fault state:       %s\r\n",
+                       Fault_Manager_GetStateString(Fault_Manager_GetState()));
+        USB_Log_Printf("Fault reason:      %s\r\n",
+                       Fault_Manager_GetReasonString(Fault_Manager_GetReason()));
+        USB_Log_Printf("Incidents (boot):  %lu\r\n",
+                       (unsigned long)Fault_Manager_GetIncidentCount());
+        return USB_CMD_OK;
+    }
+    if (strcmp(sub, "clear") == 0) {
+        Fault_Manager_Clear();
+        USB_Log_Printf("[✓] Fault cleared\r\n");
+        return USB_CMD_OK;
+    }
+
+    USB_Log_Printf("[✗] Unknown fault subcommand: %s\r\n", sub);
+    return USB_CMD_ERROR_UNKNOWN_COMMAND;
+}
 

@@ -108,12 +108,8 @@ RTC_Status_t RTC_GetDateTime(RTC_DateTime_t *datetime)
         return RTC_ERROR_INVALID_PARAM;
     }
     
-    // Update current time based on elapsed ticks
-    TickType_t current_tick = xTaskGetTickCount();
-    TickType_t elapsed_ticks = current_tick - last_tick;
-    time_t elapsed_seconds = pdTICKS_TO_MS(elapsed_ticks) / 1000;
-    
-    time_t current_time = current_time_unix + elapsed_seconds;
+    // Get current time (re-anchors tick base to prevent 32-bit overflow)
+    time_t current_time = RTC_GetUnixTime();
     
     // Convert to datetime structure
     unix_to_datetime(current_time, datetime);
@@ -127,12 +123,18 @@ time_t RTC_GetUnixTime(void)
         return 0;
     }
     
-    // Update current time based on elapsed ticks
+    // Calculate elapsed time and re-anchor to prevent 32-bit tick overflow (~49.7 days)
     TickType_t current_tick = xTaskGetTickCount();
     TickType_t elapsed_ticks = current_tick - last_tick;
     time_t elapsed_seconds = pdTICKS_TO_MS(elapsed_ticks) / 1000;
     
-    return current_time_unix + elapsed_seconds;
+    if (elapsed_seconds > 0) {
+        // Re-anchor: fold elapsed time into base and reset tick reference
+        current_time_unix += elapsed_seconds;
+        last_tick = current_tick;
+    }
+    
+    return current_time_unix;
 }
 
 bool RTC_IsSynchronized(void)
@@ -214,7 +216,7 @@ RTC_Status_t RTC_SaveToSD(void)
     }
     
     // Open/create RTC file
-    static FIL file;
+    FIL file;
     FRESULT result = f_open(&file, RTC_FILE_PATH, FA_CREATE_ALWAYS | FA_WRITE);
     if (result != FR_OK) {
         LOG_ERROR_RTC("[RTC] ✗ Failed to open RTC file for write: %d\r\n", result);
@@ -243,7 +245,7 @@ RTC_Status_t RTC_LoadFromSD(void)
     }
     
     // Open RTC file
-    static FIL file;
+    FIL file;
     FRESULT result = f_open(&file, RTC_FILE_PATH, FA_READ);
     if (result != FR_OK) {
         LOG_DEBUG_RTC("[RTC] No saved time found on SD card\r\n");

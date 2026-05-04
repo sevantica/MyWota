@@ -18,7 +18,7 @@
 #include <stdint.h>
 
 /**
- * @brief BigYellow USB Command Adapter
+ * @brief MyWota USB Command Adapter
  * @details Provides project-specific USB command implementations for car wash system:
  *          - washstart/washstop commands
  *          - Token-based balance display
