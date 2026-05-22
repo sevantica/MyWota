@@ -2,7 +2,7 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "Configure Build",
+            "label": "MyWota - Configure Build",
             "type": "shell",
             "command": "powershell",
             "args": [
@@ -20,7 +20,7 @@
             "problemMatcher": []
         },
         {
-            "label": "Build",
+            "label": "MyWota - Build",
             "type": "process",
             "command": "${env:USERPROFILE}/.pico-sdk/ninja/v1.12.1/ninja.exe",
             "args": [
@@ -39,7 +39,7 @@
             "problemMatcher": "$gcc"
         },
         {
-            "label": "Clean Build",
+            "label": "MyWota - Clean Build",
             "type": "shell",
             "command": "powershell",
             "args": [
@@ -57,11 +57,11 @@
             "problemMatcher": []
         },
         {
-            "label": "Clean and Build",
+            "label": "MyWota - Clean and Build",
             "dependsOrder": "sequence",
             "dependsOn": [
-                "Clean Build",
-                "Build"
+                "MyWota - Clean Build",
+                "MyWota - Build"
             ],
             "group": "build",
             "presentation": {
@@ -71,7 +71,7 @@
             "problemMatcher": []
         },
         {
-            "label": "Flash with Picotool",
+            "label": "MyWota - Flash with Picotool",
             "type": "shell",
             "command": "powershell",
             "args": [
@@ -91,11 +91,11 @@
             "problemMatcher": []
         },
         {
-            "label": "Build and Flash (Picotool)",
+            "label": "MyWota - Build and Flash (Picotool)",
             "dependsOrder": "sequence",
             "dependsOn": [
-                "Build",
-                "Flash with Picotool"
+                "MyWota - Build",
+                "MyWota - Flash with Picotool"
             ],
             "group": "build",
             "presentation": {
@@ -105,7 +105,7 @@
             "problemMatcher": []
         },
         {
-            "label": "Flash with Bootloader",
+            "label": "MyWota - Flash with Bootloader",
             "type": "shell",
             "command": "powershell",
             "args": [
@@ -126,11 +126,11 @@
             "problemMatcher": []
         },
         {
-            "label": "Build and Flash with Bootloader",
+            "label": "MyWota - Build and Flash with Bootloader",
             "dependsOrder": "sequence",
             "dependsOn": [
-                "Build",
-                "Flash with Bootloader"
+                "MyWota - Build",
+                "MyWota - Flash with Bootloader"
             ],
             "group": "build",
             "presentation": {

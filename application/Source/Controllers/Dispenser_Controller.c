@@ -25,6 +25,7 @@
 #include "Dispenser_Controller.h"
 #include "Application_Interface.h"
 #include "MIFARE_Transaction_Core.h"
+#include "MIFARE_Async_Mailbox.h"
 #include "MyWota_IO_Expander_Adapter.h"
 #include "USB_Logging.h"
 #include "USB_Command_Handler.h"
@@ -71,6 +72,44 @@
 #define DISPENSER_LOG(fmt, ...) DISPENSER_DEBUG(fmt, ##__VA_ARGS__)
 
 /*Private variables -------------------------------------------------*/
+
+static MIFARE_Result_t dispenser_wait_for_async_result(uint32_t timeout_ms)
+{
+    MIFARE_Result_t result = MIFARE_RESULT_BUSY;
+
+    TickType_t start_tick = xTaskGetTickCount();
+    while (pdTICKS_TO_MS(xTaskGetTickCount() - start_tick) <= (timeout_ms + 100u)) {
+        MIFARE_AsyncStatus_t status = MIFARE_GetAsyncStatus(&result);
+        if (status == MIFARE_ASYNC_STATUS_SUCCESS) {
+            return MIFARE_RESULT_OK;
+        }
+        if (status == MIFARE_ASYNC_STATUS_FAIL) {
+            return result;
+        }
+        if (status == MIFARE_ASYNC_STATUS_TIMEOUT) {
+            return MIFARE_RESULT_TIMEOUT;
+        }
+        if (status == MIFARE_ASYNC_STATUS_CANCELLED) {
+            return MIFARE_RESULT_ERROR;
+        }
+
+        System_ReportTaskStatus(SYSTEM_TASK_ID_DISPENSER, true);
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    return MIFARE_RESULT_TIMEOUT;
+}
+
+static MIFARE_Result_t dispenser_request_card_update(bool fast)
+{
+    const uint32_t timeout_ms = 2500;
+
+    if (!MIFARE_RequestUpdateCardAsync(fast, timeout_ms)) {
+        return MIFARE_RESULT_BUSY;
+    }
+
+    return dispenser_wait_for_async_result(timeout_ms);
+}
 
 /* Note: DispenserState_t enum is defined in Dispenser_Controller.h */
 
@@ -141,6 +180,7 @@ static void dispenser_valve_close(void);
 static const char* dispenser_get_valve_state_name(ValveState_t state);
 static void dispenser_self_clean_finish(bool success, const char* reason);
 static void dispenser_self_clean_step(void);
+static void dispenser_clear_wait_for_flow_mode(void);
 
 /*Public Functions ---------------------------------------------------*/
 
@@ -249,6 +289,9 @@ static void dispenser_start_dispense_internal(bool no_card_mode, uint32_t target
     
     g_no_card_mode = no_card_mode;
     g_target_volume_ml = target_ml;
+    if (no_card_mode) {
+        dispenser_clear_wait_for_flow_mode();
+    }
     
     g_dispense_timer.dispense_start_time = xTaskGetTickCount();
     g_dispense_timer.last_deduction_time = g_dispense_timer.dispense_start_time;
@@ -546,8 +589,8 @@ static bool dispense(uint32_t elapsed_ms)
             // Feed watchdog before potentially long MIFARE operations
             System_ReportTaskStatus(SYSTEM_TASK_ID_DISPENSER, true);
             
-            // Perform write (Fast or Full based on interval)
-            MIFARE_Result_t result = MIFARE_UpdateCardData(is_fast_write);
+            // Request write from the MIFARE polling task (Fast or Full based on interval)
+            MIFARE_Result_t result = dispenser_request_card_update(is_fast_write);
             
             if (result == MIFARE_RESULT_OK) {
 #if LOG_DEBUG_DISPENSER_EN
@@ -580,7 +623,7 @@ static bool dispense(uint32_t elapsed_ms)
                 // Feed WDT before PN532 poll
                 System_ReportTaskStatus(SYSTEM_TASK_ID_DISPENSER, true);
                 
-                MIFARE_Result_t verify_result = MIFARE_VerifyCardPresence();
+                MIFARE_Result_t verify_result = MIFARE_SyncStateWithHardware();
                 if (verify_result != MIFARE_RESULT_OK) {
                     // Card is confirmed removed
                     DISPENSER_CRITICAL("[✗] Card removal CONFIRMED by PN532 poll");
@@ -672,6 +715,17 @@ DispenserResult_t MIFARE_Dispenser_GetStatus(DispenserStatus_t *status)
  */
 DispenserResult_t MIFARE_Dispenser_EmergencyStop(void)
 {
+    if (g_self_clean_active) {
+        dispenser_self_clean_finish(false, "emergency stop");
+        return DISPENSER_RESULT_OK;
+    }
+
+    if (!g_dispense_timer.dispense_active && g_wait_for_flow_mode) {
+        dispenser_clear_wait_for_flow_mode();
+        DISPENSER_CRITICAL("[✓] Wait-and-dispense cancelled - emergency stop");
+        return DISPENSER_RESULT_OK;
+    }
+
     dispenser_stop_dispense("Emergency stop", RS485_ERR_EMERGENCY_STOP);
     return DISPENSER_RESULT_OK;
 }
@@ -687,6 +741,11 @@ DispenserResult_t MIFARE_Dispenser_ManualStart(uint32_t target_ml)
     if (g_dispense_timer.dispense_active) {
         DISPENSER_ERROR("Manual start failed - dispense already in progress");
         return DISPENSER_RESULT_ERROR;
+    }
+
+    if (g_wait_for_flow_mode) {
+        DISPENSER_ERROR("Manual start failed - wait-and-dispense is armed");
+        return DISPENSER_RESULT_BUSY;
     }
     
     // Use the unified dispense start in no-card mode
@@ -736,6 +795,12 @@ DispenserResult_t MIFARE_Dispenser_WaitAndDispense(uint32_t max_volume_ml)
 DispenserResult_t MIFARE_Dispenser_ManualStop(void)
 {
     if (!g_dispense_timer.dispense_active) {
+        if (g_wait_for_flow_mode) {
+            dispenser_clear_wait_for_flow_mode();
+            DISPENSER_CRITICAL("[✓] Wait-and-dispense cancelled - manual stop");
+            return DISPENSER_RESULT_OK;
+        }
+
         DISPENSER_DEBUG("Manual stop - no dispense active");
         return DISPENSER_RESULT_OK;
     }
@@ -808,6 +873,11 @@ static void MIFARE_Dispenser_Task(void* argument)
             case DISPENSER_IDLE:
                 // Only check for card in card mode
                 if (!g_no_card_mode && card_ready) {
+                    if (MIFARE_IsAdminCard()) {
+                        DISPENSER_DEBUG("IDLE: Admin card present - no auto-dispense");
+                        break;
+                    }
+
                     // Get MIFARE state to check if auto-dispense is allowed
                     MIFARE_TransactionState_t mifare_state = MIFARE_GetTransactionState();
                     
@@ -1064,6 +1134,60 @@ float Dispenser_GetFlowRateLPM(void)
 }
 
 /* ---------------------------------------------------------------------------
+ * Flow diagnostics ring (consumed by RS485 status responder).
+ * Each call to Dispenser_SampleFlowDiagnostics() advances the ring with the
+ * current instantaneous flow rate so the master can compute min/max even when
+ * its effective sampling period exceeds 1 s (multiple slaves share the bus).
+ * ------------------------------------------------------------------------ */
+
+#define FLOW_DIAG_RING_DEPTH 8u
+static uint16_t s_flow_diag_ring[FLOW_DIAG_RING_DEPTH] = {0};
+static uint8_t  s_flow_diag_ring_head = 0;
+static uint8_t  s_flow_diag_ring_count = 0;
+
+void Dispenser_SampleFlowDiagnostics(uint16_t *flow_clpm,
+                                     uint16_t *flow_clpm_min,
+                                     uint16_t *flow_clpm_max)
+{
+    /* Convert L/min -> centiL/min, clamp to uint16 range. */
+    uint16_t clpm = 0;
+    if (g_flow_sensor_initialized) {
+        YS_S201_FlowData_t flow_data;
+        if (YS_S201_GetFlowData(&g_flow_sensor_handle, &flow_data) == YS_S201_OK) {
+            float v = flow_data.flow_rate_lpm * 100.0f;
+            if (v < 0.0f) v = 0.0f;
+            if (v > 65000.0f) v = 65000.0f;   /* leave 0xFFFF for "unknown" */
+            clpm = (uint16_t)v;
+        }
+    }
+
+    /* Push into ring */
+    s_flow_diag_ring[s_flow_diag_ring_head] = clpm;
+    s_flow_diag_ring_head = (uint8_t)((s_flow_diag_ring_head + 1u) % FLOW_DIAG_RING_DEPTH);
+    if (s_flow_diag_ring_count < FLOW_DIAG_RING_DEPTH) {
+        s_flow_diag_ring_count++;
+    }
+
+    /* Compute min/max across populated entries */
+    uint16_t mn = clpm;
+    uint16_t mx = clpm;
+    for (uint8_t i = 0; i < s_flow_diag_ring_count; i++) {
+        uint16_t v = s_flow_diag_ring[i];
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+    }
+
+    if (flow_clpm)     *flow_clpm     = clpm;
+    if (flow_clpm_min) *flow_clpm_min = mn;
+    if (flow_clpm_max) *flow_clpm_max = mx;
+}
+
+bool Dispenser_IsValveCommanded(void)
+{
+    return Dispenser_GetValveState() == VALVE_OPEN;
+}
+
+/* ---------------------------------------------------------------------------
  * Self-Clean (CCH-orchestrated periodic flush)
  * ------------------------------------------------------------------------ */
 
@@ -1093,6 +1217,10 @@ DispenserResult_t Dispenser_StartSelfClean(uint32_t volume_ml, uint32_t max_dura
     }
     if (g_dispense_timer.dispense_active || g_dispenser_state != DISPENSER_IDLE) {
         DISPENSER_ERROR("[✗] Self-clean refused: dispenser not idle (state=%d)", g_dispenser_state);
+        return DISPENSER_RESULT_BUSY;
+    }
+    if (g_wait_for_flow_mode) {
+        DISPENSER_ERROR("[✗] Self-clean refused: wait-and-dispense is armed");
         return DISPENSER_RESULT_BUSY;
     }
     if (MIFARE_IsCardPresent()) {
@@ -1221,6 +1349,13 @@ static void dispenser_self_clean_finish(bool success, const char* reason)
     }
 }
 
+static void dispenser_clear_wait_for_flow_mode(void)
+{
+    g_wait_for_flow_mode = false;
+    g_max_dispense_volume_ml = 0;
+    g_flow_started = false;
+}
+
 /**
  * @brief Initialize new customer card with balance
  * @param initial_balance_ml Initial balance in milliliters
@@ -1231,7 +1366,11 @@ DispenserResult_t MIFARE_Dispenser_InitializeNewCustomer(uint32_t initial_balanc
 {
     DISPENSER_LOG("Initializing new customer card with %lu ml balance", initial_balance_ml);
     
-    MIFARE_Result_t result = MIFARE_InitializeNewCustomerCard(initial_balance_ml, customer_id, false);
+    const uint32_t timeout_ms = 10000;
+    MIFARE_Result_t result = MIFARE_RESULT_BUSY;
+    if (MIFARE_RequestInitCardAsync(initial_balance_ml, customer_id, timeout_ms)) {
+        result = dispenser_wait_for_async_result(timeout_ms);
+    }
     
     if (result == MIFARE_RESULT_OK) {
         DISPENSER_CRITICAL("[\u2713] New customer initialized with %lu ml balance", initial_balance_ml);
@@ -1256,7 +1395,11 @@ DispenserResult_t MIFARE_Dispenser_TopupCard(uint32_t topup_ml)
     
     DISPENSER_LOG("Adding %lu ml to card", topup_ml);
     
-    MIFARE_Result_t result = MIFARE_TopupCardBalance(topup_ml);
+    const uint32_t timeout_ms = 5000;
+    MIFARE_Result_t result = MIFARE_RESULT_BUSY;
+    if (MIFARE_RequestTopupAsync(topup_ml, timeout_ms)) {
+        result = dispenser_wait_for_async_result(timeout_ms);
+    }
     
     if (result == MIFARE_RESULT_OK) {
         DISPENSER_CRITICAL("[\u2713] Added %lu ml to card", topup_ml);
@@ -1515,6 +1658,33 @@ static void dispenser_app_task_stop(void)
     Task_Stop_Dispenser_Task();
 }
 
+/**
+ * @brief Application interface: Trigger self-clean cycle
+ */
+static Application_Result_t dispenser_app_trigger_clean(uint32_t volume_ml, uint32_t max_sec)
+{
+    DispenserResult_t r = Dispenser_StartSelfClean(volume_ml, max_sec);
+    return (r == DISPENSER_RESULT_OK) ? APP_RESULT_OK : APP_RESULT_ERROR;
+}
+
+/**
+ * @brief Application interface: Abort self-clean cycle
+ */
+static Application_Result_t dispenser_app_abort_clean(void)
+{
+    Dispenser_StopSelfClean();
+    return APP_RESULT_OK;
+}
+
+/**
+ * @brief Application interface: Clear latched fault
+ */
+static Application_Result_t dispenser_app_clear_fault(void)
+{
+    Fault_Manager_Clear();
+    return APP_RESULT_OK;
+}
+
 /* Application Interface Callbacks -------------------------------------------*/
 static const Application_Callbacks_t s_dispenser_callbacks = {
     .init = dispenser_app_init,
@@ -1530,7 +1700,10 @@ static const Application_Callbacks_t s_dispenser_callbacks = {
     .get_secondary_balance = dispenser_app_get_secondary_balance,
     .get_status_string = dispenser_app_get_status_string,
     .task_start = dispenser_app_task_start,
-    .task_stop = dispenser_app_task_stop
+    .task_stop = dispenser_app_task_stop,
+    .trigger_clean = dispenser_app_trigger_clean,
+    .abort_clean = dispenser_app_abort_clean,
+    .clear_fault = dispenser_app_clear_fault
 };
 
 /* Application Interface Instance --------------------------------------------*/

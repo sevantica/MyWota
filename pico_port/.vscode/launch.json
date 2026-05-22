@@ -2,7 +2,7 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Build and Flash with Bootloader",
+            "name": "MyWota - Build and Flash with Bootloader",
             "type": "cppdbg",
             "request": "launch",
             "program": "${workspaceFolder}/build/UI_PICO_PORT.elf",
@@ -13,7 +13,7 @@
             "externalConsole": false,
             "MIMode": "gdb",
             "miDebuggerPath": "${env:USERPROFILE}/.pico-sdk/toolchain/14_2_Rel1/bin/arm-none-eabi-gdb.exe",
-            "preLaunchTask": "Build and Flash with Bootloader",
+            "preLaunchTask": "MyWota - Build and Flash with Bootloader",
             "setupCommands": [
                 {
                     "description": "Enable pretty-printing for gdb",
@@ -28,7 +28,7 @@
             }
         },
         {
-            "name": "Flash Only with Bootloader",
+            "name": "MyWota - Flash Only with Bootloader",
             "type": "cppdbg",
             "request": "launch",
             "program": "${workspaceFolder}/build/UI_PICO_PORT.elf",
@@ -39,7 +39,7 @@
             "externalConsole": false,
             "MIMode": "gdb",
             "miDebuggerPath": "${env:USERPROFILE}/.pico-sdk/toolchain/14_2_Rel1/bin/arm-none-eabi-gdb.exe",
-            "preLaunchTask": "Flash with Bootloader",
+            "preLaunchTask": "MyWota - Flash with Bootloader",
             "setupCommands": [
                 {
                     "description": "Enable pretty-printing for gdb",
@@ -49,7 +49,7 @@
             ]
         },
         {
-            "name": "Build Only",
+            "name": "MyWota - Build Only",
             "type": "cppdbg",
             "request": "launch",
             "program": "${workspaceFolder}/build/UI_PICO_PORT.elf",
@@ -60,7 +60,7 @@
             "externalConsole": false,
             "MIMode": "gdb",
             "miDebuggerPath": "${env:USERPROFILE}/.pico-sdk/toolchain/14_2_Rel1/bin/arm-none-eabi-gdb.exe",
-            "preLaunchTask": "Build",
+            "preLaunchTask": "MyWota - Build",
             "setupCommands": [
                 {
                     "description": "Enable pretty-printing for gdb",

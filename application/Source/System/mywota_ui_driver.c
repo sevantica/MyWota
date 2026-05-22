@@ -36,6 +36,7 @@
 #include "MIFARE_Transaction_Core.h"  /* For getter functions */
 #include "Dispenser_Controller.h"        /* For dispenser functions */
 #include "System_Config.h"                /* For SD card configuration */
+#include "USB_Command_Handler.h"
 #ifdef LV_USE_ILI9341
 #include "display/ili9341/lv_ili9341.h"
 #endif
@@ -750,9 +751,14 @@ static void update_ui_from_system_state(void)
     uint32_t card_balance_tokens = MIFARE_GetBalance();
     MIFARE_CardState_t card_state = MIFARE_GetCardState();
     MIFARE_TransactionState_t txn_state = MIFARE_GetTransactionState();
+    bool admin_card_present = MIFARE_IsAdminCard();
+    USB_PendingCommandState_t* pending_card_command = USB_Command_GetPendingCommand();
+    bool card_process_waiting_for_tap = (pending_card_command != NULL &&
+                                         pending_card_command->active &&
+                                         card_state == MIFARE_CARD_STATE_ABSENT);
     bool card_present_now = (card_state == MIFARE_CARD_STATE_PRESENT || 
                              card_state == MIFARE_CARD_STATE_NEEDS_POLLING_CYCLE);
-    bool card_authenticated = (card_state == MIFARE_CARD_STATE_PRESENT && card_balance_tokens > 0);
+    bool card_authenticated = (card_state == MIFARE_CARD_STATE_PRESENT && (card_balance_tokens > 0 || admin_card_present));
     
     /* Cache balance when card is ready (before error states can clear it) */
     if (card_state == MIFARE_CARD_STATE_PRESENT && card_balance_tokens > 0) {
@@ -839,7 +845,9 @@ static void update_ui_from_system_state(void)
     if (ui_customerID != NULL) {
         const char* new_customer_id = NULL;
         
-        if (card_state == MIFARE_CARD_STATE_PRESENT) {
+        if (admin_card_present) {
+            new_customer_id = "Admin";
+        } else if (card_state == MIFARE_CARD_STATE_PRESENT) {
             /* Card present - get and cache phone number */
             char phone_str[12];
             if (MIFARE_GetCustomerPhoneNumber(phone_str, sizeof(phone_str))) {
@@ -900,7 +908,7 @@ static void update_ui_from_system_state(void)
         should_show_error = true;
     } else if (card_state == MIFARE_CARD_STATE_ABSENT && !ui_ctx.in_cooldown) {
         /* No card present (only show after cooldown expires) */
-        error_text = "No Card";
+        error_text = card_process_waiting_for_tap ? "Tap Card" : "No Card";
         should_show_error = true;
     } else if (card_state == MIFARE_CARD_STATE_PRESENT && 
                txn_state == TRANSACTION_STATE_WAITING_REMOVAL) {
@@ -909,6 +917,8 @@ static void update_ui_from_system_state(void)
     } else if (card_state == MIFARE_CARD_STATE_ERROR) {
         /* Card failed to initialize */
         should_show_error = true;
+    } else if (admin_card_present) {
+        should_show_error = false;
     } else if (card_state == MIFARE_CARD_STATE_PRESENT && card_balance_tokens == 0 && 
                txn_state != TRANSACTION_STATE_ERROR_NO_FLOW) {
         /* Card authenticated but no balance (not a flow error) */
@@ -1014,6 +1024,16 @@ static void update_ui_from_system_state(void)
             if (lv_obj_has_flag(ui_cardErrorStatus, LV_OBJ_FLAG_HIDDEN)) {
                 lv_obj_clear_flag(ui_cardErrorStatus, LV_OBJ_FLAG_HIDDEN);
             }
+        } else if (admin_card_present && !is_dispensing) {
+            /* Admin card ready - no dispensing balance shown */
+            if (strcmp(last_error_text, "Admin") != 0) {
+                lv_label_set_text(ui_cardErrorStatus, "Admin");
+                strncpy(last_error_text, "Admin", sizeof(last_error_text) - 1);
+                last_error_text[sizeof(last_error_text) - 1] = '\0';
+            }
+            if (lv_obj_has_flag(ui_cardErrorStatus, LV_OBJ_FLAG_HIDDEN)) {
+                lv_obj_clear_flag(ui_cardErrorStatus, LV_OBJ_FLAG_HIDDEN);
+            }
         } else if (card_authenticated && card_balance_tokens > 0 && !is_dispensing) {
             /* Card ready with balance, not yet dispensing - show "Ready" */
             if (strcmp(last_error_text, "Ready") != 0) {
@@ -1101,7 +1121,7 @@ static void update_ui_from_system_state(void)
                 should_show = true;
             } else if (card_state == MIFARE_CARD_STATE_ABSENT && !ui_ctx.in_cooldown) {
                 /* No card present (only show after cooldown expires) */
-                error_text = "No Card";
+                error_text = card_process_waiting_for_tap ? "Tap Card" : "No Card";
                 should_show = true;
             } else if (card_state == MIFARE_CARD_STATE_PRESENT && 
                        txn_state == TRANSACTION_STATE_WAITING_REMOVAL) {
@@ -1133,6 +1153,9 @@ static void update_ui_from_system_state(void)
             }
             
             error_text = show_remove_message ? "Remove Card" : "No Init";
+            should_show = true;
+        } else if (admin_card_present) {
+            error_text = "Admin";
             should_show = true;
         } else if (card_state == MIFARE_CARD_STATE_PRESENT && card_balance_tokens == 0) {
             /* Card authenticated but no balance - alternate between "No Balance" and "Remove Card" every 2 seconds */
@@ -1183,7 +1206,7 @@ static void update_ui_from_system_state(void)
                 const char *status_msg = (ctx == MIFARE_CONTEXT_INIT) ? "Complete" : "Topped Up";
                 error_text = show_remove_message_waiting_cooldown ? "Remove Card" : status_msg;
             } else if (card_state == MIFARE_CARD_STATE_ABSENT) {
-                error_text = "No Card";
+                error_text = card_process_waiting_for_tap ? "Tap Card" : "No Card";
             } else if (card_state == MIFARE_CARD_STATE_ERROR) {
                 /* Use same alternating pattern as above */
                 static uint32_t last_toggle_time_cooldown = 0;
@@ -1196,6 +1219,8 @@ static void update_ui_from_system_state(void)
                 }
                 
                 error_text = show_remove_message_cooldown ? "Remove Card" : "No Init";
+            } else if (admin_card_present) {
+                error_text = "Admin";
             } else if (card_state == MIFARE_CARD_STATE_PRESENT && card_balance_tokens == 0) {
                 /* Use same alternating pattern for no balance */
                 static uint32_t last_toggle_time_balance_cooldown = 0;

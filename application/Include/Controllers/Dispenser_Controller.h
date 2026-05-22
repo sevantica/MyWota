@@ -168,6 +168,26 @@ ValveState_t Dispenser_GetValveState(void);       // Get current valve state (OP
 float Dispenser_GetFlowRateLPM(void);             // Get current flow rate in liters per minute
 
 /**
+ * @brief Sample the slave's flow diagnostics ring (called by RS485 status responder).
+ * @details Maintains an internal 8-deep ring of recent flow samples. Each call
+ *          advances the ring with the current instantaneous flow rate, then
+ *          returns the latest value plus the min/max across the ring. Units
+ *          are centiLitres / minute (cL/min); divide by 100 for L/min.
+ * @param[out] flow_clpm     Latest instantaneous flow (cL/min). May be NULL.
+ * @param[out] flow_clpm_min Min value in the ring (cL/min). May be NULL.
+ * @param[out] flow_clpm_max Max value in the ring (cL/min). May be NULL.
+ */
+void Dispenser_SampleFlowDiagnostics(uint16_t *flow_clpm,
+                                     uint16_t *flow_clpm_min,
+                                     uint16_t *flow_clpm_max);
+
+/**
+ * @brief Returns true while the valve is commanded open (i.e. the controller
+ *        wants water to flow). Mirrors `Dispenser_GetValveState() == VALVE_OPEN`.
+ */
+bool Dispenser_IsValveCommanded(void);
+
+/**
  * @brief Get this dispenser's current pump request for the CCH master.
  * @details MyWota dispensers only ever request a BOOSTER pump (never a
  *          pressure washer). The request is asserted from "card validated

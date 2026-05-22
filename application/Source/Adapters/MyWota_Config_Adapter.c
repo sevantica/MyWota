@@ -74,6 +74,7 @@ static const Config_Key_Entry_t mywota_config_schema[] = {
     {"mifare.card_init_phone_number",  CONFIG_VAL_STRING, &g_system_config.mifare.card_init_phone_number,  16, "Init phone"},
     {"mifare.card_init_validity",      CONFIG_VAL_UINT8,  &g_system_config.mifare.card_init_validity,       0, "Init validity"},
     {"mifare.no_card_user_id",         CONFIG_VAL_STRING, &g_system_config.mifare.no_card_user_id,         16, "No card user"},
+    {"mifare.admin_init_password",     CONFIG_VAL_STRING, &g_system_config.mifare.admin_init_password,     32, "Admin init password"},
     
     /* MIFARE security settings */
     {"mifare.security.encryption_enabled",      CONFIG_VAL_BOOL,   &g_system_config.mifare.security.encryption_enabled,       0, "Enable encryption"},

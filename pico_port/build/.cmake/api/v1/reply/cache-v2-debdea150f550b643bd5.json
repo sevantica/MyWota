@@ -1446,6 +1446,30 @@
 			"value" : "ON"
 		},
 		{
+			"name" : "DRIVERS_ENABLE_RS485_MASTER",
+			"properties" : 
+			[
+				{
+					"name" : "HELPSTRING",
+					"value" : "Enable RS485 master drivers"
+				}
+			],
+			"type" : "BOOL",
+			"value" : "OFF"
+		},
+		{
+			"name" : "DRIVERS_ENABLE_RS485_SLAVE",
+			"properties" : 
+			[
+				{
+					"name" : "HELPSTRING",
+					"value" : "Enable RS485 slave drivers"
+				}
+			],
+			"type" : "BOOL",
+			"value" : "ON"
+		},
+		{
 			"name" : "DRIVERS_ENABLE_USB",
 			"properties" : 
 			[

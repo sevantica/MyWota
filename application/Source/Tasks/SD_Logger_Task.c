@@ -28,6 +28,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include "RTC_Manager.h"
+#include "RS485_Slave_Common_Handlers.h"
 
 /* Private defines -----------------------------------------------------------*/
 #define SD_INIT_RETRY_DELAY_MS      5000    // Wait 5 seconds before retrying initialization
@@ -942,6 +943,22 @@ bool SD_Logger_LogTransaction(const uint8_t *card_uid, uint8_t uid_length,
                    card_uid ? card_uid[2] : 0, card_uid ? card_uid[3] : 0,
                    event_type ? event_type : "?",
                    balance_before, balance_after, unit, amount);
+
+    /* Queue for upload to RS485 master (best-effort; ignored if no master). */
+    if (card_uid != NULL) {
+        RS485_Transaction_Record_t rec = {0};
+        rec.timestamp = (uint32_t)RTC_GetUnixTime();
+        rec.transaction_id = 0; /* Auto-allocated by queue */
+        uint8_t copy_len = uid_length;
+        if (copy_len > sizeof(rec.card_uid)) copy_len = sizeof(rec.card_uid);
+        memcpy(rec.card_uid, card_uid, copy_len);
+        rec.card_uid_length = copy_len;
+        rec.transaction_type = 0; /* Project-specific code (0 = generic) */
+        rec.balance_before = balance_before;
+        rec.balance_after = balance_after;
+        rec.amount = (int32_t)balance_after - (int32_t)balance_before;
+        (void)RS485_SlaveCommon_TxnQueue_Push(&rec);
+    }
 
     if (!sd_logger_context.filesystem_ready || card_uid == NULL || event_type == NULL) {
         return false;

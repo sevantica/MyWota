@@ -1475,14 +1475,14 @@
 				{
 					"directoryIndex" : 99,
 					"id" : "Drivers::@1d7df37e8e284987ec01",
-					"jsonFile" : "target-Drivers-Debug-dffb997a84ee64b53e59.json",
+					"jsonFile" : "target-Drivers-Debug-312c45e0ffaba0e54563.json",
 					"name" : "Drivers",
 					"projectIndex" : 0
 				},
 				{
 					"directoryIndex" : 0,
 					"id" : "UI_PICO_PORT::@6890427a1f51a3e7e1df",
-					"jsonFile" : "target-UI_PICO_PORT-Debug-1287d323fda1ecd68ffd.json",
+					"jsonFile" : "target-UI_PICO_PORT-Debug-6525d6d909b0ff0a3960.json",
 					"name" : "UI_PICO_PORT",
 					"projectIndex" : 0
 				},
@@ -1531,7 +1531,7 @@
 				{
 					"directoryIndex" : 98,
 					"id" : "lvgl::@5f7289a7c6d370d52f20",
-					"jsonFile" : "target-lvgl-Debug-4b863bb355343a13cd90.json",
+					"jsonFile" : "target-lvgl-Debug-b0ea6bfe5bd46faac4a5.json",
 					"name" : "lvgl",
 					"projectIndex" : 2
 				},

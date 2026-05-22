@@ -160,6 +160,7 @@ set(APP_SOURCES
     ../application/Source/Adapters/MyWota_Config_Adapter.c
     ../application/Source/Adapters/MyWota_Hardware_Adapter.c
     ../application/Source/Adapters/MyWota_IO_Expander_Adapter.c
+    ../application/Source/Adapters/MyWota_Command_Catalog.c
     ../application/Source/Tasks/Feedback_Task.c
     ../application/Source/Adapters/MIFARE_Volume_Adapter.c
     ../application/Source/Tasks/RS485_Task.c

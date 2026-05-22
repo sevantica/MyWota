@@ -2,6 +2,7 @@
 #include "RS485_Protocol.h"
 #include "RS485_Discovery.h"
 #include "RS485_FW_Update.h"
+#include "System_Command.h"
 #include "RS485_Command_Adapter.h"
 #include "RS485_Command_Interface.h"
 #include "RTC_Manager.h"
@@ -168,11 +169,19 @@ static RS485_Result_t handle_sync_time(const RS485_Frame_t* req, RS485_Frame_t* 
             unix_time = (time_t)t32;
         }
         
-        if (RTC_SetUnixTime(unix_time) == RTC_OK) {
-            RTC_SaveToSD();
+        System_Command_Request_t request = {
+            .id = SYSTEM_CMD_ID_RTC_SYNC,
+            .origin = SYSTEM_CMD_ORIGIN_RS485,
+            .param1 = (uint32_t)unix_time,
+        };
+        System_Command_Status_t status = System_Command_Execute(&request, NULL);
+        if (status == SYSTEM_CMD_STATUS_OK) {
             RS485_BuildFrame(resp, RS485_ADDR_MASTER, RS485_CMD_ACK, req->header.sequence, NULL, 0);
             return RS485_OK;
         }
+        uint8_t reason = (status == SYSTEM_CMD_STATUS_UNAUTHORIZED) ? RS485_NAK_NOT_AUTHORIZED : RS485_NAK_INVALID_PARAM;
+        RS485_BuildFrame(resp, RS485_ADDR_MASTER, RS485_CMD_NAK, req->header.sequence, &reason, 1);
+        return RS485_OK;
     }
     
     uint8_t reason = RS485_NAK_INVALID_PARAM;
@@ -182,6 +191,12 @@ static RS485_Result_t handle_sync_time(const RS485_Frame_t* req, RS485_Frame_t* 
 
 static RS485_Result_t handle_fw_update(const RS485_Frame_t* req, RS485_Frame_t* resp)
 {
+    if (System_Command_RequireAuth(SYSTEM_CMD_AUTH_ADMIN, "firmware update") != SYSTEM_CMD_STATUS_OK) {
+        uint8_t reason = RS485_NAK_NOT_AUTHORIZED;
+        RS485_BuildFrame(resp, RS485_ADDR_MASTER, RS485_CMD_NAK, req->header.sequence, &reason, 1);
+        return RS485_OK;
+    }
+
     bool success = false;
     
     switch (req->header.command) {
@@ -329,17 +344,30 @@ static RS485_Result_t handle_trigger_clean(const RS485_Frame_t* req, RS485_Frame
 
     /* volume == 0 means "abort" */
     if (payload.target_volume_ml == 0) {
-        Dispenser_StopSelfClean();
-        RS485_BuildFrame(resp, RS485_ADDR_MASTER, RS485_CMD_ACK, req->header.sequence, NULL, 0);
+        System_Command_Request_t request = {
+            .id = SYSTEM_CMD_ID_CLEAN_STOP,
+            .origin = SYSTEM_CMD_ORIGIN_RS485,
+        };
+        if (System_Command_Execute(&request, NULL) == SYSTEM_CMD_STATUS_OK) {
+            RS485_BuildFrame(resp, RS485_ADDR_MASTER, RS485_CMD_ACK, req->header.sequence, NULL, 0);
+        } else {
+            uint8_t reason = RS485_NAK_NOT_AUTHORIZED;
+            RS485_BuildFrame(resp, RS485_ADDR_MASTER, RS485_CMD_NAK, req->header.sequence, &reason, 1);
+        }
         return RS485_OK;
     }
 
-    DispenserResult_t r = Dispenser_StartSelfClean(payload.target_volume_ml,
-                                                   payload.max_duration_sec);
-    if (r == DISPENSER_RESULT_OK) {
+    System_Command_Request_t request = {
+        .id = SYSTEM_CMD_ID_CLEAN_START,
+        .origin = SYSTEM_CMD_ORIGIN_RS485,
+        .param1 = payload.target_volume_ml,
+        .param2 = payload.max_duration_sec,
+    };
+    System_Command_Status_t status = System_Command_Execute(&request, NULL);
+    if (status == SYSTEM_CMD_STATUS_OK) {
         RS485_BuildFrame(resp, RS485_ADDR_MASTER, RS485_CMD_ACK, req->header.sequence, NULL, 0);
     } else {
-        uint8_t reason = (r == DISPENSER_RESULT_BUSY) ? RS485_NAK_BUSY : RS485_NAK_INVALID_PARAM;
+        uint8_t reason = (status == SYSTEM_CMD_STATUS_UNAUTHORIZED) ? RS485_NAK_NOT_AUTHORIZED : RS485_NAK_BUSY;
         RS485_BuildFrame(resp, RS485_ADDR_MASTER, RS485_CMD_NAK, req->header.sequence, &reason, 1);
     }
     return RS485_OK;
@@ -396,6 +424,13 @@ static void update_device_status(void)
 
     /* Pump request (CCH aggregates across all slaves to drive shared pumps) */
     Dispenser_GetPeripheralRequest(&status.peripheral_request_id, &status.peripheral_request_level);
+
+    uint32_t admin_remaining_ms = System_Command_GetAdminRemainingMs();
+    if (admin_remaining_ms > 0u) {
+        status.flags |= RS485_STATUS_FLAG_ADMIN_AUTH;
+        uint32_t admin_remaining_sec = (admin_remaining_ms + 999u) / 1000u;
+        status.reserved_v2 = (admin_remaining_sec > 255u) ? 255u : (uint8_t)admin_remaining_sec;
+    }
     
     /* Get card information */
     status.flags |= (MIFARE_IsCardPresent() ? RS485_STATUS_FLAG_CARD_PRESENT : 0);

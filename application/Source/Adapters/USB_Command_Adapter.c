@@ -23,6 +23,7 @@
 #include "MIFARE_Transaction_Core.h"
 #include "Module_Interface.h"
 #include "MyWota_System.h"
+#include "System_Command.h"
 #include "Fault_Manager.h"
 #include "System_Config.h"
 #include <stdlib.h>
@@ -44,6 +45,19 @@ static const USB_Command_Adapter_Entry_t adapter_commands[] = {
 
 static const size_t adapter_command_count = sizeof(adapter_commands) / sizeof(adapter_commands[0]);
 
+static USB_Command_Status_t usb_status_from_system(System_Command_Status_t status)
+{
+    switch (status) {
+        case SYSTEM_CMD_STATUS_OK:
+            return USB_CMD_OK;
+        case SYSTEM_CMD_STATUS_UNKNOWN_COMMAND:
+            return USB_CMD_ERROR_UNKNOWN_COMMAND;
+        case SYSTEM_CMD_STATUS_INVALID_PARAM:
+            return USB_CMD_ERROR_INVALID_PARAM;
+        default:
+            return USB_CMD_ERROR;
+    }
+}
 /* Exported functions --------------------------------------------------------*/
 
 const USB_Command_Adapter_Entry_t* USB_Command_Adapter_GetCommands(void)
@@ -58,9 +72,9 @@ size_t USB_Command_Adapter_GetCommandCount(void)
 
 void USB_Command_Adapter_PrintStatus(void)
 {
-    /* Display token balance if card is ready */
+    /* Display card balance if card is ready */
     if (MIFARE_IsCardReady()) {
-        USB_Log_Printf("Token Balance:     %lu ml\r\n", MIFARE_GetBalance());
+        USB_Log_Printf("Balance:           %lu L\r\n", MIFARE_GetBalance() / 1000u);
     }
     
     /* Display dispenser status */
@@ -115,9 +129,14 @@ static USB_Command_Status_t cmd_dispenser(int argc, char** argv)
             volume_ml = volume_l * 1000;
         }
         
-        DispenserResult_t result = MIFARE_Dispenser_ManualStart(volume_ml);
-        
-        if (result == DISPENSER_RESULT_OK) {
+        System_Command_Request_t request = {
+            .id = SYSTEM_CMD_ID_DISPENSE_START,
+            .origin = SYSTEM_CMD_ORIGIN_LOCAL_USB,
+            .param1 = volume_ml,
+        };
+        System_Command_Status_t status = System_Command_Execute(&request, NULL);
+
+        if (status == SYSTEM_CMD_STATUS_OK) {
             if (volume_ml == 0) {
                 USB_Log_Printf("[✓] Manual dispense started (unlimited)\r\n");
             } else {
@@ -125,19 +144,23 @@ static USB_Command_Status_t cmd_dispenser(int argc, char** argv)
             }
             return USB_CMD_OK;
         } else {
-            USB_Log_Printf("[✗] Failed to start dispense (already running?)\r\n");
-            return USB_CMD_ERROR;
+            USB_Log_Printf("[✗] Failed to start dispense: %s\r\n", System_Command_GetStatusString(status));
+            return usb_status_from_system(status);
         }
     }
     else if (strcmp(subcmd, "stop") == 0) {
-        DispenserResult_t result = MIFARE_Dispenser_ManualStop();
-        
-        if (result == DISPENSER_RESULT_OK) {
+        System_Command_Request_t request = {
+            .id = SYSTEM_CMD_ID_DISPENSE_STOP,
+            .origin = SYSTEM_CMD_ORIGIN_LOCAL_USB,
+        };
+        System_Command_Status_t status = System_Command_Execute(&request, NULL);
+
+        if (status == SYSTEM_CMD_STATUS_OK) {
             USB_Log_Printf("[✓] Dispense stopped\r\n");
             return USB_CMD_OK;
         } else {
-            USB_Log_Printf("[✗] Failed to stop dispense\r\n");
-            return USB_CMD_ERROR;
+            USB_Log_Printf("[✗] Failed to stop dispense: %s\r\n", System_Command_GetStatusString(status));
+            return usb_status_from_system(status);
         }
     }
     else if (strcmp(subcmd, "topup") == 0) {
@@ -153,22 +176,13 @@ static USB_Command_Status_t cmd_dispenser(int argc, char** argv)
         }
         
         uint32_t amount_ml = amount_l * 1000;
-        
-        USB_Log_Printf("[→] Topping up card with %lu L (%lu ml)...\r\n", amount_l, amount_ml);
-        
-        /* Attempt to topup directly via Dispenser Controller */
-        DispenserResult_t result = MIFARE_Dispenser_TopupCard(amount_ml);
-        
-        if (result == DISPENSER_RESULT_OK) {
-            USB_Log_Printf("[✓] Topup successful. New balance: %lu ml\r\n", MIFARE_GetBalance());
-            return USB_CMD_OK;
-        } else if (result == DISPENSER_RESULT_CARD_NOT_READY) {
-            USB_Log_Printf("[✗] Card not ready. Please present card.\r\n");
-            return USB_CMD_ERROR;
-        } else {
-            USB_Log_Printf("[✗] Topup failed (Result: %d)\r\n", result);
-            return USB_CMD_ERROR;
-        }
+
+        System_Command_Request_t request = {
+            .id = SYSTEM_CMD_ID_CARD_TOPUP,
+            .origin = SYSTEM_CMD_ORIGIN_LOCAL_USB,
+            .param1 = amount_ml,
+        };
+        return usb_status_from_system(System_Command_Execute(&request, NULL));
     }
 
     USB_Log_Printf("[✗] Unknown dispenser command: %s\r\n", subcmd);
@@ -194,16 +208,30 @@ static USB_Command_Status_t cmd_clean(int argc, char** argv)
     if (strcmp(sub, "start") == 0) {
         uint32_t vol = (argc >= 3) ? (uint32_t)atoi(argv[2]) : 0;
         uint32_t sec = (argc >= 4) ? (uint32_t)atoi(argv[3]) : 0;
-        DispenserResult_t r = Dispenser_StartSelfClean(vol, sec);
-        if (r == DISPENSER_RESULT_OK) {
+        System_Command_Request_t request = {
+            .id = SYSTEM_CMD_ID_CLEAN_START,
+            .origin = SYSTEM_CMD_ORIGIN_LOCAL_USB,
+            .param1 = vol,
+            .param2 = sec,
+        };
+        System_Command_Status_t status = System_Command_Execute(&request, NULL);
+        if (status == SYSTEM_CMD_STATUS_OK) {
             USB_Log_Printf("[→] Self-clean started\r\n");
             return USB_CMD_OK;
         }
-        USB_Log_Printf("[✗] Self-clean refused (result=%d)\r\n", r);
-        return USB_CMD_ERROR;
+        USB_Log_Printf("[✗] Self-clean refused: %s\r\n", System_Command_GetStatusString(status));
+        return usb_status_from_system(status);
     }
     if (strcmp(sub, "stop") == 0) {
-        Dispenser_StopSelfClean();
+        System_Command_Request_t request = {
+            .id = SYSTEM_CMD_ID_CLEAN_STOP,
+            .origin = SYSTEM_CMD_ORIGIN_LOCAL_USB,
+        };
+        System_Command_Status_t status = System_Command_Execute(&request, NULL);
+        if (status != SYSTEM_CMD_STATUS_OK) {
+            USB_Log_Printf("[✗] Self-clean stop refused: %s\r\n", System_Command_GetStatusString(status));
+            return usb_status_from_system(status);
+        }
         USB_Log_Printf("[→] Self-clean stop requested\r\n");
         return USB_CMD_OK;
     }
@@ -243,7 +271,15 @@ static USB_Command_Status_t cmd_fault(int argc, char** argv)
         return USB_CMD_OK;
     }
     if (strcmp(sub, "clear") == 0) {
-        Fault_Manager_Clear();
+        System_Command_Request_t request = {
+            .id = SYSTEM_CMD_ID_FAULT_CLEAR,
+            .origin = SYSTEM_CMD_ORIGIN_LOCAL_USB,
+        };
+        System_Command_Status_t status = System_Command_Execute(&request, NULL);
+        if (status != SYSTEM_CMD_STATUS_OK) {
+            USB_Log_Printf("[✗] Fault clear refused: %s\r\n", System_Command_GetStatusString(status));
+            return usb_status_from_system(status);
+        }
         USB_Log_Printf("[✓] Fault cleared\r\n");
         return USB_CMD_OK;
     }
