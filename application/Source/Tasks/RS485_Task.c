@@ -2,6 +2,7 @@
 #include "RS485_Protocol.h"
 #include "RS485_Discovery.h"
 #include "RS485_FW_Update.h"
+#include "RS485_Slave_Common_Handlers.h"
 #include "System_Command.h"
 #include "RS485_Command_Adapter.h"
 #include "RS485_Command_Interface.h"
@@ -28,7 +29,7 @@
 #endif
 
 /* Configuration -------------------------------------------------------------*/
-#define RS485_BAUDRATE              115200
+#define RS485_BAUDRATE              RS485_DEFAULT_BAUDRATE
 #define RS485_MY_ADDRESS            0x01
 #define RS485_FW_FLASH_OFFSET       0x00100000
 #define RS485_FW_MAX_SIZE           (1024 * 1024)
@@ -120,10 +121,6 @@ static void RS485_Task(void* argument)
     
     /* 4. Register Command Handlers */
     RS485_Slave_RegisterHandler(RS485_CMD_SYNC_TIME, handle_sync_time);
-    RS485_Slave_RegisterHandler(RS485_CMD_FW_START,  handle_fw_update);
-    RS485_Slave_RegisterHandler(RS485_CMD_FW_DATA,   handle_fw_update);
-    RS485_Slave_RegisterHandler(RS485_CMD_FW_APPLY,  handle_fw_update);
-    RS485_Slave_RegisterHandler(RS485_CMD_FW_VERIFY, handle_fw_update);
     RS485_Slave_RegisterHandler(RS485_CMD_DEBUG_LOG, handle_debug_log);
     RS485_Slave_RegisterHandler(RS485_CMD_DEBUG_CMD, handle_debug_cmd);
     RS485_Slave_RegisterHandler(RS485_CMD_DEBUG_FETCH, handle_debug_fetch);
@@ -147,7 +144,7 @@ static void RS485_Task(void* argument)
         RS485_Slave_Process();
         
         /* Service timeouts */
-        RS485_FW_Update_CheckTimeout();
+        RS485_SlaveCommon_FW_Tick();
         
         vTaskDelay(pdMS_TO_TICKS(1));
     }
@@ -209,7 +206,12 @@ static RS485_Result_t handle_fw_update(const RS485_Frame_t* req, RS485_Frame_t* 
             break;
             
         case RS485_CMD_FW_DATA:
-            success = RS485_FW_Update_WriteData(req->payload, req->header.length);
+            if (req->header.length >= sizeof(RS485_FW_Data_Header_t)) {
+                const RS485_FW_Data_Header_t *header = (const RS485_FW_Data_Header_t *)req->payload;
+                success = RS485_FW_Update_WriteData(header->offset,
+                                                    req->payload + sizeof(RS485_FW_Data_Header_t),
+                                                    header->length);
+            }
             break;
             
         case RS485_CMD_FW_APPLY:

@@ -28,6 +28,11 @@
 #include "PN532_Driver.h"
 #include "Application_Interface.h"
 #include "RTC_Manager.h"
+#include "RTC_Task.h"
+#include "SD_Logger_Task.h"
+#include "Feedback_Task.h"
+#include "mywota_ui_driver.h"
+#include "MyWota_System.h"
 #include "USB_Logging.h"
 #include "Firmware_Version.h"
 #include "pico/unique_id.h"
@@ -69,6 +74,8 @@ static void rs485_send_ack(uint8_t sequence);
 static void rs485_send_nak(uint8_t sequence, RS485_NAK_Reason_t reason);
 static void rs485_send_response(uint8_t sequence, RS485_Command_t command, 
                                  const void* payload, uint16_t length);
+static void rs485_fw_exclusive_changed(bool active, void *context);
+static void rs485_set_optional_task(TaskHandle_t handle, System_Task_ID_t task_id, bool suspend);
 
 /* Command Table -------------------------------------------------------------*/
 static const RS485_Command_Entry_t adapter_commands[] = {
@@ -126,8 +133,46 @@ RS485_Result_t RS485_Command_Adapter_Init(void)
     const uint32_t fw_stage_offset = (uint32_t)(PICO_FLASH_SIZE_BYTES / 2u);
     const uint32_t fw_stage_max    = (uint32_t)(PICO_FLASH_SIZE_BYTES / 2u) - (16u * 1024u);
     RS485_SlaveCommon_FW_Init(fw_stage_offset, fw_stage_max);
+    RS485_SlaveCommon_FW_SetExclusiveCallback(rs485_fw_exclusive_changed, NULL);
     
     return result;
+}
+
+static void rs485_set_optional_task(TaskHandle_t handle, System_Task_ID_t task_id, bool suspend)
+{
+    if (handle == NULL) {
+        return;
+    }
+
+    if (suspend) {
+        System_SetTaskMonitoringEnabled(task_id, false);
+        vTaskSuspend(handle);
+    } else {
+        vTaskResume(handle);
+        System_SetTaskMonitoringEnabled(task_id, true);
+        System_ReportTaskStatus(task_id, true);
+    }
+}
+
+static void rs485_fw_exclusive_changed(bool active, void *context)
+{
+    (void)context;
+
+    if (active) {
+        LOG_DEBUG_ADAPTER("[RS485_ADAPTER] Firmware update exclusive mode: pausing optional tasks\r\n");
+        if (Dispenser_IsDispenseActive()) {
+            (void)MIFARE_Dispenser_EmergencyStop();
+        }
+    } else {
+        LOG_DEBUG_ADAPTER("[RS485_ADAPTER] Firmware update exclusive mode ended: resuming optional tasks\r\n");
+    }
+
+    rs485_set_optional_task(task_get_handle_MIFARE_Polling_Task(), SYSTEM_TASK_ID_MIFARE_POLLING, active);
+    rs485_set_optional_task(Dispenser_Task_GetHandle(), SYSTEM_TASK_ID_DISPENSER, active);
+    rs485_set_optional_task(task_get_handle_LCD_Display_Driver_Task(), SYSTEM_TASK_ID_LCD_DISPLAY, active);
+    rs485_set_optional_task(Feedback_Task_GetHandle(), SYSTEM_TASK_ID_BUZZER_POLLING, active);
+    rs485_set_optional_task(SD_Logger_Task_GetHandle(), SYSTEM_TASK_ID_SD_LOGGER, active);
+    rs485_set_optional_task(RTC_Task_GetHandle(), SYSTEM_TASK_ID_RTC, active);
 }
 
 /* Private Functions ---------------------------------------------------------*/
@@ -478,9 +523,9 @@ static bool cmd_admin_auth_clear(const RS485_Frame_t *rx_frame, uint8_t sequence
  */
 static void rs485_send_ack(uint8_t sequence)
 {
-    RS485_Frame_t ack_frame;
-    RS485_BuildFrame(&ack_frame, RS485_ADDR_MASTER, RS485_CMD_ACK, sequence, NULL, 0);
-    RS485_SendFrame(&ack_frame);
+    RS485_Frame_t* response_frame = RS485_GetScratchFrame();
+    RS485_BuildFrame(response_frame, RS485_ADDR_MASTER, RS485_CMD_ACK, sequence, NULL, 0);
+    RS485_SendFrame(response_frame);
 }
 
 /**
@@ -488,10 +533,10 @@ static void rs485_send_ack(uint8_t sequence)
  */
 static void rs485_send_nak(uint8_t sequence, RS485_NAK_Reason_t reason)
 {
-    RS485_Frame_t nak_frame;
+    RS485_Frame_t* response_frame = RS485_GetScratchFrame();
     uint8_t payload = (uint8_t)reason;
-    RS485_BuildFrame(&nak_frame, RS485_ADDR_MASTER, RS485_CMD_NAK, sequence, &payload, 1);
-    RS485_SendFrame(&nak_frame);
+    RS485_BuildFrame(response_frame, RS485_ADDR_MASTER, RS485_CMD_NAK, sequence, &payload, 1);
+    RS485_SendFrame(response_frame);
 }
 
 /**
@@ -500,7 +545,7 @@ static void rs485_send_nak(uint8_t sequence, RS485_NAK_Reason_t reason)
 static void rs485_send_response(uint8_t sequence, RS485_Command_t command,
                                  const void* payload, uint16_t length)
 {
-    RS485_Frame_t response_frame;
-    RS485_BuildFrame(&response_frame, RS485_ADDR_MASTER, command, sequence, payload, length);
-    RS485_SendFrame(&response_frame);
+    RS485_Frame_t* response_frame = RS485_GetScratchFrame();
+    RS485_BuildFrame(response_frame, RS485_ADDR_MASTER, command, sequence, payload, length);
+    RS485_SendFrame(response_frame);
 }

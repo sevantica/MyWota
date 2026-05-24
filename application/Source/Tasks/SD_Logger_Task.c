@@ -478,6 +478,11 @@ void Task_Start_SD_Logger_Task(void)
                 &sd_logger_task_tcb);
 }
 
+TaskHandle_t SD_Logger_Task_GetHandle(void)
+{
+    return sd_logger_task_handle;
+}
+
 /**
  * @brief Check if SD logger is ready for logging operations
  * @return true if ready, false otherwise

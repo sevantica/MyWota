@@ -16,6 +16,8 @@
 /*Includes ----------------------------------------------------------*/
 #include <stdint.h>
 #include <stdbool.h>
+#include "FreeRTOS.h"
+#include "task.h"
 #include "Application_Interface.h"
 
 /*Defines ------------------------------------------------------------*/
@@ -156,6 +158,11 @@ void Task_Start_Dispenser_Task(void);
  * @brief Stop the dispenser polling task
  */
 void Task_Stop_Dispenser_Task(void);
+
+/**
+ * @brief Get dispenser task handle.
+ */
+TaskHandle_t Dispenser_Task_GetHandle(void);
 
 /* UI Helper Functions - Business logic layer exposes these for UI to poll */
 uint32_t Dispenser_GetBalanceMl(void);            // Get current balance in milliliters from card

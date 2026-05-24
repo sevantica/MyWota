@@ -1039,6 +1039,11 @@ void Task_Stop_Dispenser_Task(void)
     }
 }
 
+TaskHandle_t Dispenser_Task_GetHandle(void)
+{
+    return dispenser_task_handle;
+}
+
 /* UI Getter Functions -------------------------------------------------------*/
 
 uint32_t Dispenser_GetBalanceMl(void)

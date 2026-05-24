@@ -68,6 +68,9 @@ typedef struct {
  */
 void Task_Start_SD_Logger_Task(void);
 
+/** @brief Get SD logger task handle. */
+TaskHandle_t SD_Logger_Task_GetHandle(void);
+
 /**
  * @brief Log MIFARE card scan with all block data to SD card
  * @param card_uid Card unique identifier

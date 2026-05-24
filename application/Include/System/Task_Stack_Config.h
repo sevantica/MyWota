@@ -69,7 +69,7 @@
 #define RTC_TASK_STACK_WORDS        STACK_BYTES_TO_WORDS(RTC_TASK_STACK_BYTES)
 
 /* RS485 Task - RS485 communication and firmware update */
-#define RS485_TASK_STACK_BYTES      (768u * 4)   /* 3072 bytes - Increased for safety */
+#define RS485_TASK_STACK_BYTES      (1024u * 4)  /* 4096 bytes - Larger RS485 firmware frames */
 #define RS485_TASK_STACK_WORDS      STACK_BYTES_TO_WORDS(RS485_TASK_STACK_BYTES)
 
 /* Network Task - WiFi and LwIP handling */

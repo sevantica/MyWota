@@ -151,3 +151,8 @@ void Feedback_Task_Start(void)
         &feedback_task_tcb
     );
 }
+
+TaskHandle_t Feedback_Task_GetHandle(void)
+{
+    return s_feedback_task_handle;
+}

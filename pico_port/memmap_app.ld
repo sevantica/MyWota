@@ -23,8 +23,8 @@
 
 MEMORY
 {
-    /* App runs at 0x10008000 (32KB offset for bootloader) */
-    FLASH(rx) : ORIGIN = 0x10008000, LENGTH = (2 * 1024 * 1024) - 32k
+    /* App runs at 0x10010000 (64KB offset for ECDSA-capable bootloader) */
+    FLASH(rx) : ORIGIN = 0x10010000, LENGTH = (2 * 1024 * 1024) - 64k
     RAM(rwx) : ORIGIN =  0x20000000, LENGTH = 256k
     SCRATCH_X(rwx) : ORIGIN = 0x20040000, LENGTH = 4k
     SCRATCH_Y(rwx) : ORIGIN = 0x20041000, LENGTH = 4k

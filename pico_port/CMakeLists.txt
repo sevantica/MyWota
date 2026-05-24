@@ -33,6 +33,8 @@ message(STATUS "Build type is ${CMAKE_BUILD_TYPE}")
 # Define build type for conditional compilation in shared drivers
 add_compile_definitions(BUILD_TYPE_WATER_DISPENSER)
 
+set(PICO_MBEDTLS_CONFIG_FILE "RS485_Firmware_mbedtls_config.h")
+
 # Initialize the Pico SDK
 set(PICO_NO_PICOTOOL 1)
 pico_sdk_init()
@@ -73,6 +75,10 @@ set(TUSB_CONFIG_DIR ${CMAKE_CURRENT_SOURCE_DIR})
 
 # Path to the shared VS Code Common cross-project directory
 set(COMMON_PROJECT_DIR "C:/Business/Cross Project/VS Code Common")
+
+target_include_directories(pico_mbedtls_headers INTERFACE
+    "${COMMON_PROJECT_DIR}/sevantica_drivers/Include/Crypto"
+)
 
 # Add the custom drivers library (includes FreeRTOS via FetchContent)
 # Note: MIFARE Transaction Core now included in sevantica_drivers
@@ -190,7 +196,7 @@ add_custom_command(
     COMMENT "Forcing recompilation of Firmware_Version.c for fresh timestamp"
 )
 
-# Use custom linker script for bootloader-aware build (app at 0x10008000)
+# Use custom linker script for bootloader-aware build (app at 0x10010000)
 pico_set_linker_script(UI_PICO_PORT ${CMAKE_CURRENT_SOURCE_DIR}/memmap_app.ld)
 
 # Link libraries
@@ -228,6 +234,8 @@ target_link_libraries(UI_PICO_PORT
     hardware_clocks
     hardware_flash
     hardware_uart
+    pico_mbedtls_crypto
+    pico_mbedtls_headers
     hardware_pwm
     hardware_adc
     pico_unique_id
