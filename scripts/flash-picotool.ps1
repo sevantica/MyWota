@@ -1,17 +1,22 @@
 param(
     [switch]$WithBootloader,
-    [string]$BootloaderPath = "C:\Business\Cross Project\VS Code Common\Pico bootloader\build\bootloader.bin"
+    [string]$BootloaderPath = ""
 )
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $ProjectDir = Split-Path -Parent $ScriptDir
-$PicoPortDir = Join-Path $ProjectDir "pico_port"
-$BuildDir = Join-Path $PicoPortDir "build"
-$CombinedBuildDir = Join-Path $ProjectDir "build"  # For combined.uf2 output
+$BuildDir = Join-Path $ProjectDir "build"
 $TargetName = "UI_PICO_PORT"
 
 if ($WithBootloader) {
     Write-Host "=== Flash with Bootloader Mode ===" -ForegroundColor Cyan
+
+    if ([string]::IsNullOrWhiteSpace($BootloaderPath)) {
+        $BootloaderRoot = "C:\Business\Cross Project\VS Code Common\Pico bootloader"
+        $PreferredBootloaderPath = Join-Path $BootloaderRoot "build_agent\bootloader.bin"
+        $FallbackBootloaderPath = Join-Path $BootloaderRoot "build\bootloader.bin"
+        $BootloaderPath = if (Test-Path $PreferredBootloaderPath) { $PreferredBootloaderPath } else { $FallbackBootloaderPath }
+    }
     
     # Check bootloader exists
     if (-not (Test-Path $BootloaderPath)) {
@@ -26,12 +31,7 @@ if ($WithBootloader) {
         exit 1
     }
     
-    # Ensure combined build directory exists for output
-    if (-not (Test-Path $CombinedBuildDir)) {
-        New-Item -ItemType Directory -Path $CombinedBuildDir -Force | Out-Null
-    }
-    
-    $CombinedUf2 = Join-Path $CombinedBuildDir "combined.uf2"
+    $CombinedUf2 = Join-Path $BuildDir "combined.uf2"
     $BundleScript = Join-Path $ScriptDir "bundle_firmware.py"
     
     Write-Host "Creating combined firmware..."
@@ -48,8 +48,8 @@ if ($WithBootloader) {
     $Uf2File = $CombinedUf2
     Write-Host "Combined firmware ready: $Uf2File" -ForegroundColor Green
 } else {
-    $Uf2File = Join-Path $CombinedBuildDir "$TargetName.uf2"
-    Write-Host "WARNING: App built for bootloader (0x10008000) but flashing WITHOUT bootloader!" -ForegroundColor Yellow
+    $Uf2File = Join-Path $BuildDir "$TargetName.uf2"
+    Write-Host "WARNING: App built for bootloader (0x10010000) but flashing WITHOUT bootloader!" -ForegroundColor Yellow
     Write-Host "Use -WithBootloader flag to include bootloader, or device will not boot." -ForegroundColor Yellow
 }
 

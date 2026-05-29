@@ -22,7 +22,7 @@
 #include "Dispenser_Controller.h"
 #include "Fault_Manager.h"
 #include <string.h>
-#include "RP2040_HAL.h"
+#include "Pico_HAL.h"
 
 #if defined(PICO_BOARD) || defined(RP2040)
     #include "hardware/uart.h"
@@ -33,6 +33,8 @@
 #define RS485_MY_ADDRESS            0x01
 #define RS485_FW_FLASH_OFFSET       0x00100000
 #define RS485_FW_MAX_SIZE           (1024 * 1024)
+#define RS485_REMOTE_CMD_MAX_LEN    127u
+#define RS485_DEBUG_LOG_CHUNK_SIZE  256u
 
 /* Private Variables ---------------------------------------------------------*/
 static TaskHandle_t rs485_task_handle = NULL;
@@ -239,13 +241,13 @@ static RS485_Result_t handle_fw_update(const RS485_Frame_t* req, RS485_Frame_t* 
 static RS485_Result_t handle_debug_log(const RS485_Frame_t* req, RS485_Frame_t* resp)
 {
     uint16_t log_len = 0;
-    char temp_payload[RS485_MAX_PAYLOAD];
+    char temp_payload[RS485_DEBUG_LOG_CHUNK_SIZE];
     
     uint16_t available = (rs485_system_log.head >= rs485_system_log.tail) ? 
         (rs485_system_log.head - rs485_system_log.tail) : 
         (RS485_SYSTEM_LOG_SIZE - rs485_system_log.tail + rs485_system_log.head);
     
-    log_len = (available > RS485_MAX_PAYLOAD) ? RS485_MAX_PAYLOAD : available;
+    log_len = (available > RS485_DEBUG_LOG_CHUNK_SIZE) ? RS485_DEBUG_LOG_CHUNK_SIZE : available;
     
     if (log_len > 0) {
         for(uint16_t i = 0; i < log_len; i++) {
@@ -268,8 +270,8 @@ static RS485_Result_t handle_debug_cmd(const RS485_Frame_t* req, RS485_Frame_t* 
         return RS485_OK;
     }
 
-    char cmd[RS485_MAX_PAYLOAD + 1];
-    size_t len = (req->header.length > RS485_MAX_PAYLOAD) ? RS485_MAX_PAYLOAD : req->header.length;
+    char cmd[RS485_REMOTE_CMD_MAX_LEN + 1u];
+    size_t len = (req->header.length > RS485_REMOTE_CMD_MAX_LEN) ? RS485_REMOTE_CMD_MAX_LEN : req->header.length;
     memcpy(cmd, req->payload, len);
     cmd[len] = '\0';
 

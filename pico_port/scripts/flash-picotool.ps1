@@ -8,14 +8,73 @@ $ProjectDir = Split-Path -Parent $ScriptDir
 $BuildDir = Join-Path $ProjectDir "build"
 $TargetName = "UI_PICO_PORT"
 
+function Get-PicotoolPath {
+    $picoSdkPath = "$env:USERPROFILE\.pico-sdk\picotool\2.2.0\picotool\picotool.exe"
+    if (Test-Path $picoSdkPath) {
+        return $picoSdkPath
+    }
+
+    $picotoolCommand = Get-Command picotool -ErrorAction SilentlyContinue
+    if ($picotoolCommand) {
+        return $picotoolCommand.Source
+    }
+
+    return "picotool"
+}
+
+$PicotoolPath = Get-PicotoolPath
+
+function Assert-RP2040Image {
+    param(
+        [string]$ImagePath,
+        [string]$Description
+    )
+
+    $info = & $PicotoolPath info -a "$ImagePath" 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Could not inspect $Description with picotool: $ImagePath"
+        Write-Host $info
+        exit 1
+    }
+
+    if ($info -notmatch "family ID 'rp2040'" -and $info -notmatch "pico_board:\s+pico") {
+        Write-Error "$Description is not an RP2040/Pico image: $ImagePath"
+        Write-Host $info
+        exit 1
+    }
+}
+
+function Assert-ConnectedRP2040Bootsel {
+    $info = & $PicotoolPath info -a 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Could not inspect connected BOOTSEL device with picotool."
+        Write-Host $info
+        exit 1
+    }
+
+    if ($info -notmatch "type:\s+RP2040") {
+        Write-Error "Connected BOOTSEL device is not RP2040. Refusing to flash MyWota firmware."
+        Write-Host $info
+        exit 1
+    }
+}
+
 if ($WithBootloader) {
     Write-Host "=== Flash with Bootloader Mode ===" -ForegroundColor Cyan
 
     if ([string]::IsNullOrWhiteSpace($BootloaderPath)) {
         $BootloaderRoot = "C:\Business\Cross Project\VS Code Common\Pico bootloader"
-        $PreferredBootloaderPath = Join-Path $BootloaderRoot "build_agent\bootloader.bin"
-        $FallbackBootloaderPath = Join-Path $BootloaderRoot "build\bootloader.bin"
-        $BootloaderPath = if (Test-Path $PreferredBootloaderPath) { $PreferredBootloaderPath } else { $FallbackBootloaderPath }
+        $BootloaderCandidates = @(
+            (Join-Path $BootloaderRoot "build_agent\bootloader.bin"),
+            (Join-Path $BootloaderRoot "build\bootloader.bin")
+        ) | Where-Object { Test-Path $_ } | ForEach-Object { Get-Item $_ } | Sort-Object LastWriteTime -Descending
+
+        if ($BootloaderCandidates.Count -gt 0) {
+            $BootloaderPath = $BootloaderCandidates[0].FullName
+            Write-Host "Selected newest bootloader artifact: $BootloaderPath ($($BootloaderCandidates[0].LastWriteTime))" -ForegroundColor Cyan
+        } else {
+            $BootloaderPath = Join-Path $BootloaderRoot "build_agent\bootloader.bin"
+        }
     }
     
     # Check bootloader exists
@@ -24,6 +83,7 @@ if ($WithBootloader) {
         Write-Host "Build the bootloader first or specify path with -BootloaderPath" -ForegroundColor Yellow
         exit 1
     }
+    Assert-RP2040Image -ImagePath $BootloaderPath -Description "Bootloader"
     
     $AppBin = Join-Path $BuildDir "$TargetName.bin"
     if (-not (Test-Path $AppBin)) {
@@ -62,19 +122,12 @@ if (-not (Test-Path $Uf2File)) {
 }
 
 # Try to find picotool
-$PicotoolPath = "picotool" # Default to PATH
-# Check common locations if not in path
-$PicoSdkPath = "$env:USERPROFILE\.pico-sdk\picotool\2.2.0\picotool\picotool.exe"
-if (Test-Path $PicoSdkPath) {
-    $PicotoolPath = $PicoSdkPath
-}
-
 Write-Host "Using picotool: $PicotoolPath"
 
 # Function to find the Pico's COM port
 function Find-PicoComPort {
     $ports = Get-CimInstance -ClassName Win32_PnPEntity | Where-Object { 
-        $_.Name -match "COM\d+" -and ($_.Name -match "USB Serial|MyWota|Pico|RP2040")
+        $_.Name -match "COM\d+" -and ($_.Name -match "USB Serial|MyWota|Pico|RP2040") -and ($_.Name -notmatch "Bluetooth")
     }
     if ($ports) {
         $portMatch = [regex]::Match($ports[0].Name, "COM(\d+)")
@@ -82,11 +135,7 @@ function Find-PicoComPort {
             return "COM$($portMatch.Groups[1].Value)"
         }
     }
-    # Fallback: try to find any USB serial port
-    $allPorts = [System.IO.Ports.SerialPort]::GetPortNames()
-    foreach ($port in $allPorts) {
-        return $port  # Return first available
-    }
+
     return $null
 }
 
@@ -111,18 +160,10 @@ if ($ComPort) {
         Start-Sleep -Seconds 2
     } catch {
         Write-Host "Could not send bootsel command: $($_.Exception.Message)"
-        Write-Host "Will try picotool reboot method..."
+        Write-Host "If the target is already in BOOTSEL, flashing will continue; otherwise put it in BOOTSEL manually."
     }
 } else {
-    Write-Host "No serial port found, trying picotool reboot method..."
-}
-
-# Attempt to force reboot into BOOTSEL mode using picotool (fallback)
-Write-Host "Attempting to force device into BOOTSEL mode via picotool..."
-& $PicotoolPath reboot -f -u 2>$null
-if ($LASTEXITCODE -eq 0) {
-    Write-Host "Device reboot command sent. Waiting for enumeration..."
-    Start-Sleep -Seconds 2
+    Write-Host "No matching MyWota serial port found. If the target is already in BOOTSEL, flashing will continue; otherwise put it in BOOTSEL manually."
 }
 
 # Wait a bit more and check if device is in BOOTSEL mode
@@ -130,8 +171,10 @@ $retries = 5
 $flashSuccess = $false
 
 for ($i = 0; $i -lt $retries; $i++) {
+    Assert-ConnectedRP2040Bootsel
+
     Write-Host "Flashing $Uf2File (attempt $($i + 1)/$retries)..."
-    & $PicotoolPath load -x "$Uf2File" 2>$null
+    & $PicotoolPath load --ignore-partitions -v "$Uf2File"
     
     if ($LASTEXITCODE -eq 0) {
         $flashSuccess = $true
@@ -146,6 +189,15 @@ for ($i = 0; $i -lt $retries; $i++) {
 
 if ($flashSuccess) {
     Write-Host "Flash successful!"
+
+    Write-Host "Rebooting device out of BOOTSEL mode..."
+    & $PicotoolPath reboot -f -a
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "Device rebooted to firmware." -ForegroundColor Green
+    } else {
+        Write-Host "Flash succeeded, but automatic reboot did not complete. Unplug/replug the device if it remains in BOOTSEL." -ForegroundColor Yellow
+    }
+
     exit 0
 } else {
     Write-Error "Flash failed. Make sure the device is in BOOTSEL mode (hold BOOTSEL while plugging in)."

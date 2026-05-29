@@ -11,12 +11,12 @@
 
 #include "Hardware_Access.h"
 #include "MyWota_Hardware_Adapter.h"
-#include "RP2040_HAL.h"
+#include "Pico_HAL.h"
 
 /* 
  * This file is intentionally mostly empty to match the CCH project pattern. 
  * Hardware initialization logic has been moved to:
- * 1. Platforms/RP2040_HAL.c (Universal driver logic in drivers library)
+ * 1. Platforms/Pico_HAL.c (Universal driver logic in drivers library)
  * 2. MyWota_Hardware_Adapter.c (Project-specific pin mapping and init sequence)
  *
  * Direct access functions for application-specific GPIOs are implemented 

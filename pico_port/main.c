@@ -10,7 +10,7 @@
 #include "hardware/watchdog.h"
 #include "tusb.h"
 #include "MyWota_Hardware_Adapter.h"
-#include "RP2040_HAL.h"
+#include "Pico_HAL.h"
 
 // Hard fault register structure
 typedef struct {

@@ -68,6 +68,80 @@
                     "ignoreFailures": true
                 }
             ]
+        },
+        {
+            "name": "MyWota - J-Link Upload (Bootloader)",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/UI_PICO_PORT.elf",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "miDebuggerPath": "${env:USERPROFILE}/.pico-sdk/toolchain/14_2_Rel1/bin/arm-none-eabi-gdb.exe",
+            "preLaunchTask": "MyWota - Build and Flash with J-Link (Bootloader)",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+        {
+            "name": "MyWota - J-Link Debug",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/UI_PICO_PORT.elf",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "miDebuggerPath": "${env:USERPROFILE}/.pico-sdk/toolchain/14_2_Rel1/bin/arm-none-eabi-gdb.exe",
+            "debugServerPath": "C:/Program Files/SEGGER/JLink_V862/JLinkGDBServerCL.exe",
+            "debugServerArgs": "-device RP2040_M0_0 -if SWD -speed 4000 -port 2331 -noir",
+            "serverStarted": "Listening on TCP/IP port 2331",
+            "miDebuggerServerAddress": "localhost:2331",
+            "preLaunchTask": "MyWota - Build",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Set target remote hardware",
+                    "text": "set mem inaccessible-by-default off",
+                    "ignoreFailures": true
+                }
+            ],
+            "postRemoteConnectCommands": [
+                {
+                    "description": "Reset and halt target",
+                    "text": "monitor reset halt",
+                    "ignoreFailures": false
+                },
+                {
+                    "description": "Set breakpoint at main",
+                    "text": "-break-insert main",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Run from ROM boot through bootloader to app breakpoint",
+                    "text": "monitor reset",
+                    "ignoreFailures": false
+                }
+            ],
+            "launchCompleteCommand": "None",
+            "logging": {
+                "engineLogging": false,
+                "programOutput": true,
+                "trace": false
+            }
         }
     ]
 }

@@ -4,7 +4,7 @@ Bundle bootloader and application into a single .uf2 file for development.
 
 This creates a combined binary that can be flashed with picotool in one step.
 - Bootloader at 0x10000000
-- Application (with header) at 0x10008000
+- Application (with header) at 0x10010000
 """
 
 import argparse
@@ -21,7 +21,7 @@ RP2040_FAMILY_ID = 0xE48BFF56
 
 # Flash addresses
 BOOTLOADER_ADDRESS = 0x10000000
-APP_ADDRESS = 0x10008000
+APP_ADDRESS = 0x10010000
 FLASH_PAGE_SIZE = 256
 
 
@@ -115,8 +115,8 @@ def main():
         bootloader_bin = f.read()
     
     # Check bootloader size
-    if len(bootloader_bin) > 0x8000:  # 32KB max
-        print(f"Error: Bootloader too large ({len(bootloader_bin)} bytes, max 32KB)")
+    if len(bootloader_bin) > 0x10000:  # 64KB max
+        print(f"Error: Bootloader too large ({len(bootloader_bin)} bytes, max 64KB)")
         sys.exit(1)
     
     # Read app
@@ -128,7 +128,7 @@ def main():
         app_bin = f.read()
     
     # Check if app has firmware header and strip it for direct flash
-    # When flashing combined bootloader+app, the app must be raw binary at 0x10008000
+    # When flashing combined bootloader+app, the app must be raw binary at 0x10010000
     # The header is only used for SD card OTA updates
     if len(app_bin) > FIRMWARE_HEADER_SIZE:
         magic = struct.unpack('<I', app_bin[0:4])[0]

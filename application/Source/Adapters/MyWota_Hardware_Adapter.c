@@ -20,7 +20,7 @@
 #include "MyWota_Hardware_Adapter.h"
 #include "System_Config.h"
 #include "USB_Logging.h"
-#include "RP2040_HAL.h"
+#include "Pico_HAL.h"
 #include "Hardware_Access.h"
 #include "tusb.h"
 
@@ -201,11 +201,9 @@ static HW_Interface_Result_t mywota_hw_init(void)
     /* Debug Scan I2C0 */
     LOG_DEBUG_HW("[HW_ADAPTER] Scanning I2C0 Bus...\r\n");
     int found_count = 0;
-    uint8_t dummy_rx;
     
     for (uint8_t addr = 0x08; addr < 0x78; addr++) {
-        /* Read 1 byte to probe */
-        if (HAL_I2C_0_Read(addr, &dummy_rx, 1, false) >= 0) {
+        if (HAL_I2C_0_Probe(addr, 1000) >= 0) {
             LOG_DEBUG_HW("[HW_ADAPTER]   - I2C Device Found at 0x%02X\r\n", addr);
             found_count++;
         }
@@ -218,11 +216,11 @@ static HW_Interface_Result_t mywota_hw_init(void)
     }
 
     /* Verify critical devices presence */
-    if (HAL_I2C_0_Read(pins->nfc.i2c_address, &dummy_rx, 1, false) < 0) {
+    if (HAL_I2C_0_Probe(pins->nfc.i2c_address, 1000) < 0) {
         LOG_DEBUG_HW("[HW_ADAPTER] CRITICAL: NFC (0x%02X) NOT detected!\r\n", pins->nfc.i2c_address);
     }
     
-    if (HAL_I2C_0_Read(pins->io_expander.i2c_address, &dummy_rx, 1, false) < 0) {
+    if (HAL_I2C_0_Probe(pins->io_expander.i2c_address, 1000) < 0) {
         LOG_DEBUG_HW("[HW_ADAPTER] CRITICAL: IO Expander (0x%02X) NOT detected!\r\n", pins->io_expander.i2c_address);
     }
 #endif

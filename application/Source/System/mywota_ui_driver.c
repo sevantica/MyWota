@@ -54,6 +54,8 @@
 
 /* Timing Configuration */
 #define LVGL_TASK_PERIOD_MS             5U
+#define LCD_INITIAL_RENDER_TIMEOUT_MS   3000U
+#define LCD_INITIAL_RENDER_LOG_MS       500U
 
 /* UI Display Context - tracks UI-specific state for display persistence */
 typedef struct {
@@ -330,9 +332,40 @@ static void LCD_Display_Task(void *argument)
     /* Trigger LVGL render and wait until full screen is rendered.
      * Full screen height depends on rotation - use LVGL's reported height */
     LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: Rendering initial UI (waiting for %ld lines)...\r\n", (long)display_height);
-    
+
+    TickType_t initial_render_start = xTaskGetTickCount();
+    TickType_t initial_render_last_tick = initial_render_start;
+    TickType_t initial_render_last_log = initial_render_start;
+
     while (lcd_get_lines_rendered() < (uint32_t)display_height) {
+        TickType_t tick_now = xTaskGetTickCount();
+        uint32_t elapsed_ms = (uint32_t)((tick_now - initial_render_last_tick) * portTICK_PERIOD_MS);
+        if (elapsed_ms > 0) {
+            lv_tick_inc(elapsed_ms);
+            initial_render_last_tick = tick_now;
+        }
+
         lv_timer_handler();
+        System_ReportTaskStatus(SYSTEM_TASK_ID_LCD_DISPLAY, true);
+
+        uint32_t render_elapsed_ms = (uint32_t)((tick_now - initial_render_start) * portTICK_PERIOD_MS);
+        uint32_t log_elapsed_ms = (uint32_t)((tick_now - initial_render_last_log) * portTICK_PERIOD_MS);
+        if (log_elapsed_ms >= LCD_INITIAL_RENDER_LOG_MS) {
+            initial_render_last_log = tick_now;
+            LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: Initial render progress %lu/%ld lines after %lu ms\r\n",
+                                         lcd_get_lines_rendered(),
+                                         (long)display_height,
+                                         (unsigned long)render_elapsed_ms);
+        }
+
+        if (render_elapsed_ms >= LCD_INITIAL_RENDER_TIMEOUT_MS) {
+            LOG_ERROR_LCD_DISPLAY_DRIVER("LCD: Initial render timed out at %lu/%ld lines after %lu ms\r\n",
+                                         lcd_get_lines_rendered(),
+                                         (long)display_height,
+                                         (unsigned long)render_elapsed_ms);
+            break;
+        }
+
         vTaskDelay(pdMS_TO_TICKS(5)); /* Small delay between render passes */
     }
     
