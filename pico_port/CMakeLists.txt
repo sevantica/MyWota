@@ -155,7 +155,6 @@ set(MAIN_SOURCES
 
 # Application source files (explicit list - no GLOB)
 set(APP_SOURCES
-    ../application/Source/System/FreeRTOS_Static.c
     ../application/Source/System/MyWota_Module.c
     ../application/Source/System/mywota_ui_driver.c
     ../application/Source/Controllers/Dispenser_Controller.c
@@ -170,8 +169,6 @@ set(APP_SOURCES
     ../application/Source/Tasks/Feedback_Task.c
     ../application/Source/Adapters/MIFARE_Volume_Adapter.c
     ../application/Source/Tasks/RS485_Task.c
-    ../application/Source/System/RTC_Manager.c
-    ../application/Source/Adapters/RTC_Persistence_Adapter.c
     ../application/Source/Tasks/RTC_Task.c
     ../application/Source/Tasks/SD_Logger_Task.c
     ../application/Source/Adapters/SD_Logger_Format_Adapter.c

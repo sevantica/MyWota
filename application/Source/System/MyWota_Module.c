@@ -15,7 +15,6 @@
 #include "MyWota_Hardware_Adapter.h"
 #include "MyWota_Config_Adapter.h"
 #include "SD_Logger_Format_Adapter.h"
-#include "RTC_Persistence_Adapter.h"
 #include "MyWota_IO_Expander_Adapter.h"
 #include "RS485_Command_Adapter.h"
 #include "MIFARE_Volume_Adapter.h"
@@ -110,7 +109,7 @@ void Module_Init(void)
     const SystemConfig_t* cfg = Config_Get();
 
     /* 4. Peripheral Adapters */
-    RTC_Persistence_Adapter_Init();
+    /* RTC persistence is now managed by the shared RTC_Service in sevantica_drivers */
     
     if (cfg->modules.io_expander_enabled) {
         if (MyWota_IO_Expander_Adapter_Init()) {
