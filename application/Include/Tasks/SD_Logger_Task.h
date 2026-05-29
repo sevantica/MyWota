@@ -121,6 +121,16 @@ bool SD_Logger_LogError(const char *module, int error_code, const char *descript
 bool SD_Logger_IsReady(void);
 
 /**
+ * @brief Lock the SD file system mutex
+ */
+bool SD_Logger_LockFS(void);
+
+/**
+ * @brief Unlock the SD file system mutex
+ */
+void SD_Logger_UnlockFS(void);
+
+/**
  * @brief Print card transaction log to USB terminal
  * @param card_uid Card unique identifier (hex string or bytes)
  * @param uid_length Length of card UID (4 or 7 bytes)

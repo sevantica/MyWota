@@ -215,10 +215,16 @@ RTC_Status_t RTC_SaveToSD(void)
         return RTC_ERROR;
     }
     
+    // Lock the file system safely
+    if (!SD_Logger_LockFS()) {
+        return RTC_ERROR_SD_WRITE;
+    }
+    
     // Open/create RTC file
     FIL file;
     FRESULT result = f_open(&file, RTC_FILE_PATH, FA_CREATE_ALWAYS | FA_WRITE);
     if (result != FR_OK) {
+        SD_Logger_UnlockFS();
         LOG_ERROR_RTC("[RTC] ✗ Failed to open RTC file for write: %d\r\n", result);
         return RTC_ERROR_SD_WRITE;
     }
@@ -227,6 +233,8 @@ RTC_Status_t RTC_SaveToSD(void)
     UINT bytes_written;
     result = f_write(&file, &current_time, sizeof(time_t), &bytes_written);
     f_close(&file);
+    
+    SD_Logger_UnlockFS();
     
     if (result != FR_OK || bytes_written != sizeof(time_t)) {
         LOG_ERROR_RTC("[RTC] ✗ Failed to write RTC file: %d\r\n", result);
@@ -244,10 +252,16 @@ RTC_Status_t RTC_LoadFromSD(void)
         return RTC_ERROR_SD_READ;
     }
     
+    // Lock the file system safely
+    if (!SD_Logger_LockFS()) {
+        return RTC_ERROR_SD_READ;
+    }
+    
     // Open RTC file
     FIL file;
     FRESULT result = f_open(&file, RTC_FILE_PATH, FA_READ);
     if (result != FR_OK) {
+        SD_Logger_UnlockFS();
         LOG_DEBUG_RTC("[RTC] No saved time found on SD card\r\n");
         return RTC_ERROR_SD_READ;
     }
@@ -257,6 +271,8 @@ RTC_Status_t RTC_LoadFromSD(void)
     UINT bytes_read;
     result = f_read(&file, &saved_time, sizeof(time_t), &bytes_read);
     f_close(&file);
+    
+    SD_Logger_UnlockFS();
     
     if (result != FR_OK || bytes_read != sizeof(time_t)) {
         LOG_ERROR_RTC("[RTC] ✗ Failed to read RTC file: %d\r\n", result);

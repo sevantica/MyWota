@@ -55,6 +55,22 @@ bool SD_Logger_IsReady(void)
 }
 
 /**
+ * @brief Lock the SD file system mutex
+ */
+bool SD_Logger_LockFS(void)
+{
+    return SD_Log_LockFS(1000);
+}
+
+/**
+ * @brief Unlock the SD file system mutex
+ */
+void SD_Logger_UnlockFS(void)
+{
+    SD_Log_UnlockFS();
+}
+
+/**
  * @brief Log MIFARE card scan with all block data to SD card (Asynchronous)
  */
 bool SD_Logger_LogMIFARECardScan(const uint8_t *card_uid, uint8_t uid_length, 

@@ -89,10 +89,16 @@ static RTC_Persist_Result_t rtc_save_to_sd(time_t current_time)
         return RTC_PERSIST_INVALID_TIME;
     }
     
+    /* Lock the file system safely */
+    if (!SD_Logger_LockFS()) {
+        return RTC_PERSIST_NOT_AVAILABLE;
+    }
+    
     /* Open file for writing */
-    static FIL file;
+    FIL file;
     FRESULT result = f_open(&file, RTC_SAVE_FILE_PATH, FA_CREATE_ALWAYS | FA_WRITE);
     if (result != FR_OK) {
+        SD_Logger_UnlockFS();
         LOG_DEBUG_PERSIST("[RTC_PERSIST] ✗ Failed to open file for write: %d\\r\\n", result);
         return RTC_PERSIST_ERROR;
     }
@@ -101,6 +107,8 @@ static RTC_Persist_Result_t rtc_save_to_sd(time_t current_time)
     UINT bytes_written;
     result = f_write(&file, &current_time, sizeof(time_t), &bytes_written);
     f_close(&file);
+    
+    SD_Logger_UnlockFS();
     
     if (result != FR_OK || bytes_written != sizeof(time_t)) {
         LOG_DEBUG_PERSIST("[RTC_PERSIST] ✗ Failed to write time: %d\\r\\n", result);
@@ -126,10 +134,16 @@ static RTC_Persist_Result_t rtc_load_from_sd(time_t* loaded_time)
         return RTC_PERSIST_ERROR;
     }
     
+    /* Lock the file system safely */
+    if (!SD_Logger_LockFS()) {
+        return RTC_PERSIST_NOT_AVAILABLE;
+    }
+    
     /* Open file for reading */
-    static FIL file;
+    FIL file;
     FRESULT result = f_open(&file, RTC_SAVE_FILE_PATH, FA_READ);
     if (result != FR_OK) {
+        SD_Logger_UnlockFS();
         LOG_DEBUG_PERSIST("[RTC_PERSIST] No saved time file found\\r\\n");
         return RTC_PERSIST_NOT_AVAILABLE;
     }
@@ -139,6 +153,8 @@ static RTC_Persist_Result_t rtc_load_from_sd(time_t* loaded_time)
     UINT bytes_read;
     result = f_read(&file, &saved_time, sizeof(time_t), &bytes_read);
     f_close(&file);
+    
+    SD_Logger_UnlockFS();
     
     if (result != FR_OK || bytes_read != sizeof(time_t)) {
         LOG_DEBUG_PERSIST("[RTC_PERSIST] ✗ Failed to read time: %d\\r\\n", result);
