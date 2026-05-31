@@ -1,0 +1,7 @@
+r
+h
+loadbin "C:\Business\Cross Project\VS Code Common\Pico bootloader\build\bootloader.bin" 0x12000000
+loadbin "C:\Business\MyWota\MyWota_FW\MyWota\pico_port\build\UI_PICO_PORT.bin" 0x12010000
+r
+go
+q

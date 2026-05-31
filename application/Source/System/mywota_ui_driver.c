@@ -27,7 +27,6 @@
 #include "LCD_Driver.h"
 #include "lvgl.h"
 #include "ui.h"
-#include "ui_Screen1.h"
 #include "Module_Interface.h"
 #include "MyWota_System.h"
 #include "System_Events.h"
@@ -36,7 +35,7 @@
 #include "MIFARE_Transaction_Core.h"  /* For getter functions */
 #include "Dispenser_Controller.h"        /* For dispenser functions */
 #include "System_Config.h"                /* For SD card configuration */
-#include "USB_Command_Handler.h"
+#include "CLI_Processor.h"
 #ifdef LV_USE_ILI9341
 #include "display/ili9341/lv_ili9341.h"
 #endif
@@ -691,20 +690,20 @@ static void apply_background_colors_from_config(void)
         return;  /* No changes - skip update */
     }
     
-    if (ui_Screen1 != NULL) {
+    if (ui_operationalScreen != NULL) {
         /* Apply main background color */
-        lv_obj_set_style_bg_color(ui_Screen1, lv_color_hex(config->ui.bg_color), LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_set_style_bg_opa(ui_Screen1, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_color(ui_operationalScreen, lv_color_hex(config->ui.bg_color), LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_opa(ui_operationalScreen, 255, LV_PART_MAIN | LV_STATE_DEFAULT);
         
         /* Apply gradient color */
-        lv_obj_set_style_bg_grad_color(ui_Screen1, lv_color_hex(config->ui.bg_grad_color), LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_grad_color(ui_operationalScreen, lv_color_hex(config->ui.bg_grad_color), LV_PART_MAIN | LV_STATE_DEFAULT);
         
         /* Apply gradient stops */
-        lv_obj_set_style_bg_main_stop(ui_Screen1, config->ui.bg_main_stop, LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_set_style_bg_grad_stop(ui_Screen1, config->ui.bg_grad_stop, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_main_stop(ui_operationalScreen, config->ui.bg_main_stop, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_grad_stop(ui_operationalScreen, config->ui.bg_grad_stop, LV_PART_MAIN | LV_STATE_DEFAULT);
         
         /* Apply gradient direction (vertical) */
-        lv_obj_set_style_bg_grad_dir(ui_Screen1, LV_GRAD_DIR_VER, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_grad_dir(ui_operationalScreen, LV_GRAD_DIR_VER, LV_PART_MAIN | LV_STATE_DEFAULT);
         
         LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: Applied background colors from config (0x%06lX -> 0x%06lX)\r\n",
                                      config->ui.bg_color, config->ui.bg_grad_color);
@@ -785,7 +784,7 @@ static void update_ui_from_system_state(void)
     MIFARE_CardState_t card_state = MIFARE_GetCardState();
     MIFARE_TransactionState_t txn_state = MIFARE_GetTransactionState();
     bool admin_card_present = MIFARE_IsAdminCard();
-    USB_PendingCommandState_t* pending_card_command = USB_Command_GetPendingCommand();
+    CLI_PendingCommandState_t* pending_card_command = CLI_GetPendingCommand();
     bool card_process_waiting_for_tap = (pending_card_command != NULL &&
                                          pending_card_command->active &&
                                          card_state == MIFARE_CARD_STATE_ABSENT);

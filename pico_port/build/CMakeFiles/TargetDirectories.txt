@@ -1,4 +1,5 @@
 C:/Business/MyWota/MyWota_FW/MyWota/pico_port/build/CMakeFiles/UI_PICO_PORT.dir
+C:/Business/MyWota/MyWota_FW/MyWota/pico_port/build/CMakeFiles/UI_PICO_PORT_fw_rollout.dir
 C:/Business/MyWota/MyWota_FW/MyWota/pico_port/build/CMakeFiles/edit_cache.dir
 C:/Business/MyWota/MyWota_FW/MyWota/pico_port/build/CMakeFiles/rebuild_cache.dir
 C:/Business/MyWota/MyWota_FW/MyWota/pico_port/build/CMakeFiles/list_install_components.dir

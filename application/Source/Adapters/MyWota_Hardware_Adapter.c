@@ -22,6 +22,7 @@
 #include "USB_Logging.h"
 #include "Pico_HAL.h"
 #include "Hardware_Access.h"
+#include "RS485_Protocol.h"
 #include "tusb.h"
 
 /* Logging Configuration -----------------------------------------------------*/
@@ -37,7 +38,7 @@
 #define SPI0_DEFAULT_BAUDRATE       62500000    /* 62.5 MHz (RP2040 max) */
 #define I2C0_DEFAULT_BAUDRATE       400000      /* 400 kHz for NFC/RFID */
 #define I2C1_DEFAULT_BAUDRATE       400000      /* 400 kHz */
-#define UART0_DEFAULT_BAUDRATE      115200      /* RS485 Bus */
+#define UART0_DEFAULT_BAUDRATE      RS485_DEFAULT_BAUDRATE  /* RS485 Bus */
 #define UART1_DEFAULT_BAUDRATE      115200      /* Extra / Debug */
 
 /*===========================================================================*/
@@ -140,7 +141,7 @@ static const HW_Pin_Map_t mywota_pin_map = {
         .pico_led_pin = 25,
         .light_sensor_pin = LIGHT_SENSOR_PIN,
         .flow_sensor_pin = FLOW_SENSOR_PIN,    /* GPIO 22 */
-        .valve_control_pin = 0xFF   /* Controlled via IO Expander */
+        .valve_control_pin = VALVE_CONTROL_PIN
     },
     
     .project_name = "MyWota",
@@ -239,6 +240,11 @@ static HW_Interface_Result_t mywota_hw_init(void)
     
     if (pins->app_gpio.flow_sensor_pin != 0xFF) {
         HAL_GPIO_Init_Input(pins->app_gpio.flow_sensor_pin, true, false); 
+    }
+
+    if (pins->app_gpio.valve_control_pin != 0xFF) {
+        HAL_GPIO_Init_Output(pins->app_gpio.valve_control_pin);
+        HAL_GPIO_Write(pins->app_gpio.valve_control_pin, 0); // Keep closed initially
     }
 
     /* 3. Module Specific Hardware Init */

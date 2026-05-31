@@ -46,6 +46,9 @@ static void Feedback_Task(void *pvParameters)
     static bool s_logged_app_status = false;
     static MIFARE_TransactionState_t s_last_mifare_state = TRANSACTION_STATE_IDLE;
     
+    // Play a nice double-beep indicating the application has successfully booted and the task is running
+    Feedback_Play(FEEDBACK_PATTERN_DOUBLE_BEEP);
+
     for (;;) {
         /* Heartbeat */
         TASK_HEARTBEAT_EVERY_SECOND("Feedback");

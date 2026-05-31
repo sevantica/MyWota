@@ -29,7 +29,7 @@
 /* Daily-limit packing helpers ----------------------------------------------*/
 /* card_data->usage_data.reserved layout:
  *   bits 31..16 : epoch_day_lo (UTC days since 1970-01-01, mod 65536)
- *   bits 15..0  : daily_used_l (liters dispensed today, capped 65535)
+ *   bits 15..0  : daily_used_cl (centiliters dispensed today, capped 65535, i.e., 655.35L)
  */
 static inline uint16_t today_epoch_day_lo(void) {
     time_t now = RTC_GetUnixTime();
@@ -37,13 +37,13 @@ static inline uint16_t today_epoch_day_lo(void) {
     return (uint16_t)(days & 0xFFFFu);
 }
 
-static inline void daily_unpack(uint32_t raw, uint16_t *day, uint16_t *used_l) {
-    if (day)    *day    = (uint16_t)((raw >> 16) & 0xFFFFu);
-    if (used_l) *used_l = (uint16_t)(raw & 0xFFFFu);
+static inline void daily_unpack(uint32_t raw, uint16_t *day, uint16_t *used_cl) {
+    if (day)      *day      = (uint16_t)((raw >> 16) & 0xFFFFu);
+    if (used_cl)  *used_cl  = (uint16_t)(raw & 0xFFFFu);
 }
 
-static inline uint32_t daily_pack(uint16_t day, uint16_t used_l) {
-    return ((uint32_t)day << 16) | (uint32_t)used_l;
+static inline uint32_t daily_pack(uint16_t day, uint16_t used_cl) {
+    return ((uint32_t)day << 16) | (uint32_t)used_cl;
 }
 
 /* Logging Configuration -----------------------------------------------------*/
@@ -157,20 +157,20 @@ static MIFARE_Result_t volume_deduct_balance(MIFARE_CardData_t *card_data, uint3
      * card transaction (no extra block writes). */
     if (g_system_config.mifare.max_daily_volume_ml > 0 && amount > 0) {
         uint16_t today = today_epoch_day_lo();
-        uint16_t card_day = 0, used_l = 0;
-        daily_unpack(card_data->usage_data.reserved, &card_day, &used_l);
+        uint16_t card_day = 0, used_cl = 0;
+        daily_unpack(card_data->usage_data.reserved, &card_day, &used_cl);
         if (card_day != today) {
             /* New day - reset counter */
             card_day = today;
-            used_l   = 0;
+            used_cl  = 0;
         }
-        /* Add this session's mL, rounded up to whole liters with carry. */
-        uint32_t used_ml = (uint32_t)used_l * 1000u + amount;
-        uint32_t new_l   = used_ml / 1000u;
-        if (new_l > 0xFFFFu) new_l = 0xFFFFu;
-        card_data->usage_data.reserved = daily_pack(card_day, (uint16_t)new_l);
-        LOG_DEBUG_VOLUME("[VOLUME] Daily counter -> %lu L (day %u)\r\n",
-                         (unsigned long)new_l, (unsigned)card_day);
+        /* Add this session's mL converted to cL. Carry any remainder. */
+        uint32_t used_ml = (uint32_t)used_cl * 10u + amount;
+        uint32_t new_cl   = used_ml / 10u;
+        if (new_cl > 0xFFFFu) new_cl = 0xFFFFu;
+        card_data->usage_data.reserved = daily_pack(card_day, (uint16_t)new_cl);
+        LOG_DEBUG_VOLUME("[VOLUME] Daily counter -> %lu cL (day %u)\r\n",
+                         (unsigned long)new_cl, (unsigned)card_day);
     }
     
     return volume_write_balance(card_data, new_balance);
@@ -233,17 +233,17 @@ static MIFARE_Result_t volume_on_card_detected(MIFARE_CardData_t *card_data)
     uint32_t max_ml = g_system_config.mifare.max_daily_volume_ml;
     if (max_ml > 0) {
         uint16_t today = today_epoch_day_lo();
-        uint16_t card_day = 0, used_l = 0;
-        daily_unpack(card_data->usage_data.reserved, &card_day, &used_l);
+        uint16_t card_day = 0, used_cl = 0;
+        daily_unpack(card_data->usage_data.reserved, &card_day, &used_cl);
         if (card_day == today) {
-            uint32_t used_ml = (uint32_t)used_l * 1000u;
+            uint32_t used_ml = (uint32_t)used_cl * 10u;
             if (used_ml >= max_ml) {
                 LOG_CRITICAL_VOLUME("[✗] Daily limit reached (%lu/%lu ml today)\r\n",
                                     used_ml, max_ml);
                 return MIFARE_RESULT_INSUFFICIENT_BALANCE;
             }
-            LOG_DEBUG_VOLUME("[VOLUME] Daily used today: %u L (limit %lu mL)\r\n",
-                             used_l, max_ml);
+            LOG_DEBUG_VOLUME("[VOLUME] Daily used today: %.2f L (limit %lu mL)\r\n",
+                             (float)used_cl / 100.0f, max_ml);
         }
     }
 

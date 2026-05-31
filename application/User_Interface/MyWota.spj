@@ -2036,7 +2036,7 @@
           {
             "nid": 10,
             "strtype": "OBJECT/Name",
-            "strval": "Screen1",
+            "strval": "operationalScreen",
             "InheritedType": 10
           },
           {
@@ -2225,7 +2225,7 @@
     "theme_color1": 5,
     "theme_color2": 0,
     "custom_variable_prefix": "uic",
-    "backup_cnt": 2030,
+    "backup_cnt": 2055,
     "autosave_cnt": 0,
     "group_color_cnt": 0,
     "lvgl_version": "9.2.2",

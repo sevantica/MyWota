@@ -18,6 +18,7 @@
 
 /* Includes ------------------------------------------------------------------*/
 #include "RS485_Command_Adapter.h"
+#include "MyWota_Command_Processor.h"
 #include "RS485_Task.h"
 #include "RS485_Protocol.h"
 #include "RS485_Slave_Common_Handlers.h"
@@ -34,6 +35,8 @@
 #include "mywota_ui_driver.h"
 #include "MyWota_System.h"
 #include "USB_Logging.h"
+#include "USB_Command_Handler.h"
+#include "CLI_Processor.h"
 #include "Firmware_Version.h"
 #include "pico/unique_id.h"
 #include "pico/time.h"
@@ -58,16 +61,10 @@
 static bool cmd_poll_status(const RS485_Frame_t *rx_frame, uint8_t sequence);
 static bool cmd_get_device_info(const RS485_Frame_t *rx_frame, uint8_t sequence);
 static bool cmd_get_config(const RS485_Frame_t *rx_frame, uint8_t sequence);
-static bool cmd_reset(const RS485_Frame_t *rx_frame, uint8_t sequence);
 static bool cmd_heartbeat(const RS485_Frame_t *rx_frame, uint8_t sequence);
-static bool cmd_sync_time(const RS485_Frame_t *rx_frame, uint8_t sequence);
-static bool cmd_trigger_clean(const RS485_Frame_t *rx_frame, uint8_t sequence);
-static bool cmd_dispense_start(const RS485_Frame_t *rx_frame, uint8_t sequence);
-static bool cmd_dispense_stop(const RS485_Frame_t *rx_frame, uint8_t sequence);
-static bool cmd_card_update(const RS485_Frame_t *rx_frame, uint8_t sequence);
-static bool cmd_fault_clear(const RS485_Frame_t *rx_frame, uint8_t sequence);
-static bool cmd_admin_auth_grant(const RS485_Frame_t *rx_frame, uint8_t sequence);
-static bool cmd_admin_auth_clear(const RS485_Frame_t *rx_frame, uint8_t sequence);
+static bool cmd_control_forward(const RS485_Frame_t *rx_frame, uint8_t sequence);
+static bool cmd_debug_cmd(const RS485_Frame_t *rx_frame, uint8_t sequence);
+static bool cmd_debug_fetch(const RS485_Frame_t *rx_frame, uint8_t sequence);
 
 /* Helper Functions */
 static void rs485_send_ack(uint8_t sequence);
@@ -82,16 +79,16 @@ static const RS485_Command_Entry_t adapter_commands[] = {
     {RS485_CMD_POLL_STATUS,    cmd_poll_status,      "Poll dispenser status"},
     {RS485_CMD_GET_INFO,       cmd_get_device_info,  "Get device information"},
     {RS485_CMD_GET_CONFIG,     cmd_get_config,       "Get configuration"},
-    {RS485_CMD_RESET,          cmd_reset,            "Reset device"},
+    {RS485_CMD_RESET,          cmd_control_forward,  "Reset device"},
     {RS485_CMD_HEARTBEAT,      cmd_heartbeat,        "Heartbeat ack"},
-    {RS485_CMD_SYNC_TIME,      cmd_sync_time,        "Sync RTC"},
-    {RS485_CMD_TRIGGER_CLEAN,  cmd_trigger_clean,    "Self-clean cycle"},
-    {RS485_CMD_DISPENSE_START, cmd_dispense_start,   "Manual dispense start"},
-    {RS485_CMD_DISPENSE_STOP,  cmd_dispense_stop,    "Stop dispense"},
-    {RS485_CMD_CARD_UPDATE,    cmd_card_update,      "Card top-up"},
-    {RS485_CMD_FAULT_CLEAR,    cmd_fault_clear,      "Clear latched fault"},
-    {RS485_CMD_ADMIN_AUTH_GRANT, cmd_admin_auth_grant, "Grant admin authorization"},
-    {RS485_CMD_ADMIN_AUTH_CLEAR, cmd_admin_auth_clear, "Clear admin authorization"},
+    {RS485_CMD_SYNC_TIME,      cmd_control_forward,  "Sync RTC"},
+    {RS485_CMD_TRIGGER_CLEAN,  cmd_control_forward,  "Self-clean cycle"},
+    {RS485_CMD_DISPENSE_START, cmd_control_forward,  "Manual dispense start"},
+    {RS485_CMD_DISPENSE_STOP,  cmd_control_forward,  "Stop dispense"},
+    {RS485_CMD_CARD_UPDATE,    cmd_control_forward,  "Card top-up"},
+    {RS485_CMD_FAULT_CLEAR,    cmd_control_forward,  "Clear latched fault"},
+    {RS485_CMD_ADMIN_AUTH_GRANT, cmd_control_forward, "Grant admin authorization"},
+    {RS485_CMD_ADMIN_AUTH_CLEAR, cmd_control_forward, "Clear admin authorization"},
     /* Shared firmware-update + transaction-sync handlers */
     {RS485_CMD_FW_START,         RS485_SlaveCommon_FW_HandleStart,   "FW update start"},
     {RS485_CMD_FW_DATA,          RS485_SlaveCommon_FW_HandleData,    "FW data chunk"},
@@ -99,6 +96,9 @@ static const RS485_Command_Entry_t adapter_commands[] = {
     {RS485_CMD_FW_APPLY,         RS485_SlaveCommon_FW_HandleApply,   "FW apply / reboot"},
     {RS485_CMD_GET_TRANSACTIONS, RS485_SlaveCommon_TxnHandleGet,     "Pull pending transactions"},
     {RS485_CMD_TRANSACTION_ACK,  RS485_SlaveCommon_TxnHandleAck,     "Ack uploaded transactions"},
+    /* Debug & Remote command output capture handlers */
+    {RS485_CMD_DEBUG_CMD,        cmd_debug_cmd,                      "Execute remote debug command"},
+    {RS485_CMD_DEBUG_FETCH,      cmd_debug_fetch,                    "Fetch debug output chunk"},
 };
 
 static const RS485_Command_Interface_t command_interface = {
@@ -130,8 +130,10 @@ RS485_Result_t RS485_Command_Adapter_Init(void)
 #ifndef PICO_FLASH_SIZE_BYTES
 #define PICO_FLASH_SIZE_BYTES (2u * 1024u * 1024u)
 #endif
-    const uint32_t fw_stage_offset = (uint32_t)(PICO_FLASH_SIZE_BYTES / 2u);
-    const uint32_t fw_stage_max    = (uint32_t)(PICO_FLASH_SIZE_BYTES / 2u) - (16u * 1024u);
+    const uint32_t fw_bootloader_size = 64u * 1024u;
+    const uint32_t fw_app_max_size = 980u * 1024u;
+    const uint32_t fw_stage_offset = fw_bootloader_size + fw_app_max_size;
+    const uint32_t fw_stage_max = (uint32_t)PICO_FLASH_SIZE_BYTES - fw_stage_offset - (16u * 1024u);
     RS485_SlaveCommon_FW_Init(fw_stage_offset, fw_stage_max);
     RS485_SlaveCommon_FW_SetExclusiveCallback(rs485_fw_exclusive_changed, NULL);
     
@@ -333,27 +335,6 @@ static bool cmd_get_config(const RS485_Frame_t *rx_frame, uint8_t sequence)
 
 /* New Command Handlers -----------------------------------------------------*/
 
-static bool cmd_reset(const RS485_Frame_t *rx_frame, uint8_t sequence)
-{
-    (void)rx_frame;
-    LOG_DEBUG_ADAPTER("[RS485_ADAPTER] RESET requested\r\n");
-
-    System_Command_Request_t request = {
-        .id = SYSTEM_CMD_ID_RESET,
-        .origin = SYSTEM_CMD_ORIGIN_RS485,
-    };
-    System_Command_Status_t status = System_Command_Execute(&request, NULL);
-    if (status == SYSTEM_CMD_STATUS_OK) {
-        rs485_send_ack(sequence);
-        busy_wait_us(20000);
-        watchdog_reboot(0, 0, 0);
-        while (1) { }
-    } else {
-        rs485_send_nak(sequence, RS485_NAK_NOT_AUTHORIZED);
-    }
-    return true;
-}
-
 static bool cmd_heartbeat(const RS485_Frame_t *rx_frame, uint8_t sequence)
 {
     (void)rx_frame;
@@ -361,159 +342,9 @@ static bool cmd_heartbeat(const RS485_Frame_t *rx_frame, uint8_t sequence)
     return true;
 }
 
-static bool cmd_sync_time(const RS485_Frame_t *rx_frame, uint8_t sequence)
+static bool cmd_control_forward(const RS485_Frame_t *rx_frame, uint8_t sequence)
 {
-    if (rx_frame->header.length < sizeof(RS485_SyncTime_Payload_t)) {
-        rs485_send_nak(sequence, RS485_NAK_INVALID_PARAM);
-        return true;
-    }
-    const RS485_SyncTime_Payload_t* p = (const RS485_SyncTime_Payload_t*)rx_frame->payload;
-    System_Command_Request_t request = {
-        .id = SYSTEM_CMD_ID_RTC_SYNC,
-        .origin = SYSTEM_CMD_ORIGIN_RS485,
-        .param1 = p->unix_time,
-    };
-    System_Command_Status_t status = System_Command_Execute(&request, NULL);
-    if (status == SYSTEM_CMD_STATUS_OK) {
-        rs485_send_ack(sequence);
-        LOG_DEBUG_ADAPTER("[RS485_ADAPTER] RTC synced to %lu\r\n", (unsigned long)p->unix_time);
-    } else {
-        rs485_send_nak(sequence, (status == SYSTEM_CMD_STATUS_UNAUTHORIZED) ? RS485_NAK_NOT_AUTHORIZED : RS485_NAK_NOT_READY);
-    }
-    return true;
-}
-
-static bool cmd_trigger_clean(const RS485_Frame_t *rx_frame, uint8_t sequence)
-{
-    if (rx_frame->header.length < sizeof(RS485_TriggerClean_Payload_t)) {
-        rs485_send_nak(sequence, RS485_NAK_INVALID_PARAM);
-        return true;
-    }
-    const RS485_TriggerClean_Payload_t* p =
-        (const RS485_TriggerClean_Payload_t*)rx_frame->payload;
-
-    const Application_Instance_t* app = Application_GetActive();
-    if (p->target_volume_ml == 0) {
-        System_Command_Request_t request = {
-            .id = SYSTEM_CMD_ID_CLEAN_STOP,
-            .origin = SYSTEM_CMD_ORIGIN_RS485,
-        };
-        System_Command_Status_t status = System_Command_Execute(&request, NULL);
-        if (status == SYSTEM_CMD_STATUS_OK) rs485_send_ack(sequence);
-        else rs485_send_nak(sequence, (status == SYSTEM_CMD_STATUS_UNAUTHORIZED) ? RS485_NAK_NOT_AUTHORIZED : RS485_NAK_BUSY);
-        return true;
-    }
-
-    (void)app;
-    System_Command_Request_t request = {
-        .id = SYSTEM_CMD_ID_CLEAN_START,
-        .origin = SYSTEM_CMD_ORIGIN_RS485,
-        .param1 = p->target_volume_ml,
-        .param2 = p->max_duration_sec,
-    };
-    System_Command_Status_t status = System_Command_Execute(&request, NULL);
-    if (status == SYSTEM_CMD_STATUS_OK) {
-        rs485_send_ack(sequence);
-    } else {
-        rs485_send_nak(sequence, (status == SYSTEM_CMD_STATUS_UNAUTHORIZED) ? RS485_NAK_NOT_AUTHORIZED : RS485_NAK_BUSY);
-    }
-    return true;
-}
-
-static bool cmd_dispense_start(const RS485_Frame_t *rx_frame, uint8_t sequence)
-{
-    uint32_t volume_ml = 0;
-    if (rx_frame->header.length >= sizeof(RS485_DispenseStart_Payload_t)) {
-        const RS485_DispenseStart_Payload_t* p =
-            (const RS485_DispenseStart_Payload_t*)rx_frame->payload;
-        volume_ml = p->target_volume_ml;
-    }
-    System_Command_Request_t request = {
-        .id = SYSTEM_CMD_ID_DISPENSE_START,
-        .origin = SYSTEM_CMD_ORIGIN_RS485,
-        .param1 = volume_ml,
-    };
-    System_Command_Status_t status = System_Command_Execute(&request, NULL);
-    if (status == SYSTEM_CMD_STATUS_OK) {
-        rs485_send_ack(sequence);
-    } else {
-        rs485_send_nak(sequence, (status == SYSTEM_CMD_STATUS_UNAUTHORIZED) ? RS485_NAK_NOT_AUTHORIZED : RS485_NAK_BUSY);
-    }
-    return true;
-}
-
-static bool cmd_dispense_stop(const RS485_Frame_t *rx_frame, uint8_t sequence)
-{
-    (void)rx_frame;
-    System_Command_Request_t request = {
-        .id = SYSTEM_CMD_ID_DISPENSE_STOP,
-        .origin = SYSTEM_CMD_ORIGIN_RS485,
-    };
-    System_Command_Status_t status = System_Command_Execute(&request, NULL);
-    if (status == SYSTEM_CMD_STATUS_OK) rs485_send_ack(sequence);
-    else rs485_send_nak(sequence, (status == SYSTEM_CMD_STATUS_UNAUTHORIZED) ? RS485_NAK_NOT_AUTHORIZED : RS485_NAK_BUSY);
-    return true;
-}
-
-static bool cmd_card_update(const RS485_Frame_t *rx_frame, uint8_t sequence)
-{
-    if (rx_frame->header.length < sizeof(RS485_CardUpdate_Payload_t)) {
-        rs485_send_nak(sequence, RS485_NAK_INVALID_PARAM);
-        return true;
-    }
-    const RS485_CardUpdate_Payload_t* p =
-        (const RS485_CardUpdate_Payload_t*)rx_frame->payload;
-    System_Command_Request_t request = {
-        .id = SYSTEM_CMD_ID_CARD_TOPUP,
-        .origin = SYSTEM_CMD_ORIGIN_RS485,
-        .param1 = p->topup_amount,
-    };
-    System_Command_Status_t status = System_Command_Execute(&request, NULL);
-    if (status == SYSTEM_CMD_STATUS_OK) {
-        rs485_send_ack(sequence);
-    } else {
-        rs485_send_nak(sequence, (status == SYSTEM_CMD_STATUS_UNAUTHORIZED) ? RS485_NAK_NOT_AUTHORIZED : RS485_NAK_CARD_ERROR);
-    }
-    return true;
-}
-
-static bool cmd_fault_clear(const RS485_Frame_t *rx_frame, uint8_t sequence)
-{
-    (void)rx_frame;
-    System_Command_Request_t request = {
-        .id = SYSTEM_CMD_ID_FAULT_CLEAR,
-        .origin = SYSTEM_CMD_ORIGIN_RS485,
-    };
-    System_Command_Status_t status = System_Command_Execute(&request, NULL);
-    if (status == SYSTEM_CMD_STATUS_OK) rs485_send_ack(sequence);
-    else rs485_send_nak(sequence, (status == SYSTEM_CMD_STATUS_UNAUTHORIZED) ? RS485_NAK_NOT_AUTHORIZED : RS485_NAK_BUSY);
-    return true;
-}
-
-static bool cmd_admin_auth_grant(const RS485_Frame_t *rx_frame, uint8_t sequence)
-{
-    if (rx_frame->header.length < sizeof(RS485_AdminAuthGrant_Payload_t)) {
-        rs485_send_nak(sequence, RS485_NAK_INVALID_PARAM);
-        return true;
-    }
-
-    RS485_AdminAuthGrant_Payload_t payload;
-    memcpy(&payload, rx_frame->payload, sizeof(payload));
-    System_Command_SetRemoteAdminGrant(payload.session_id, payload.duration_ms);
-    rs485_send_ack(sequence);
-    LOG_DEBUG_ADAPTER("[RS485_ADAPTER] Admin grant session=%lu duration=%lu ms\r\n",
-                      (unsigned long)payload.session_id,
-                      (unsigned long)payload.duration_ms);
-    return true;
-}
-
-static bool cmd_admin_auth_clear(const RS485_Frame_t *rx_frame, uint8_t sequence)
-{
-    (void)rx_frame;
-    System_Command_ClearRemoteAdminGrant();
-    rs485_send_ack(sequence);
-    LOG_DEBUG_ADAPTER("[RS485_ADAPTER] Admin grant cleared\r\n");
-    return true;
+    return MyWota_Command_Processor_ExecuteRS485(rx_frame, sequence);
 }
 
 /* Helper Functions ----------------------------------------------------------*/
@@ -548,4 +379,86 @@ static void rs485_send_response(uint8_t sequence, RS485_Command_t command,
     RS485_Frame_t* response_frame = RS485_GetScratchFrame();
     RS485_BuildFrame(response_frame, RS485_ADDR_MASTER, command, sequence, payload, length);
     RS485_SendFrame(response_frame);
+}
+
+/* Remote Command Capture Support */
+#define REMOTE_CAPTURE_BUF_SIZE  2048
+#define REMOTE_CHUNK_SIZE        128
+
+static char s_remote_capture_buf[REMOTE_CAPTURE_BUF_SIZE];
+static uint16_t s_remote_capture_len = 0;
+
+static void remote_capture_handler(const char* message, size_t length, void* context)
+{
+    (void)context;
+    size_t avail = REMOTE_CAPTURE_BUF_SIZE - s_remote_capture_len - 1;
+    if (length > avail) length = avail;
+    if (length > 0) {
+        memcpy(s_remote_capture_buf + s_remote_capture_len, message, length);
+        s_remote_capture_len += length;
+        s_remote_capture_buf[s_remote_capture_len] = '\0';
+    }
+}
+
+static bool cmd_debug_cmd(const RS485_Frame_t *rx_frame, uint8_t sequence)
+{
+    uint16_t cmd_len = rx_frame->header.length;
+    char cmd_line[256];
+    if (cmd_len >= sizeof(cmd_line)) {
+        cmd_len = sizeof(cmd_line) - 1;
+    }
+    memcpy(cmd_line, rx_frame->payload, cmd_len);
+    cmd_line[cmd_len] = '\0';
+
+    s_remote_capture_buf[0] = '\0';
+    s_remote_capture_len = 0;
+
+#ifdef USE_DRIVERS_USB
+    const CLI_Channel_t capture_channel = {
+        .write = remote_capture_handler,
+        .context = NULL
+    };
+    CLI_Execute(cmd_line, &capture_channel);
+#endif
+
+    uint8_t payload[3];
+    payload[0] = s_remote_capture_len & 0xFF;
+    payload[1] = (s_remote_capture_len >> 8) & 0xFF;
+    
+    uint16_t num_chunks = (s_remote_capture_len + REMOTE_CHUNK_SIZE - 1) / REMOTE_CHUNK_SIZE;
+    payload[2] = (uint8_t)num_chunks;
+
+    rs485_send_response(sequence, RS485_CMD_DEBUG_CMD, payload, sizeof(payload));
+
+    LOG_DEBUG_ADAPTER("[RS485_ADAPTER] Debug cmd executed: '%s', len=%u, chunks=%u\r\n",
+                      cmd_line, s_remote_capture_len, num_chunks);
+
+    return true;
+}
+
+static bool cmd_debug_fetch(const RS485_Frame_t *rx_frame, uint8_t sequence)
+{
+    if (rx_frame->header.length < 1) {
+        rs485_send_nak(sequence, RS485_NAK_INVALID_PARAM);
+        return true;
+    }
+
+    uint8_t chunk_idx = rx_frame->payload[0];
+    uint16_t offset = chunk_idx * REMOTE_CHUNK_SIZE;
+
+    if (offset >= s_remote_capture_len) {
+        rs485_send_response(sequence, RS485_CMD_DEBUG_FETCH, NULL, 0);
+        return true;
+    }
+
+    uint16_t chunk_len = s_remote_capture_len - offset;
+    if (chunk_len > REMOTE_CHUNK_SIZE) {
+        chunk_len = REMOTE_CHUNK_SIZE;
+    }
+
+    rs485_send_response(sequence, RS485_CMD_DEBUG_FETCH, s_remote_capture_buf + offset, chunk_len);
+
+    LOG_DEBUG_ADAPTER("[RS485_ADAPTER] Debug fetch sent chunk %u, len=%u\r\n", chunk_idx, chunk_len);
+
+    return true;
 }

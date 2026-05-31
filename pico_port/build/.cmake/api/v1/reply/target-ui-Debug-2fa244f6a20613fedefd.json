@@ -1,0 +1,306 @@
+{
+	"archive" : {},
+	"artifacts" : 
+	[
+		{
+			"path" : "app_ui/libui.a"
+		}
+	],
+	"backtrace" : 1,
+	"backtraceGraph" : 
+	{
+		"commands" : 
+		[
+			"add_library",
+			"add_compile_options",
+			"add_compile_definitions",
+			"include_directories"
+		],
+		"files" : 
+		[
+			"C:/Business/MyWota/MyWota_FW/MyWota/application/User_Interface/MyWota/ui/CMakeLists.txt",
+			"CMakeLists.txt"
+		],
+		"nodes" : 
+		[
+			{
+				"file" : 0
+			},
+			{
+				"command" : 0,
+				"file" : 0,
+				"line" : 7,
+				"parent" : 0
+			},
+			{
+				"file" : 1
+			},
+			{
+				"command" : 1,
+				"file" : 1,
+				"line" : 98,
+				"parent" : 2
+			},
+			{
+				"command" : 1,
+				"file" : 1,
+				"line" : 115,
+				"parent" : 2
+			},
+			{
+				"command" : 1,
+				"file" : 1,
+				"line" : 116,
+				"parent" : 2
+			},
+			{
+				"command" : 1,
+				"file" : 1,
+				"line" : 117,
+				"parent" : 2
+			},
+			{
+				"command" : 1,
+				"file" : 1,
+				"line" : 120,
+				"parent" : 2
+			},
+			{
+				"command" : 1,
+				"file" : 1,
+				"line" : 121,
+				"parent" : 2
+			},
+			{
+				"command" : 1,
+				"file" : 1,
+				"line" : 122,
+				"parent" : 2
+			},
+			{
+				"command" : 1,
+				"file" : 1,
+				"line" : 123,
+				"parent" : 2
+			},
+			{
+				"command" : 2,
+				"file" : 1,
+				"line" : 37,
+				"parent" : 2
+			},
+			{
+				"command" : 3,
+				"file" : 1,
+				"line" : 130,
+				"parent" : 2
+			}
+		]
+	},
+	"compileGroups" : 
+	[
+		{
+			"compileCommandFragments" : 
+			[
+				{
+					"fragment" : "-mcpu=cortex-m0plus -mthumb -O0 -g -std=gnu11"
+				},
+				{
+					"backtrace" : 3,
+					"fragment" : "-Wall"
+				},
+				{
+					"backtrace" : 3,
+					"fragment" : "-Wno-format"
+				},
+				{
+					"backtrace" : 3,
+					"fragment" : "-Wno-unused-function"
+				},
+				{
+					"backtrace" : 3,
+					"fragment" : "-Wno-maybe-uninitialized"
+				},
+				{
+					"backtrace" : 4,
+					"fragment" : "-g3"
+				},
+				{
+					"backtrace" : 4,
+					"fragment" : "-DDEBUG=1"
+				},
+				{
+					"backtrace" : 5,
+					"fragment" : "-fno-omit-frame-pointer"
+				},
+				{
+					"backtrace" : 6,
+					"fragment" : "-fno-eliminate-unused-debug-symbols"
+				},
+				{
+					"backtrace" : 7,
+					"fragment" : "-fno-inline"
+				},
+				{
+					"backtrace" : 8,
+					"fragment" : "-fno-inline-functions"
+				},
+				{
+					"backtrace" : 9,
+					"fragment" : "-fno-inline-small-functions"
+				},
+				{
+					"backtrace" : 10,
+					"fragment" : "-fno-inline-functions-called-once"
+				}
+			],
+			"defines" : 
+			[
+				{
+					"backtrace" : 11,
+					"define" : "BUILD_TYPE_WATER_DISPENSER"
+				}
+			],
+			"includes" : 
+			[
+				{
+					"backtrace" : 12,
+					"path" : "C:/Business/MyWota/MyWota_FW/MyWota/pico_port"
+				},
+				{
+					"backtrace" : 12,
+					"path" : "C:/Business/MyWota/MyWota_FW/MyWota/pico_port/freertos_config"
+				},
+				{
+					"backtrace" : 12,
+					"path" : "C:/Business/MyWota/MyWota_FW/MyWota/pico_port/../application/User_Interface/MyWota"
+				},
+				{
+					"backtrace" : 12,
+					"path" : "C:/Business/MyWota/MyWota_FW/MyWota/pico_port/../application/User_Interface/MyWota/lvgl/src"
+				},
+				{
+					"backtrace" : 12,
+					"path" : "C:/Business/MyWota/MyWota_FW/MyWota/pico_port/../application/User_Interface/MyWota/lvgl/src/drivers"
+				},
+				{
+					"backtrace" : 12,
+					"path" : "C:/Business/MyWota/MyWota_FW/MyWota/pico_port/../application/Include"
+				},
+				{
+					"backtrace" : 12,
+					"path" : "C:/Business/MyWota/MyWota_FW/MyWota/pico_port/../application/Include/Adapters"
+				},
+				{
+					"backtrace" : 12,
+					"path" : "C:/Business/MyWota/MyWota_FW/MyWota/pico_port/../application/Include/Controllers"
+				},
+				{
+					"backtrace" : 12,
+					"path" : "C:/Business/MyWota/MyWota_FW/MyWota/pico_port/../application/Include/System"
+				},
+				{
+					"backtrace" : 12,
+					"path" : "C:/Business/MyWota/MyWota_FW/MyWota/pico_port/../application/Include/Tasks"
+				},
+				{
+					"backtrace" : 12,
+					"path" : "C:/Business/Cross Project/VS Code Common/sevantica_drivers/Include"
+				},
+				{
+					"backtrace" : 12,
+					"path" : "C:/Business/MyWota/MyWota_FW/MyWota/pico_port/../application/User_Interface/MyWota/ui"
+				},
+				{
+					"backtrace" : 12,
+					"path" : "C:/Business/MyWota/MyWota_FW/MyWota/pico_port/../application/User_Interface/MyWota/ui/screens"
+				},
+				{
+					"backtrace" : 12,
+					"path" : "C:/Business/MyWota/MyWota_FW/MyWota/pico_port/../application/User_Interface/MyWota/ui/images"
+				},
+				{
+					"backtrace" : 12,
+					"path" : "C:/Business/MyWota/MyWota_FW/MyWota/pico_port/../application/User_Interface/MyWota/ui/components"
+				},
+				{
+					"backtrace" : 12,
+					"path" : "C:/Business/MyWota/MyWota_FW/MyWota/pico_port/screens"
+				}
+			],
+			"language" : "C",
+			"languageStandard" : 
+			{
+				"backtraces" : 
+				[
+					1
+				],
+				"standard" : "11"
+			},
+			"sourceIndexes" : 
+			[
+				0,
+				1,
+				2,
+				3,
+				4
+			]
+		}
+	],
+	"id" : "ui::@c42b2c6639eacaa29da9",
+	"name" : "ui",
+	"nameOnDisk" : "libui.a",
+	"paths" : 
+	{
+		"build" : "app_ui",
+		"source" : "C:/Business/MyWota/MyWota_FW/MyWota/application/User_Interface/MyWota/ui"
+	},
+	"sourceGroups" : 
+	[
+		{
+			"name" : "Source Files",
+			"sourceIndexes" : 
+			[
+				0,
+				1,
+				2,
+				3,
+				4
+			]
+		}
+	],
+	"sources" : 
+	[
+		{
+			"backtrace" : 1,
+			"compileGroupIndex" : 0,
+			"path" : "C:/Business/MyWota/MyWota_FW/MyWota/application/User_Interface/MyWota/ui/screens/ui_operationalScreen.c",
+			"sourceGroupIndex" : 0
+		},
+		{
+			"backtrace" : 1,
+			"compileGroupIndex" : 0,
+			"path" : "C:/Business/MyWota/MyWota_FW/MyWota/application/User_Interface/MyWota/ui/ui.c",
+			"sourceGroupIndex" : 0
+		},
+		{
+			"backtrace" : 1,
+			"compileGroupIndex" : 0,
+			"path" : "C:/Business/MyWota/MyWota_FW/MyWota/application/User_Interface/MyWota/ui/components/ui_comp_hook.c",
+			"sourceGroupIndex" : 0
+		},
+		{
+			"backtrace" : 1,
+			"compileGroupIndex" : 0,
+			"path" : "C:/Business/MyWota/MyWota_FW/MyWota/application/User_Interface/MyWota/ui/ui_helpers.c",
+			"sourceGroupIndex" : 0
+		},
+		{
+			"backtrace" : 1,
+			"compileGroupIndex" : 0,
+			"path" : "C:/Business/MyWota/MyWota_FW/MyWota/application/User_Interface/MyWota/ui/images/ui_img_mifaretag_gra_png.c",
+			"sourceGroupIndex" : 0
+		}
+	],
+	"type" : "STATIC_LIBRARY"
+}

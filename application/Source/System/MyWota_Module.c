@@ -27,6 +27,7 @@
 #include "MyWota_ui_driver.h"
 #include "Log_Strings.h"
 #include "Feedback_Task.h"
+#include "Feedback_Service.h"
 
 /* MIFARE */
 #include "MIFARE_Transaction_Core.h"
@@ -123,8 +124,12 @@ void Module_Init(void)
     
     /* Feedback / Buzzer */
     if (cfg->modules.buzzer_enabled) {
+        bool feedback_status = Feedback_Service_Init(&cfg->buzzer);
+        if (!feedback_status) {
+            LOG_CRITICAL_SYSTEM("[!] Feedback Service Init Failed - task will start anyway\r\n");
+        }
         Feedback_Task_Start();
-        s_module_states[MODULE_BUZZER] = MODULE_STATE_RUNNING;
+        s_module_states[MODULE_BUZZER] = feedback_status ? MODULE_STATE_RUNNING : MODULE_STATE_ERROR;
         System_RegisterTask(SYSTEM_TASK_ID_BUZZER_POLLING, "Feedback");
     }
     

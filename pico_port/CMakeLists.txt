@@ -13,6 +13,7 @@ if (EXISTS ${picoVscode})
 endif()
 # ====================================================================================
 set(PICO_BOARD pico CACHE STRING "Board type")
+set(PICO_STDIO_UART 0 CACHE BOOL "Disable UART stdio; UART0 is used for RS485" FORCE)
 
 cmake_minimum_required(VERSION 3.13)
 
@@ -20,6 +21,8 @@ cmake_minimum_required(VERSION 3.13)
 include(pico_sdk_import.cmake)
 
 project(UI_PICO_PORT C CXX ASM)
+
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 # Set up shared picotool directory to avoid repeated downloads
 set(PICOTOOL_FETCH_FROM_GIT_PATH "C:/Users/bchir/.pico-sdk/picotool" CACHE STRING "Shared directory for picotool builds")
@@ -157,6 +160,7 @@ set(MAIN_SOURCES
 set(APP_SOURCES
     ../application/Source/System/MyWota_Module.c
     ../application/Source/System/mywota_ui_driver.c
+    ../application/Source/System/MyWota_Command_Processor.c
     ../application/Source/Controllers/Dispenser_Controller.c
     ../application/Source/Controllers/Fault_Manager.c
     ../application/Source/System/Firmware_Version.c
@@ -213,7 +217,6 @@ target_link_libraries(UI_PICO_PORT
     pico_malloc
     pico_mem_ops
     pico_printf
-    pico_stdio_uart  # UART stdio only (USB handled by TinyUSB)
     tinyusb_device   # TinyUSB device stack for CDC+MSC composite
     tinyusb_board    # TinyUSB board support
     hardware_base
@@ -288,9 +291,40 @@ target_compile_definitions(UI_PICO_PORT PRIVATE
     USE_DRIVERS_USB=1
 )
 
-# Enable UART output only (USB CDC handled by TinyUSB)
+# USB CDC is handled by TinyUSB; UART0 is reserved for RS485.
 pico_enable_stdio_usb(UI_PICO_PORT 0)
 pico_enable_stdio_uart(UI_PICO_PORT 0)
 
 # Create map/bin/hex/uf2 files automatically after each build
 pico_add_extra_outputs(UI_PICO_PORT)
+
+set(FIRMWARE_VERSION_HEADER "${CMAKE_CURRENT_SOURCE_DIR}/../application/Include/System/Firmware_Version.h")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${FIRMWARE_VERSION_HEADER}")
+file(READ "${FIRMWARE_VERSION_HEADER}" FW_VERSION_HEADER_CONTENT)
+foreach(FW_VERSION_COMPONENT MAJOR MINOR PATCH)
+    if(NOT FW_VERSION_HEADER_CONTENT MATCHES "#define[ \t]+FW_VERSION_${FW_VERSION_COMPONENT}[ \t]+([0-9]+)")
+        message(FATAL_ERROR "Could not parse FW_VERSION_${FW_VERSION_COMPONENT} from ${FIRMWARE_VERSION_HEADER}")
+    endif()
+    set(FW_VERSION_${FW_VERSION_COMPONENT}_VALUE "${CMAKE_MATCH_1}")
+endforeach()
+set(FW_ROLLOUT_VERSION "${FW_VERSION_MAJOR_VALUE}.${FW_VERSION_MINOR_VALUE}.${FW_VERSION_PATCH_VALUE}")
+
+set(RS485_SIGN_FIRMWARE_SCRIPT
+    "C:/Business/Central Control Hub/Central Control Hub_FW/Central-Control-Hub/scripts/sign-firmware.py"
+    CACHE FILEPATH "Path to the RS485 firmware signing tool"
+)
+if(NOT EXISTS "${RS485_SIGN_FIRMWARE_SCRIPT}")
+    message(FATAL_ERROR "RS485 firmware signing tool not found: ${RS485_SIGN_FIRMWARE_SCRIPT}")
+endif()
+
+set(FW_ROLLOUT_BIN "${CMAKE_CURRENT_BINARY_DIR}/fw_rollout.bin")
+set(FW_ROLLOUT_INPUT_BIN "${CMAKE_CURRENT_BINARY_DIR}/UI_PICO_PORT.bin")
+math(EXPR FW_ROLLOUT_MAX_TOTAL_SIZE "(2 * 1024 * 1024) - (16 * 1024) - 4096 - (64 * 1024) - (980 * 1024)")
+add_custom_command(
+    OUTPUT "${FW_ROLLOUT_BIN}"
+    COMMAND ${Python3_EXECUTABLE} "${RS485_SIGN_FIRMWARE_SCRIPT}" "${FW_ROLLOUT_INPUT_BIN}" "${FW_ROLLOUT_BIN}" --product mywota --version "${FW_ROLLOUT_VERSION}" --max-total-size "${FW_ROLLOUT_MAX_TOTAL_SIZE}"
+    DEPENDS UI_PICO_PORT "${FW_ROLLOUT_INPUT_BIN}" "${RS485_SIGN_FIRMWARE_SCRIPT}" "${FIRMWARE_VERSION_HEADER}"
+    COMMENT "Generating MyWota signed firmware rollout container: fw_rollout.bin"
+    VERBATIM
+)
+add_custom_target(UI_PICO_PORT_fw_rollout ALL DEPENDS "${FW_ROLLOUT_BIN}")

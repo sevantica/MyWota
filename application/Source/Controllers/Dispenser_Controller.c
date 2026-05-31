@@ -28,7 +28,7 @@
 #include "MIFARE_Async_Mailbox.h"
 #include "MyWota_IO_Expander_Adapter.h"
 #include "USB_Logging.h"
-#include "USB_Command_Handler.h"
+#include "CLI_Processor.h"
 #include "RS485_Protocol.h"
 #include "Module_Interface.h"
 #include "MyWota_System.h"
@@ -889,24 +889,23 @@ static void MIFARE_Dispenser_Task(void* argument)
                     }
                     
                     DISPENSER_DEBUG("IDLE: Card ready detected - checking for pending commands");
-                    // Card detected - first check for pending USB commands (like topup, recover)
-                    USB_PendingCommandState_t* pending = USB_Command_GetPendingCommand();
+                    CLI_PendingCommandState_t* pending = CLI_GetPendingCommand();
                     if (pending != NULL && pending->active) {
                         DISPENSER_DEBUG("IDLE: Pending USB command found (cmd=%d) - skipping auto-dispense", pending->command);
                         // For RECOVER command, verify UID matches before executing
-                        if (pending->command == USB_PENDING_CMD_RECOVER) {
+                        if (pending->command == CLI_PENDING_CMD_RECOVER) {
                             PN532_CardInfo_t card_info;
                             if (MIFARE_GetCurrentCardInfo(&card_info)) {
                                 if (card_info.uid_length == pending->target_uid_length &&
                                     memcmp(card_info.uid, pending->target_uid, pending->target_uid_length) == 0) {
                                     // UID matches - execute recovery
-                                    USB_Command_ExecutePendingCommand(pending);
+                                    CLI_ExecutePendingCommand(pending);
                                 }
                                 // UID doesn't match - don't execute, wait for correct card
                             }
                         } else {
                             // Other commands (topup, cardinit) - execute immediately
-                            USB_Command_ExecutePendingCommand(pending);
+                            CLI_ExecutePendingCommand(pending);
                             DISPENSER_DEBUG("IDLE: USB command executed");
                         }
                         // Don't auto-start dispense this cycle - let card be re-polled
@@ -1446,9 +1445,11 @@ void MIFARE_Dispenser_GetTestModeStatus(void)
 static void dispenser_valve_open(void)
 {
     App_GPIO_Pins_t gpio_pins = Get_App_GPIO_Pins();
-    gpio_put(gpio_pins.valve_control_pin, 1);  // Turn on valve
+    if (gpio_pins.valve_control_pin != 0xFF) {
+        gpio_put(gpio_pins.valve_control_pin, 1);  // Turn on valve
+    }
     g_dispense_timer.valve_state = VALVE_OPEN;
-    DISPENSER_LOG("Valve OPEN (GPIO %lu)", gpio_pins.valve_control_pin);
+    DISPENSER_CRITICAL("Valve OPEN (GPIO %lu)", gpio_pins.valve_control_pin);
 }
 
 /**
@@ -1457,9 +1458,11 @@ static void dispenser_valve_open(void)
 static void dispenser_valve_close(void)
 {
     App_GPIO_Pins_t gpio_pins = Get_App_GPIO_Pins();
-    gpio_put(gpio_pins.valve_control_pin, 0);  // Turn off valve
+    if (gpio_pins.valve_control_pin != 0xFF) {
+        gpio_put(gpio_pins.valve_control_pin, 0);  // Turn off valve
+    }
     g_dispense_timer.valve_state = VALVE_CLOSED;
-    DISPENSER_LOG("Valve CLOSED (GPIO %lu)", gpio_pins.valve_control_pin);
+    DISPENSER_CRITICAL("Valve CLOSED (GPIO %lu)", gpio_pins.valve_control_pin);
 }
 
 /**

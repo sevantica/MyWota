@@ -14,7 +14,7 @@
 #define USB_COMMAND_ADAPTER_H_
 
 /* Includes ------------------------------------------------------------------*/
-#include "USB_Command_Handler.h"
+#include "CLI_Processor.h"
 #include <stdint.h>
 
 /**
@@ -28,10 +28,10 @@
 /* Exported types ------------------------------------------------------------*/
 typedef struct {
     const char* name;
-    USB_Command_Status_t (*handler)(int argc, char** argv);
+    CLI_Command_Status_t (*handler)(const CLI_Channel_t* channel, int argc, char** argv);
     const char* description;
     const char* usage;
-} USB_Command_Adapter_Entry_t;
+} CLI_Command_Adapter_Entry_t;
 
 /* Exported functions --------------------------------------------------------*/
 
@@ -39,7 +39,7 @@ typedef struct {
  * @brief Get project-specific command table
  * @return Pointer to command table array
  */
-const USB_Command_Adapter_Entry_t* USB_Command_Adapter_GetCommands(void);
+const CLI_Command_Adapter_Entry_t* USB_Command_Adapter_GetCommands(void);
 
 /**
  * @brief Get number of project-specific commands
@@ -51,7 +51,7 @@ size_t USB_Command_Adapter_GetCommandCount(void);
  * @brief Print project-specific status information
  * @details Called from cmd_status to display balance and controller state
  */
-void USB_Command_Adapter_PrintStatus(void);
+void USB_Command_Adapter_PrintStatus(const CLI_Channel_t* channel);
 
 /**
  * @brief Get project-specific includes string for display
