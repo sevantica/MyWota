@@ -1,4 +1,10 @@
 # PowerShell script for J-Link flashing - MyWota (RP2040)
+#
+# NOTE: SEGGER's built-in RP2040 flash loader sizes the QSPI part via SFDP. The
+# GigaDevice-equivalent (clone) flash on this board returns no valid SFDP, so SEGGER
+# fails with "Algo reported a flash size of 0 bytes". This script therefore programs
+# through the RP2040 bootrom flash routines (driven from a RAM stub over SWD) via the
+# shared Invoke-JLinkBootromFlash.ps1 helper, which never reads SFDP.
 param(
     [string]$BuildDir = "",
     [string]$ProjectName = "UI_PICO_PORT",
@@ -15,6 +21,12 @@ if ($BuildDir -eq "") {
     $BuildDir = Join-Path $ProjectDir "build"
 }
 
+$SharedFlasher = "C:\Business\Cross Project\VS Code Common\jlink-rp2040-flash\Invoke-JLinkBootromFlash.ps1"
+$JLinkPath = "C:\Program Files\SEGGER\JLink_V862\JLink.exe"
+$AppRunAddress = "0x10010000"
+$AppFlashOffset = 0x10000
+$BootloaderFlashOffset = 0x0
+
 function Get-NewestSharedBootloader {
     $BootloaderRoot = "C:\Business\Cross Project\VS Code Common\Pico bootloader"
     $BootloaderCandidates = @(
@@ -30,35 +42,17 @@ function Get-NewestSharedBootloader {
     return (Join-Path $BootloaderRoot "build\bootloader.bin")
 }
 
-$JLinkDevice = "RP2040_M0_0"
-$JLinkSpeed = 4000
-$JLinkPath = "C:\Program Files\SEGGER\JLink_V862\JLink.exe"
-$AppRunAddress = "0x10010000"
-$BootloaderRunAddress = "0x10000000"
-$AppProgramAddress = "0x12010000"
-$BootloaderProgramAddress = "0x12000000"
-
 $elfFile = Join-Path $BuildDir "$ProjectName.elf"
 $binFile = Join-Path $BuildDir "$ProjectName.bin"
-
-if ($WithBootloader) {
-    Write-Host "=== J-Link Flash: MyWota (RP2040) [WITH BOOTLOADER] ===" -ForegroundColor Cyan
-    if ([string]::IsNullOrWhiteSpace($BootloaderPath)) {
-        $BootloaderPath = Get-NewestSharedBootloader
-    }
-    if (-not (Test-Path $BootloaderPath)) {
-        Write-Error "Bootloader binary not found: $BootloaderPath"
-        Write-Host "Build the shared RP2040 bootloader first or specify -BootloaderPath." -ForegroundColor Yellow
-        exit 1
-    }
-} else {
-    Write-Host "=== J-Link Flash: MyWota (RP2040) [APPLICATION ONLY AT $AppRunAddress] ===" -ForegroundColor Cyan
-    Write-Host "WARNING: This app is linked for the bootloader boundary and will not boot from reset without a bootloader." -ForegroundColor Yellow
-}
 
 if (-not (Test-Path $elfFile)) {
     Write-Error "ELF file not found: $elfFile"
     Write-Host "Build the project first." -ForegroundColor Yellow
+    exit 1
+}
+
+if (-not (Test-Path $SharedFlasher)) {
+    Write-Error "Shared J-Link bootrom flasher not found: $SharedFlasher"
     exit 1
 }
 
@@ -75,53 +69,23 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-$jlinkCmdFile = Join-Path $BuildDir "jlink_flash_cmd.jlink"
-
+$images = @()
 if ($WithBootloader) {
-    Write-Host "Preparing J-Link commands for bootloader + app..."
-    @"
-r
-h
-loadbin "$BootloaderPath" $BootloaderProgramAddress
-loadbin "$binFile" $AppProgramAddress
-r
-go
-q
-"@ | Set-Content -Path $jlinkCmdFile -Encoding ASCII
+    Write-Host "=== J-Link Flash: MyWota (RP2040) [WITH BOOTLOADER, bootrom path] ===" -ForegroundColor Cyan
+    if ([string]::IsNullOrWhiteSpace($BootloaderPath)) {
+        $BootloaderPath = Get-NewestSharedBootloader
+    }
+    if (-not (Test-Path $BootloaderPath)) {
+        Write-Error "Bootloader binary not found: $BootloaderPath"
+        Write-Host "Build the shared RP2040 bootloader first or specify -BootloaderPath." -ForegroundColor Yellow
+        exit 1
+    }
+    $images += @{ Path = $BootloaderPath; Offset = $BootloaderFlashOffset }
 } else {
-    Write-Host "Preparing J-Link commands for app only..."
-    @"
-r
-h
-loadbin "$binFile" $AppProgramAddress
-r
-go
-q
-"@ | Set-Content -Path $jlinkCmdFile -Encoding ASCII
+    Write-Host "=== J-Link Flash: MyWota (RP2040) [APPLICATION ONLY AT $AppRunAddress, bootrom path] ===" -ForegroundColor Cyan
+    Write-Host "WARNING: This app is linked for the bootloader boundary and will not boot from reset without a bootloader." -ForegroundColor Yellow
 }
+$images += @{ Path = $binFile; Offset = $AppFlashOffset }
 
-Write-Host "Flashing via J-Link (SWD)..."
-Write-Host "  Device: $JLinkDevice"
-if ($WithBootloader) {
-    Write-Host "  Bootloader: $BootloaderPath @ QSPI $BootloaderProgramAddress (runs at $BootloaderRunAddress)"
-}
-Write-Host "  Application: $binFile @ QSPI $AppProgramAddress (runs at $AppRunAddress)"
-
-$jlinkOutput = & $JLinkPath -device $JLinkDevice -if SWD -speed $JLinkSpeed -autoconnect 1 -CommandFile $jlinkCmdFile 2>&1
-$jlinkExitCode = $LASTEXITCODE
-$jlinkOutput | ForEach-Object { Write-Host $_ }
-$jlinkOutputText = $jlinkOutput | Out-String
-
-if ($jlinkExitCode -ne 0 -or $jlinkOutputText -match "(?i)(\*\*\*\*\*\* Error|ERROR:|Unspecified error|Could not connect|Failed to power up DAP|VTref=0\.000V)") {
-    if ($jlinkOutputText -match "SEGGER_OPEN_GetFlashInfo\(\): Algo reported a flash size of 0 bytes") {
-        Write-Host "J-Link connected to the RP2040 core, but SEGGER's RP2040 QSPI flash loader could not detect the external flash." -ForegroundColor Yellow
-        Write-Host "Flash this board with picotool/BOOTSEL, then use the 'MyWota - J-Link Debug' launch config to debug the already-flashed app." -ForegroundColor Yellow
-    }
-    Write-Error "Flashing failed. J-Link reported an error."
-    if ($jlinkExitCode -ne 0) {
-        exit $jlinkExitCode
-    }
-    exit 1
-}
-
-Write-Host "Firmware flashed successfully!" -ForegroundColor Green
+& $SharedFlasher -Images $images -JLinkPath $JLinkPath
+exit $LASTEXITCODE

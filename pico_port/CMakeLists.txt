@@ -86,6 +86,7 @@ target_include_directories(pico_mbedtls_headers INTERFACE
 # Add the custom drivers library (includes FreeRTOS via FetchContent)
 # Note: MIFARE Transaction Core now included in sevantica_drivers
 add_subdirectory("${COMMON_PROJECT_DIR}/sevantica_drivers" ${CMAKE_CURRENT_BINARY_DIR}/drivers)
+target_compile_definitions(Drivers PRIVATE USB_LOG_ONLINE_TERMINAL_MIRROR=1)
 
 # Set C/C++ standards
 set(CMAKE_C_STANDARD 11)
@@ -172,7 +173,6 @@ set(APP_SOURCES
     ../application/Source/Adapters/MyWota_Command_Catalog.c
     ../application/Source/Tasks/Feedback_Task.c
     ../application/Source/Adapters/MIFARE_Volume_Adapter.c
-    ../application/Source/Tasks/RS485_Task.c
     ../application/Source/Tasks/RTC_Task.c
     ../application/Source/Tasks/SD_Logger_Task.c
     ../application/Source/Adapters/SD_Logger_Format_Adapter.c
@@ -289,6 +289,7 @@ target_compile_definitions(UI_PICO_PORT PRIVATE
     LIB_TINYUSB_DEVICE=1
     CFG_TUSB_MCU=OPT_MCU_RP2040
     USE_DRIVERS_USB=1
+    USB_LOG_ONLINE_TERMINAL_MIRROR=1
 )
 
 # USB CDC is handled by TinyUSB; UART0 is reserved for RS485.
@@ -317,14 +318,21 @@ if(NOT EXISTS "${RS485_SIGN_FIRMWARE_SCRIPT}")
     message(FATAL_ERROR "RS485 firmware signing tool not found: ${RS485_SIGN_FIRMWARE_SCRIPT}")
 endif()
 
-set(FW_ROLLOUT_BIN "${CMAKE_CURRENT_BINARY_DIR}/fw_rollout.bin")
+set(FW_ROLLOUT_BIN "${CMAKE_CURRENT_BINARY_DIR}/mywota.bin")
 set(FW_ROLLOUT_INPUT_BIN "${CMAKE_CURRENT_BINARY_DIR}/UI_PICO_PORT.bin")
 math(EXPR FW_ROLLOUT_MAX_TOTAL_SIZE "(2 * 1024 * 1024) - (16 * 1024) - 4096 - (64 * 1024) - (980 * 1024)")
+
+# Version is read from the header at build time (not configure time) so incremental
+# builds pick up patch bumps made by bump-version.ps1 without a full reconfigure.
+set(FW_VERSION_READ_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/scripts/read-fw-version.py")
+
 add_custom_command(
     OUTPUT "${FW_ROLLOUT_BIN}"
-    COMMAND ${Python3_EXECUTABLE} "${RS485_SIGN_FIRMWARE_SCRIPT}" "${FW_ROLLOUT_INPUT_BIN}" "${FW_ROLLOUT_BIN}" --product mywota --version "${FW_ROLLOUT_VERSION}" --max-total-size "${FW_ROLLOUT_MAX_TOTAL_SIZE}"
-    DEPENDS UI_PICO_PORT "${FW_ROLLOUT_INPUT_BIN}" "${RS485_SIGN_FIRMWARE_SCRIPT}" "${FIRMWARE_VERSION_HEADER}"
-    COMMENT "Generating MyWota signed firmware rollout container: fw_rollout.bin"
+    COMMAND ${Python3_EXECUTABLE} "${FW_VERSION_READ_SCRIPT}" "${FIRMWARE_VERSION_HEADER}"
+            --sign "${RS485_SIGN_FIRMWARE_SCRIPT}" "${FW_ROLLOUT_INPUT_BIN}" "${FW_ROLLOUT_BIN}"
+            --product mywota --max-total-size "${FW_ROLLOUT_MAX_TOTAL_SIZE}"
+    DEPENDS UI_PICO_PORT "${FW_ROLLOUT_INPUT_BIN}" "${RS485_SIGN_FIRMWARE_SCRIPT}" "${FIRMWARE_VERSION_HEADER}" "${FW_VERSION_READ_SCRIPT}"
+    COMMENT "Generating MyWota signed firmware rollout container: mywota.bin"
     VERBATIM
 )
 add_custom_target(UI_PICO_PORT_fw_rollout ALL DEPENDS "${FW_ROLLOUT_BIN}")

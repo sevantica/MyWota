@@ -29,6 +29,11 @@
 #include <string.h>
 #include <stdlib.h>
 
+/* Bind the real, channel-less USB logger before USB_Log_Printf is re-aliased
+ * below to the CLI-channel variant. RS485-origin handlers have no CLI channel,
+ * so their diagnostics log through this pointer instead. */
+static int (* const rs485_diag_log)(const char *format, ...) = USB_Log_Printf;
+
 #ifdef USB_Log_Printf
 #undef USB_Log_Printf
 #endif
@@ -277,6 +282,10 @@ bool MyWota_Command_Processor_ExecuteRS485(const RS485_Frame_t *rx_frame, uint8_
                 request.id = SYSTEM_CMD_ID_ADMIN_GRANT;
                 request.param1 = payload.session_id;
                 request.param2 = payload.duration_ms;
+                rs485_diag_log("[RS485 Slave] RX ADMIN_AUTH_GRANT seq=%u session=0x%08lX duration=%lums\r\n",
+                               (unsigned)sequence,
+                               (unsigned long)payload.session_id,
+                               (unsigned long)payload.duration_ms);
             }
             break;
 
@@ -289,6 +298,17 @@ bool MyWota_Command_Processor_ExecuteRS485(const RS485_Frame_t *rx_frame, uint8_
     }
 
     MyWota_Command_Processor_Execute(&request, NULL, NULL);
+
+    /* Post-execution cleanup: a single-command remote admin grant (session
+     * 0xFFFFFFFF) must persist until the *next* command consumes it. Clearing
+     * it here only makes sense for non-grant commands; doing it on the grant
+     * command itself would revoke admin before the privileged command (e.g.
+     * TRIGGER_CLEAN) ever arrives, causing it to be rejected as unauthorized. */
+    if (rx_frame->header.command != RS485_CMD_ADMIN_AUTH_GRANT &&
+        System_Command_GetRemoteAdminSessionID() == 0xFFFFFFFFu) {
+        System_Command_ClearRemoteAdminGrant();
+    }
+
     return true;
 }
 
@@ -319,7 +339,7 @@ static void dispatch_usb(const System_Command_Request_t *request, System_Command
 
         case SYSTEM_CMD_ID_CARD_TOPUP:
             if (status == SYSTEM_CMD_STATUS_OK) {
-                USB_Log_Printf("[✓] Card topup succeeded\r\n");
+                USB_Log_Printf("[✓] Card topup completed successfully\r\n");
             } else {
                 USB_Log_Printf("[✗] Card topup failed: %s\r\n", System_Command_GetStatusString(status));
             }
@@ -394,6 +414,12 @@ static void dispatch_usb(const System_Command_Request_t *request, System_Command
 static void dispatch_rs485(const System_Command_Request_t *request, System_Command_Status_t status)
 {
     uint8_t sequence = (uint8_t)request->session_id;
+
+    if (request->id == SYSTEM_CMD_ID_ADMIN_GRANT) {
+        rs485_diag_log("[RS485 Slave] TX %s for ADMIN_AUTH_GRANT seq=%u (status=%d)\r\n",
+                       (status == SYSTEM_CMD_STATUS_OK) ? "ACK" : "NAK",
+                       (unsigned)sequence, (int)status);
+    }
 
     if (status == SYSTEM_CMD_STATUS_OK) {
         RS485_Frame_t* response_frame = RS485_GetScratchFrame();

@@ -37,6 +37,8 @@
 /* Direct GPIO Pin Definitions (for source files that haven't migrated to Adapter yet) */
 #define I2C_0_SDA_PIN                   20
 #define I2C_0_SCL_PIN                   21
+#define I2C_1_SDA_PIN                   26
+#define I2C_1_SCL_PIN                   27
 #define PCD_RST_PIN                    14
 #define RS485_DATA_EN_PIN              9
 #define SYSTEM_COMM_LED_PIN            6

@@ -20,6 +20,8 @@
  */
 
 #include "RS485_Command_Interface.h"
+#include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -31,6 +33,11 @@ extern "C" {
  * @return RS485_OK on success
  */
 RS485_Result_t RS485_Command_Adapter_Init(void);
+
+bool RS485_Command_Adapter_GetFirmwareProgress(uint8_t *phase_out,
+											   uint8_t *progress_percent_out,
+											   uint32_t *completed_work_out,
+											   uint32_t *total_work_out);
 
 #ifdef __cplusplus
 }

@@ -64,7 +64,7 @@ static const HW_Pin_Map_t mywota_pin_map = {
         .default_baudrate = 0
     },
     
-    /* I2C0 - NFC/RFID and IO Expander */
+    /* I2C0 - IO Expander */
     .i2c_bus0 = {
         .i2c_instance = 0,
         .sda_pin = I2C_0_SDA_PIN,
@@ -72,11 +72,11 @@ static const HW_Pin_Map_t mywota_pin_map = {
         .default_baudrate = I2C0_DEFAULT_BAUDRATE
     },
     
-    /* I2C1 - Secondary */
+    /* I2C1 - NFC/RFID */
     .i2c_bus1 = {
         .i2c_instance = 1,
-        .sda_pin = 26,
-        .scl_pin = 27,
+        .sda_pin = I2C_1_SDA_PIN,
+        .scl_pin = I2C_1_SCL_PIN,
         .default_baudrate = I2C1_DEFAULT_BAUDRATE
     },
     
@@ -110,7 +110,7 @@ static const HW_Pin_Map_t mywota_pin_map = {
     .nfc = {
         .reset_pin = PCD_RST_PIN,     /* GPIO 14 - Fixed from 22 to avoid flow sensor conflict */
         .irq_pin = 0xFF,
-        .i2c_instance = 0,
+        .i2c_instance = 1,
         .i2c_address = 0x24
     },
     
@@ -182,10 +182,15 @@ static HW_Interface_Result_t mywota_hw_init(void)
                    pins->spi_bus0.mosi_pin, 
                    pins->spi_bus0.miso_pin);
 
-    /* I2C 0 - NFC and IO Expander */
+    /* I2C 0 - IO Expander */
     HAL_I2C_0_Init(pins->i2c_bus0.default_baudrate, 
                    pins->i2c_bus0.sda_pin, 
                    pins->i2c_bus0.scl_pin);
+
+    /* I2C 1 - NFC / PN532 */
+    HAL_I2C_1_Init(pins->i2c_bus1.default_baudrate,
+                   pins->i2c_bus1.sda_pin,
+                   pins->i2c_bus1.scl_pin);
 
 #if LOG_DEBUG_HW_ADAPTER_EN
     /* 1.1 Pre-Init NFC Reset to ensure it's awake for scanning */
@@ -217,7 +222,7 @@ static HW_Interface_Result_t mywota_hw_init(void)
     }
 
     /* Verify critical devices presence */
-    if (HAL_I2C_0_Probe(pins->nfc.i2c_address, 1000) < 0) {
+    if (HAL_I2C_1_Probe(pins->nfc.i2c_address, 1000) < 0) {
         LOG_DEBUG_HW("[HW_ADAPTER] CRITICAL: NFC (0x%02X) NOT detected!\r\n", pins->nfc.i2c_address);
     }
     

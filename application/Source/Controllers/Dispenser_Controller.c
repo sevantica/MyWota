@@ -13,9 +13,8 @@
 /**
  * @file Dispenser_Controller.c
  * @brief Dispenser business logic layer - manages balance (ml) and dispense operations
- * @details This layer polls MIFARE_Transaction_Manager for card data,
- *          makes business decisions, and updates card data accordingly.
- *          Follows the polling architecture pattern.
+ * @details This layer reacts to MIFARE transaction state, publishes operation/status
+ *          events, makes business decisions, and updates card data accordingly.
  *          
  *          Implements the common Application_Interface for interoperability
  *          with other MIFARE-based applications (e.g., car wash).
@@ -24,8 +23,6 @@
 /* Includes ------------------------------------------------------------------*/
 #include "Dispenser_Controller.h"
 #include "Application_Interface.h"
-#include "MIFARE_Transaction_Core.h"
-#include "MIFARE_Async_Mailbox.h"
 #include "MyWota_IO_Expander_Adapter.h"
 #include "USB_Logging.h"
 #include "CLI_Processor.h"
@@ -34,6 +31,7 @@
 #include "MyWota_System.h"
 #include "System_Config.h"
 #include "Heartbeat_Task.h"
+#include "Event_Broker.h"
 #include "Fault_Manager.h"
 #include "Task_Stack_Config.h"
 #include "YS_S201_Driver.h"
@@ -41,6 +39,8 @@
 #include "RTC_Manager.h"
 #include "FreeRTOS.h"
 #include "task.h"
+#include "queue.h"
+#include "semphr.h"
 #include <string.h>
 #include <stdio.h>
 #include "pico/stdlib.h"  /* For gpio_put */
@@ -71,52 +71,98 @@
 /* Convenience macro for debug logging */
 #define DISPENSER_LOG(fmt, ...) DISPENSER_DEBUG(fmt, ##__VA_ARGS__)
 
-/*Private variables -------------------------------------------------*/
+/* Private variables -------------------------------------------------*/
 
-static MIFARE_Result_t dispenser_wait_for_async_result(uint32_t timeout_ms)
+/* Decoupled event-driven Auth/Card state variables */
+static QueueHandle_t s_dispenser_event_queue = NULL;
+static StaticQueue_t s_dispenser_queue_buffer;
+static uint8_t s_dispenser_queue_storage[10 * sizeof(Event_t*)];
+static bool g_auth_card_present = false;
+static bool g_auth_card_ready = false;
+static uint32_t g_auth_card_balance = 0;
+static bool g_auth_card_admin = false;
+static uint8_t g_auth_card_uid[7] = {0};
+static uint8_t g_auth_card_uid_len = 0;
+
+/* Semaphore and result to handle synchronous Topup and Init Customer requests */
+static SemaphoreHandle_t s_trans_sem = NULL;
+static StaticSemaphore_t s_trans_sem_buffer;
+static DispenserResult_t s_trans_result = DISPENSER_RESULT_ERROR;
+
+/* Local stats tracking */
+static uint32_t g_dispenses_completed = 0;
+static uint32_t g_dispenses_failed = 0;
+static uint32_t g_total_volume_dispensed_ml = 0;
+
+static void process_dispenser_event(Event_t const *e)
 {
-    MIFARE_Result_t result = MIFARE_RESULT_BUSY;
-
-    TickType_t start_tick = xTaskGetTickCount();
-    while (pdTICKS_TO_MS(xTaskGetTickCount() - start_tick) <= (timeout_ms + 100u)) {
-        MIFARE_AsyncStatus_t status = MIFARE_GetAsyncStatus(&result);
-        if (status == MIFARE_ASYNC_STATUS_SUCCESS) {
-            return MIFARE_RESULT_OK;
+    if (e == NULL) return;
+    
+    switch (e->header.id) {
+        case EVT_RFID_CARD_DETECTED: {
+            Event_RFID_Detected_t* detected = (Event_RFID_Detected_t*)e;
+            g_auth_card_present = true;
+            g_auth_card_ready = true;
+            g_auth_card_uid_len = detected->uid_len;
+            if (detected->uid_len <= 7) {
+                memcpy(g_auth_card_uid, detected->uid, detected->uid_len);
+            }
+            DISPENSER_DEBUG("Event: CARD_DETECTED");
+            break;
         }
-        if (status == MIFARE_ASYNC_STATUS_FAIL) {
-            return result;
+        case EVT_RFID_CARD_REMOVED: {
+            g_auth_card_present = false;
+            g_auth_card_ready = false;
+            g_auth_card_balance = 0;
+            g_auth_card_admin = false;
+            g_auth_card_uid_len = 0;
+            DISPENSER_DEBUG("Event: CARD_REMOVED");
+            break;
         }
-        if (status == MIFARE_ASYNC_STATUS_TIMEOUT) {
-            return MIFARE_RESULT_TIMEOUT;
+        case EVT_RFID_STATE_CHANGED: {
+            Event_RFID_State_t* state_evt = (Event_RFID_State_t*)e;
+            if (state_evt->card_state == 0) { // absent
+                g_auth_card_present = false;
+                g_auth_card_ready = false;
+                g_auth_card_balance = 0;
+                g_auth_card_admin = false;
+                g_auth_card_uid_len = 0;
+            } else {
+                g_auth_card_present = true;
+                g_auth_card_ready = (state_evt->transaction_state == 1); // READY
+                g_auth_card_balance = state_evt->balance;
+                g_auth_card_admin = (state_evt->flags & 0x02); // ADMIN_CARD flag
+            }
+            DISPENSER_DEBUG("Event: STATE_CHANGED present=%d, ready=%d, balance=%lu", 
+                          g_auth_card_present, g_auth_card_ready, g_auth_card_balance);
+            break;
         }
-        if (status == MIFARE_ASYNC_STATUS_CANCELLED) {
-            return MIFARE_RESULT_ERROR;
+        case EVT_RFID_TRANSACTION_SUCCESS: {
+            s_trans_result = DISPENSER_RESULT_OK;
+            if (s_trans_sem != NULL) {
+                xSemaphoreGive(s_trans_sem);
+            }
+            DISPENSER_DEBUG("Event: TRANSACTION_SUCCESS");
+            break;
         }
-
-        System_ReportTaskStatus(SYSTEM_TASK_ID_DISPENSER, true);
-        vTaskDelay(pdMS_TO_TICKS(10));
+        case EVT_RFID_TRANSACTION_FAILED: {
+            s_trans_result = DISPENSER_RESULT_ERROR;
+            if (s_trans_sem != NULL) {
+                xSemaphoreGive(s_trans_sem);
+            }
+            DISPENSER_DEBUG("Event: TRANSACTION_FAILED");
+            break;
+        }
+        default:
+            break;
     }
-
-    return MIFARE_RESULT_TIMEOUT;
-}
-
-static MIFARE_Result_t dispenser_request_card_update(bool fast)
-{
-    const uint32_t timeout_ms = 2500;
-
-    if (!MIFARE_RequestUpdateCardAsync(fast, timeout_ms)) {
-        return MIFARE_RESULT_BUSY;
-    }
-
-    return dispenser_wait_for_async_result(timeout_ms);
 }
 
 /* Note: DispenserState_t enum is defined in Dispenser_Controller.h */
 
 /* Timing configuration */
 #define DISPENSER_DEDUCTION_INTERVAL_MS   50     /* Update in-memory balance every 50ms (faster response) */
-#define DISPENSER_FAST_WRITE_INTERVAL_MS    200    /* Write primary data every 200ms */
-#define DISPENSER_BACKUP_WRITE_INTERVAL_MS  500    /* Write backup data every 500ms */
+#define DISPENSER_PROGRESS_EVENT_INTERVAL_MS 250U
 
 static Dispenser_TimerState_t g_dispense_timer = {0};
 static DispenserState_t g_dispenser_state = DISPENSER_IDLE;
@@ -124,16 +170,6 @@ static uint8_t g_last_error = RS485_ERR_NONE;
 static TaskHandle_t dispenser_task_handle = NULL;
 static StaticTask_t dispenser_task_tcb;
 static StackType_t dispenser_task_stack[DISPENSER_TASK_STACK_WORDS];
-
-/* Card write timing - write less frequently to avoid slow I/O */
-static uint32_t g_last_card_write_time = 0;
-static uint32_t g_last_backup_write_time = 0;
-static uint32_t g_pending_deduction_ml = 0;  /* Accumulated deduction not yet written to card */
-
-/* Card removal detection via write failures (not polling) */
-#define DISPENSER_WRITE_FAILURE_THRESHOLD   1   /* Consecutive failures before confirming removal */
-static uint32_t g_consecutive_write_failures = 0;
-static bool g_card_removal_confirmed = false;  /* Set true when PN532 confirms card removed */
 
 /* No-card mode: dispense without card (for testing/maintenance) */
 static bool g_no_card_mode = false;
@@ -172,8 +208,10 @@ static uint32_t g_self_clean_last_flow_tick = 0;
 /*Private function prototypes ---------------------------------------*/
 static void dispenser_start_dispense(void);
 static void dispenser_start_dispense_internal(bool no_card_mode, uint32_t target_ml);
-static void dispenser_stop_dispense(const char* reason, uint8_t error_code);
+static void dispenser_stop_dispense(const char* reason, uint8_t error_code, Event_Operation_StopReason_t stop_reason);
 static bool dispense(uint32_t elapsed_ms);
+static void dispenser_publish_progress_event(uint32_t amount_ml, uint32_t remaining_ml, bool force);
+static void dispenser_publish_status_event(bool force);
 static bool dispenser_has_balance(void);
 static void dispenser_valve_open(void);
 static void dispenser_valve_close(void);
@@ -187,6 +225,155 @@ static void dispenser_clear_wait_for_flow_mode(void);
 uint8_t Dispenser_GetLastError(void)
 {
     return g_last_error;
+}
+
+void Dispenser_ClearLastError(void)
+{
+    g_last_error = RS485_ERR_NONE;
+    dispenser_publish_status_event(true);
+}
+
+static uint16_t dispenser_get_flow_clpm(void)
+{
+    if (!g_flow_sensor_initialized) {
+        return 0;
+    }
+
+    YS_S201_FlowData_t flow_data;
+    if (YS_S201_GetFlowData(&g_flow_sensor_handle, &flow_data) != YS_S201_OK) {
+        return 0;
+    }
+
+    float centilitres_per_minute = flow_data.flow_rate_lpm * 100.0f;
+    if (centilitres_per_minute < 0.0f) {
+        centilitres_per_minute = 0.0f;
+    }
+    if (centilitres_per_minute > 65000.0f) {
+        centilitres_per_minute = 65000.0f;
+    }
+    return (uint16_t)centilitres_per_minute;
+}
+
+static void dispenser_publish_status_event(bool force)
+{
+    uint32_t balance_ml = 0;
+    uint32_t remaining_ml = 0;
+    uint8_t flags = 0;
+    uint8_t peripheral_request_id = (uint8_t)RS485_PERIPHERAL_NONE;
+    uint8_t peripheral_request_level = RS485_PERIPHERAL_LEVEL_OFF;
+
+    if (g_dispense_timer.dispense_active) {
+        flags |= EVENT_DISPENSER_FLAG_ACTIVE;
+    }
+    if (g_no_card_mode) {
+        flags |= EVENT_DISPENSER_FLAG_NO_CARD_MODE;
+        remaining_ml = g_target_volume_ml;
+    } else {
+        balance_ml = g_auth_card_balance;
+        remaining_ml = g_auth_card_balance;
+    }
+    if (g_auth_card_present) {
+        flags |= EVENT_DISPENSER_FLAG_CARD_PRESENT;
+    }
+    if (g_self_clean_active) {
+        flags |= EVENT_DISPENSER_FLAG_SELF_CLEAN;
+    }
+    if (g_wait_for_flow_mode) {
+        flags |= EVENT_DISPENSER_FLAG_WAIT_FOR_FLOW;
+    }
+    if (g_dispense_timer.valve_state == VALVE_OPEN) {
+        flags |= EVENT_DISPENSER_FLAG_VALVE_OPEN;
+    }
+
+    Dispenser_GetPeripheralRequest(&peripheral_request_id, &peripheral_request_level);
+
+    uint16_t flow_clpm = dispenser_get_flow_clpm();
+
+    static uint8_t last_state = 0xFF;
+    static uint8_t last_flags = 0xFF;
+    static uint8_t last_error_code = 0xFF;
+    static uint8_t last_peripheral_request_id = 0xFF;
+    static uint8_t last_peripheral_request_level = 0xFF;
+    static uint32_t last_balance_ml = UINT32_MAX;
+    static uint32_t last_remaining_ml = UINT32_MAX;
+    static uint32_t last_dispensed_ml = UINT32_MAX;
+    static uint16_t last_flow_clpm = UINT16_MAX;
+
+    if (!force &&
+        last_state == (uint8_t)g_dispenser_state &&
+        last_flags == flags &&
+        last_error_code == g_last_error &&
+        last_peripheral_request_id == peripheral_request_id &&
+        last_peripheral_request_level == peripheral_request_level &&
+        last_balance_ml == balance_ml &&
+        last_remaining_ml == remaining_ml &&
+        last_dispensed_ml == g_dispense_timer.balance_deducted_ml &&
+        last_flow_clpm == flow_clpm) {
+        return;
+    }
+
+    Event_Dispenser_Status_t* status_evt = (Event_Dispenser_Status_t*)EventPool_Alloc(EVT_DISPENSER_STATUS_CHANGED,
+                                                                                       sizeof(Event_Dispenser_Status_t));
+    if (status_evt == NULL) {
+        return;
+    }
+
+    status_evt->state = (uint8_t)g_dispenser_state;
+    status_evt->flags = flags;
+    status_evt->error_code = g_last_error;
+    status_evt->peripheral_request_id = peripheral_request_id;
+    status_evt->peripheral_request_level = peripheral_request_level;
+    memset(status_evt->reserved, 0, sizeof(status_evt->reserved));
+    status_evt->balance_ml = balance_ml;
+    status_evt->remaining_ml = remaining_ml;
+    status_evt->dispensed_ml = g_dispense_timer.balance_deducted_ml;
+    status_evt->flow_clpm = flow_clpm;
+
+    EventBroker_Publish((Event_t*)status_evt);
+
+    last_state = (uint8_t)g_dispenser_state;
+    last_flags = flags;
+    last_error_code = g_last_error;
+    last_peripheral_request_id = peripheral_request_id;
+    last_peripheral_request_level = peripheral_request_level;
+    last_balance_ml = balance_ml;
+    last_remaining_ml = remaining_ml;
+    last_dispensed_ml = g_dispense_timer.balance_deducted_ml;
+    last_flow_clpm = flow_clpm;
+}
+
+static void dispenser_publish_progress_event(uint32_t amount_ml, uint32_t remaining_ml, bool force)
+{
+    static uint32_t last_progress_event_tick = 0;
+    static uint32_t last_progress_amount_ml = UINT32_MAX;
+    static uint32_t last_progress_remaining_ml = UINT32_MAX;
+
+    uint32_t now = xTaskGetTickCount();
+    bool interval_elapsed = pdTICKS_TO_MS(now - last_progress_event_tick) >= DISPENSER_PROGRESS_EVENT_INTERVAL_MS;
+    bool value_changed = (amount_ml != last_progress_amount_ml) ||
+                         (remaining_ml != last_progress_remaining_ml);
+
+    if (!force && (!interval_elapsed || !value_changed)) {
+        return;
+    }
+
+    Event_Operation_Progress_t* progress_evt = (Event_Operation_Progress_t*)EventPool_Alloc(EVT_OPERATION_PROGRESS,
+                                                                                             sizeof(Event_Operation_Progress_t));
+    if (progress_evt == NULL) {
+        return;
+    }
+
+    progress_evt->operation_kind = EVENT_OPERATION_KIND_DISPENSE;
+    progress_evt->operation_mode = g_no_card_mode ? EVENT_OPERATION_MODE_MANUAL : EVENT_OPERATION_MODE_AUTO;
+    progress_evt->reserved = 0;
+    progress_evt->amount_ml = amount_ml;
+    progress_evt->remaining_ml = remaining_ml;
+
+    EventBroker_Publish((Event_t*)progress_evt);
+    last_progress_event_tick = now;
+    last_progress_amount_ml = amount_ml;
+    last_progress_remaining_ml = remaining_ml;
+    dispenser_publish_status_event(force);
 }
 
 
@@ -208,6 +395,18 @@ DispenserResult_t MIFARE_Dispenser_Init(void)
     // because the site shares a single physical filter across all dispensers.
     Fault_Manager_Init();
     
+    // Initialize Event Queue and Semaphore
+    s_dispenser_event_queue = xQueueCreateStatic(10, sizeof(Event_t*), s_dispenser_queue_storage, &s_dispenser_queue_buffer);
+    if (s_dispenser_event_queue != NULL) {
+        EventBroker_Subscribe(s_dispenser_event_queue, EVT_RFID_CARD_DETECTED);
+        EventBroker_Subscribe(s_dispenser_event_queue, EVT_RFID_CARD_REMOVED);
+        EventBroker_Subscribe(s_dispenser_event_queue, EVT_RFID_STATE_CHANGED);
+        EventBroker_Subscribe(s_dispenser_event_queue, EVT_RFID_TRANSACTION_SUCCESS);
+        EventBroker_Subscribe(s_dispenser_event_queue, EVT_RFID_TRANSACTION_FAILED);
+    }
+    
+    s_trans_sem = xSemaphoreCreateBinaryStatic(&s_trans_sem_buffer);
+
     // Initialize YS-S201 water flow sensor (GPIO 22)
     App_GPIO_Pins_t gpio_pins = Get_App_GPIO_Pins();
     YS_S201_Status_t flow_status = YS_S201_Init(&g_flow_sensor_handle, gpio_pins.flow_sensor_pin);
@@ -217,6 +416,16 @@ DispenserResult_t MIFARE_Dispenser_Init(void)
         if (flow_status == YS_S201_OK) {
             g_flow_sensor_initialized = true;
             DISPENSER_CRITICAL("[✓] Flow sensor initialized on GPIO %lu", gpio_pins.flow_sensor_pin);
+
+            /* Apply configured flow calibration (pulses/L). 0 = keep driver default. */
+            uint16_t flow_ppl = g_system_config.dispenser_logic.flow_pulses_per_liter;
+            if (flow_ppl != 0) {
+                if (YS_S201_SetCalibration(&g_flow_sensor_handle, flow_ppl) == YS_S201_OK) {
+                    DISPENSER_CRITICAL("[✓] Flow calibration set to %u pulses/L", flow_ppl);
+                } else {
+                    DISPENSER_ERROR("[✗] Flow calibration value invalid: %u pulses/L", flow_ppl);
+                }
+            }
         } else {
             DISPENSER_ERROR("[✗] Flow sensor start failed: %d", flow_status);
         }
@@ -224,7 +433,7 @@ DispenserResult_t MIFARE_Dispenser_Init(void)
         DISPENSER_ERROR("[✗] Flow sensor init failed: %d", flow_status);
     }
     
-    // Register application interface for buzzer polling
+    // Register legacy application interface for command/RS485 snapshots
     const Application_Instance_t* app_interface = Dispenser_GetApplicationInterface();
     Application_Result_t app_result = Application_Register(app_interface);
     if (app_result == APP_RESULT_OK) {
@@ -234,6 +443,7 @@ DispenserResult_t MIFARE_Dispenser_Init(void)
     }
     
     DISPENSER_CRITICAL("[✓] Dispenser system initialized");
+    dispenser_publish_status_event(true);
 
     /* Arm boot-time safety self-clean if configured and last clean is stale.
      * Only fires when CCH appears absent (i.e. no clean has been commanded
@@ -262,13 +472,8 @@ DispenserResult_t MIFARE_Dispenser_Init(void)
  */
 static bool dispenser_has_balance(void)
 {
-    MIFARE_UserData_t *user_data = MIFARE_GetUserData();
-    if (!user_data) {
-        DISPENSER_DEBUG("has_balance: No user data available");
-        return false;
-    }
-    bool has_balance = (user_data->balance > 0);
-    DISPENSER_DEBUG("has_balance: balance=%lu ml, result=%s", user_data->balance, has_balance ? "YES" : "NO");
+    bool has_balance = (g_auth_card_balance > 0);
+    DISPENSER_DEBUG("has_balance: balance=%lu ml, result=%s", g_auth_card_balance, has_balance ? "YES" : "NO");
     return has_balance;
 }
 
@@ -279,16 +484,19 @@ static bool dispenser_has_balance(void)
  */
 static void dispenser_start_dispense_internal(bool no_card_mode, uint32_t target_ml)
 {
+    uint32_t start_balance_ml = 0;
+
     if (!no_card_mode) {
-        MIFARE_UserData_t *user_data = MIFARE_GetUserData();
-        if (!user_data || user_data->balance == 0) {
+        if (!g_auth_card_present || g_auth_card_balance == 0) {
             DISPENSER_ERROR("Cannot start dispense - no balance");
             return;
         }
+        start_balance_ml = g_auth_card_balance;
     }
     
     g_no_card_mode = no_card_mode;
     g_target_volume_ml = target_ml;
+    Dispenser_ClearLastError();
     if (no_card_mode) {
         dispenser_clear_wait_for_flow_mode();
     }
@@ -299,21 +507,35 @@ static void dispenser_start_dispense_internal(bool no_card_mode, uint32_t target
     g_dispense_timer.balance_deducted_ml = 0;
     g_dispense_timer.transaction_counted = false;  /* Will increment counter on first deduction */
     g_dispenser_state = DISPENSER_DISPENSE_IN_PROGRESS;
+
+    // Publish EVT_OPERATION_START event to represent dispense start
+    Event_Operation_Start_t* start_evt = (Event_Operation_Start_t*)EventPool_Alloc(EVT_OPERATION_START,
+                                                                                   sizeof(Event_Operation_Start_t));
+    if (start_evt != NULL) {
+        start_evt->operation_kind = EVENT_OPERATION_KIND_DISPENSE;
+        start_evt->operation_mode = no_card_mode ? EVENT_OPERATION_MODE_MANUAL : EVENT_OPERATION_MODE_AUTO;
+        start_evt->reserved = 0;
+        start_evt->target_ml = target_ml;
+        start_evt->balance_ml = start_balance_ml;
+        EventBroker_Publish((Event_t*)start_evt);
+    }
+    dispenser_publish_progress_event(0, no_card_mode ? target_ml : start_balance_ml, true);
+
     
-    // Reset card write tracking
-    g_last_card_write_time = g_dispense_timer.dispense_start_time;
-    g_last_backup_write_time = g_dispense_timer.dispense_start_time;
-    g_pending_deduction_ml = 0;
-    g_consecutive_write_failures = 0;  // Reset failure counter for new dispense session
-    g_card_removal_confirmed = false;  // Reset card removal flag
-    
-    // Capture starting flow volume for delta calculation
+    // Reset flow sensor volume to 0 at the start of each dispense session.
+    // This clears any residual pulses (deceleration) from previous sessions.
     if (g_flow_sensor_initialized) {
-        YS_S201_FlowData_t flow_data;
-        if (YS_S201_GetFlowData(&g_flow_sensor_handle, &flow_data) == YS_S201_OK) {
-            g_dispense_start_volume_ml = flow_data.total_volume_ml;
-            g_last_flow_volume_ml = flow_data.total_volume_ml;  // Initialize watchdog
-            DISPENSER_DEBUG("Flow sensor start volume: %.1f ml", g_dispense_start_volume_ml);
+        YS_S201_Reset(&g_flow_sensor_handle);
+        g_dispense_start_volume_ml = 0.0f;
+        g_last_flow_volume_ml = 0.0f;
+        DISPENSER_DEBUG("Flow sensor reset for new session");
+
+        /* Re-apply flow calibration from current config so a runtime change via
+         * `config set dispenser.flow_pulses_per_liter` takes effect on the next
+         * session without a reboot. 0 = keep driver default. */
+        uint16_t flow_ppl = g_system_config.dispenser_logic.flow_pulses_per_liter;
+        if (flow_ppl != 0) {
+            YS_S201_SetCalibration(&g_flow_sensor_handle, flow_ppl);
         }
     }
     
@@ -322,6 +544,7 @@ static void dispenser_start_dispense_internal(bool no_card_mode, uint32_t target
     
     // Open the valve to start dispensing
     dispenser_valve_open();
+    dispenser_publish_status_event(true);
     
     if (no_card_mode) {
         if (target_ml > 0) {
@@ -330,10 +553,7 @@ static void dispenser_start_dispense_internal(bool no_card_mode, uint32_t target
             DISPENSER_CRITICAL("[✓] Dispense STARTED - valve OPEN (no-card mode, unlimited)");
         }
     } else {
-        MIFARE_UserData_t *user_data = MIFARE_GetUserData();
-        (void)user_data;
-        DISPENSER_CRITICAL("[✓] Dispense STARTED - valve OPEN (balance: %lu ml)", 
-                         user_data ? user_data->balance : 0);
+        DISPENSER_CRITICAL("[✓] Dispense STARTED - valve OPEN (balance: %lu ml)", g_auth_card_balance);
     }
 }
 
@@ -349,11 +569,12 @@ static void dispenser_start_dispense(void)
  * @brief Stop the dispense
  * @param reason Reason for stopping (for logging)
  */
-static void dispenser_stop_dispense(const char* reason, uint8_t error_code)
+static void dispenser_stop_dispense(const char* reason, uint8_t error_code, Event_Operation_StopReason_t stop_reason)
 {
     if (!g_dispense_timer.dispense_active) {
         return;
     }
+    bool stopped_no_card_mode = g_no_card_mode;
     
     // Set last error
     g_last_error = error_code;
@@ -363,7 +584,7 @@ static void dispenser_stop_dispense(const char* reason, uint8_t error_code)
     
     g_dispense_timer.dispense_active = false;
     g_dispenser_state = DISPENSER_IDLE;
-    
+
     // Calculate dispensed volume from flow sensor
     float dispensed_ml = 0.0f;
     if (g_flow_sensor_initialized) {
@@ -373,22 +594,42 @@ static void dispenser_stop_dispense(const char* reason, uint8_t error_code)
         }
     }
     (void)dispensed_ml;
+
+    Event_Operation_Stop_t* stop_evt = (Event_Operation_Stop_t*)EventPool_Alloc(EVT_OPERATION_STOP,
+                                                                                sizeof(Event_Operation_Stop_t));
+    if (stop_evt != NULL) {
+        stop_evt->operation_kind = EVENT_OPERATION_KIND_DISPENSE;
+        stop_evt->operation_mode = stopped_no_card_mode ? EVENT_OPERATION_MODE_MANUAL : EVENT_OPERATION_MODE_AUTO;
+        stop_evt->stop_reason = (uint8_t)stop_reason;
+        stop_evt->error_code = error_code;
+        stop_evt->amount_ml = (uint32_t)(dispensed_ml + 0.5f);
+        EventBroker_Publish((Event_t*)stop_evt);
+    }
     
+    if (error_code == RS485_ERR_NONE) {
+        g_dispenses_completed++;
+        g_total_volume_dispensed_ml += (uint32_t)(dispensed_ml + 0.5f);
+    } else {
+        g_dispenses_failed++;
+    }
+
     if (g_no_card_mode) {
         // No-card mode: just log completion
         DISPENSER_CRITICAL("[✓] Dispense STOPPED - %s (dispensed: %.0f ml)", reason, dispensed_ml);
     } else {
-        // Card mode: log with warning if balance was lost
-        if (g_pending_deduction_ml > 0) {
-            DISPENSER_CRITICAL("[✗] Dispense STOPPED - %s (deducted: %lu ml, LOST: %lu ml not written to card)", 
-                             reason, g_dispense_timer.balance_deducted_ml, g_pending_deduction_ml);
-            g_pending_deduction_ml = 0;  // Reset for next session
-        } else {
-            DISPENSER_CRITICAL("[✓] Dispense STOPPED - %s (deducted: %lu ml this session)", 
-                             reason, g_dispense_timer.balance_deducted_ml);
-        }
+        DISPENSER_CRITICAL("[✓] Dispense STOPPED - %s (deducted: %lu ml this session)", 
+                          reason, g_dispense_timer.balance_deducted_ml);
     }
     
+    g_dispense_timer.valve_state = VALVE_CLOSED;
+
+    /* Publish the final status event while g_no_card_mode and g_target_volume_ml
+     * still reflect this session.  Clearing them first caused the else-branch of
+     * dispenser_publish_status_event to fall back to stale MIFARE user_data,
+     * emitting a non-zero balance_ml (e.g. 252 000 ml from the last card session)
+     * that briefly corrupted the LCD cardRemaining field. */
+    dispenser_publish_status_event(true);
+
     // Clear no-card mode
     g_no_card_mode = false;
     g_target_volume_ml = 0;
@@ -397,8 +638,6 @@ static void dispenser_stop_dispense(const char* reason, uint8_t error_code)
     g_wait_for_flow_mode = false;
     g_max_dispense_volume_ml = 0;
     g_flow_started = false;
-    
-    g_dispense_timer.valve_state = VALVE_CLOSED;
 
     /* Filter usage is tracked at the CCH (single shared filter per site).
      * The CCH derives volume from RS485 status (status.total_dispensed delta
@@ -475,21 +714,15 @@ static bool dispense(uint32_t elapsed_ms)
     uint32_t time_since_flow = pdTICKS_TO_MS(xTaskGetTickCount() - g_last_flow_change_tick);
     if (time_since_flow >= DISPENSER_FLOW_WATCHDOG_TIMEOUT_MS) {
         DISPENSER_CRITICAL("[→] No flow for %lu ms - stopping dispense", time_since_flow);
-        dispenser_stop_dispense("No flow timeout", RS485_ERR_NO_FLOW);
+        dispenser_stop_dispense("No flow timeout", RS485_ERR_NO_FLOW, EVENT_OPERATION_STOP_REASON_NO_FLOW);
         
         // Only set error state if in normal mode AND card is still present
-        // (card may have been removed during the 3s timeout)
-        if (!g_no_card_mode && MIFARE_IsCardPresent()) {
+        if (!g_no_card_mode && g_auth_card_present) {
             // Check if this is actually a balance issue
-            MIFARE_UserData_t *user_data = MIFARE_GetUserData();
-            if (user_data && user_data->balance == 0) {
-                // Balance is zero - this is a balance issue, not flow issue
-                MIFARE_SetTransactionState(TRANSACTION_STATE_READY);  // Keep card ready
+            if (g_auth_card_balance == 0) {
                 DISPENSER_CRITICAL("[✗] Insufficient balance to dispense");
                 DISPENSER_CRITICAL("[→] Card balance is 0 ml - please top up.");
             } else {
-                // Balance is available - this is a genuine flow sensor issue
-                MIFARE_SetTransactionState(TRANSACTION_STATE_ERROR_NO_FLOW);
                 DISPENSER_CRITICAL("[✗] No flow detected during dispense");
                 DISPENSER_CRITICAL("[→] Remove card and re-insert to retry.");
             }
@@ -507,11 +740,16 @@ static bool dispense(uint32_t elapsed_ms)
     if (g_no_card_mode) {
         // Update dispensed amount tracker (for UI display) - use rounding
         g_dispense_timer.balance_deducted_ml = (uint32_t)(volume_since_start + 0.5f);
+        uint32_t remaining_ml = 0;
+        if (g_target_volume_ml > g_dispense_timer.balance_deducted_ml) {
+            remaining_ml = g_target_volume_ml - g_dispense_timer.balance_deducted_ml;
+        }
+        dispenser_publish_progress_event(g_dispense_timer.balance_deducted_ml, remaining_ml, false);
         DISPENSER_DEBUG("No-card mode: total_deducted=%lu ml, volume_since_start=%.1f ml", 
                        g_dispense_timer.balance_deducted_ml, volume_since_start);
         
         if (g_target_volume_ml > 0 && volume_since_start >= (float)g_target_volume_ml) {
-            dispenser_stop_dispense("Target volume reached", RS485_ERR_NONE);
+            dispenser_stop_dispense("Target volume reached", RS485_ERR_NONE, EVENT_OPERATION_STOP_REASON_COMPLETE);
             return false;
         }
         return true;  // Continue dispensing
@@ -520,13 +758,12 @@ static bool dispense(uint32_t elapsed_ms)
     // STOP CONDITIONS 3-5 (card mode): Card removed, balance exhausted handled below
     
     // Card mode: deduct from balance
-    MIFARE_UserData_t *user_data = MIFARE_GetUserData();
-    if (!user_data) {
-        return true;  // Can't determine - assume card present
+    if (!g_auth_card_present) {
+        dispenser_stop_dispense("Card removed", RS485_ERR_CARD_REMOVED, EVENT_OPERATION_STOP_REASON_CARD_REMOVED);
+        return false;
     }
     
     // Calculate how much NEW volume to deduct (delta since last deduction)
-    // Use rounding instead of truncation to prevent undercharging
     uint32_t total_used_ml = (uint32_t)(volume_since_start + 0.5f);
     uint32_t to_deduct = 0;
     if (total_used_ml > g_dispense_timer.balance_deducted_ml) {
@@ -534,121 +771,35 @@ static bool dispense(uint32_t elapsed_ms)
     }
     
     // Clamp to available balance
-    if (to_deduct > user_data->balance) {
-        to_deduct = user_data->balance;  // Don't go negative
+    if (to_deduct > g_auth_card_balance) {
+        to_deduct = g_auth_card_balance;  // Don't go negative
     }
     
     if (to_deduct > 0) {
-        // Update balance in memory (fast - always do this)
-        MIFARE_UserData_t updated_user_data;
-        memcpy(&updated_user_data, user_data, sizeof(MIFARE_UserData_t));
-        updated_user_data.balance -= to_deduct;
-        /* Increment transaction counter only once per dispense session (not every deduction cycle) */
-        if (!g_dispense_timer.transaction_counted) {
-            updated_user_data.transaction_counter++;
-            g_dispense_timer.transaction_counted = true;
-        }
-        MIFARE_SetUserData(&updated_user_data);
+        // Update balance locally
+        g_auth_card_balance -= to_deduct;
         
         // Track total deducted this session (in ml)
         g_dispense_timer.balance_deducted_ml += to_deduct;
-        g_pending_deduction_ml += to_deduct;
         
         DISPENSER_DEBUG("Deducted: to_deduct=%lu ml, total_deducted=%lu ml, volume_since_start=%.1f ml", 
                        to_deduct, g_dispense_timer.balance_deducted_ml, volume_since_start);
+        dispenser_publish_progress_event(g_dispense_timer.balance_deducted_ml, g_auth_card_balance, false);
         
         // STOP CONDITION: Wait-for-flow mode - volume limit reached (check AFTER deduction)
         if (g_wait_for_flow_mode && g_flow_started) {
             if (g_dispense_timer.balance_deducted_ml >= g_max_dispense_volume_ml) {
                 DISPENSER_CRITICAL("[✓] Volume limit reached: %lu ml / %lu ml", 
                                  g_dispense_timer.balance_deducted_ml, g_max_dispense_volume_ml);
-                dispenser_stop_dispense("Volume limit reached", RS485_ERR_NONE);
+                dispenser_stop_dispense("Volume limit reached", RS485_ERR_NONE, EVENT_OPERATION_STOP_REASON_COMPLETE);
                 return false;
             }
         }
     }
     
-    // Check if we should write to card (Dual Interval: Fast=200ms, Backup=500ms)
-    {
-        uint32_t current_time = xTaskGetTickCount();
-        bool attempt_write = false;
-        bool is_fast_write = true;
-        
-        // 1. Check Backup Trigger (Full Write = Primary + Backup)
-        if (pdTICKS_TO_MS(current_time - g_last_backup_write_time) >= DISPENSER_BACKUP_WRITE_INTERVAL_MS && g_pending_deduction_ml > 0) {
-            attempt_write = true;
-            is_fast_write = false; // Full write
-        }
-        // 2. Check Fast Trigger (Primary Only)
-        else if (pdTICKS_TO_MS(current_time - g_last_card_write_time) >= DISPENSER_FAST_WRITE_INTERVAL_MS && g_pending_deduction_ml > 0) {
-            attempt_write = true;
-            is_fast_write = true; // Fast write
-        }
-        
-        if (attempt_write) {
-            // Feed watchdog before potentially long MIFARE operations
-            System_ReportTaskStatus(SYSTEM_TASK_ID_DISPENSER, true);
-            
-            // Request write from the MIFARE polling task (Fast or Full based on interval)
-            MIFARE_Result_t result = dispenser_request_card_update(is_fast_write);
-            
-            if (result == MIFARE_RESULT_OK) {
-#if LOG_DEBUG_DISPENSER_EN
-                MIFARE_UserData_t *written_user_data = MIFARE_GetUserData();
-                (void)written_user_data;
-                DISPENSER_DEBUG("Card write (%s): deducted %lu ml total, remaining: %lu ml", 
-                             is_fast_write ? "fast" : "FULL",
-                             g_pending_deduction_ml, written_user_data ? written_user_data->balance : 0);
-#endif
-                g_pending_deduction_ml = 0;
-                g_last_card_write_time = current_time;
-                g_consecutive_write_failures = 0;  // Reset on success
-                
-                if (!is_fast_write) {
-                    g_last_backup_write_time = current_time; // Update backup timer only on full write
-                }
-            } else {
-                g_consecutive_write_failures++;
-                DISPENSER_ERROR("Write failure (%s) #%lu: %s", 
-                             is_fast_write ? "fast" : "FULL",
-                             g_consecutive_write_failures, 
-                             MIFARE_GetResultString(result));
-            }
-            
-            // After N consecutive failures, verify card is actually gone via PN532 poll
-            if (g_consecutive_write_failures >= DISPENSER_WRITE_FAILURE_THRESHOLD) {
-                DISPENSER_CRITICAL("[→] %lu consecutive write failures - polling PN532 to confirm card state", 
-                                g_consecutive_write_failures);
-            
-                // Feed WDT before PN532 poll
-                System_ReportTaskStatus(SYSTEM_TASK_ID_DISPENSER, true);
-                
-                MIFARE_Result_t verify_result = MIFARE_SyncStateWithHardware();
-                if (verify_result != MIFARE_RESULT_OK) {
-                    // Card is confirmed removed
-                    DISPENSER_CRITICAL("[✗] Card removal CONFIRMED by PN532 poll");
-                    g_consecutive_write_failures = 0;
-                    g_card_removal_confirmed = true;  // Skip DISPENSER_WAITING_FOR_REMOVAL
-                    
-                    // Force immediate card removal (skip stability check - already confirmed)
-                    MIFARE_ForceCardRemoval();
-                    dispenser_stop_dispense("Card removed", RS485_ERR_CARD_REMOVED);
-                    
-                    return false;  // Signal card removed
-                } else {
-                    // Card is still there - RF interference or temporary issue
-                    DISPENSER_DEBUG("Card still present - resetting failure counter");
-                    g_consecutive_write_failures = 0;
-                }
-            }
-        }
-    }
-    
     // Check if balance exhausted
-    MIFARE_UserData_t *final_user_data = MIFARE_GetUserData();
-    (void)final_user_data;
-    if (final_user_data && final_user_data->balance == 0) {
-        dispenser_stop_dispense("Balance exhausted", RS485_ERR_LOW_BALANCE);
+    if (g_auth_card_balance == 0) {
+        dispenser_stop_dispense("Balance exhausted", RS485_ERR_LOW_BALANCE, EVENT_OPERATION_STOP_REASON_BALANCE);
         return false;
     }
     
@@ -661,8 +812,7 @@ static bool dispense(uint32_t elapsed_ms)
  */
 DispenserResult_t MIFARE_Dispenser_StartDispense(void)
 {
-    // In the new model, dispense starts automatically when card is detected
-    if (MIFARE_IsCardReady() && dispenser_has_balance()) {
+    if (g_auth_card_ready && dispenser_has_balance()) {
         dispenser_start_dispense();
         return DISPENSER_RESULT_OK;
     }
@@ -682,16 +832,15 @@ DispenserResult_t MIFARE_Dispenser_GetStatus(DispenserStatus_t *status)
     
     status->state = g_dispenser_state;
     status->dispense_active = g_dispense_timer.dispense_active;
-    status->card_present = MIFARE_IsCardPresent();
+    status->card_present = g_auth_card_present;
     status->dispense_bay_id = g_dispense_timer.dispense_bay_id;
     
-    // Get balance from card (0 in no-card mode)
+    // Get balance (0 in no-card mode)
     if (g_no_card_mode) {
         status->balance_ml = 0;
         status->remaining_ml = g_target_volume_ml;  // Target volume in no-card mode
     } else {
-        MIFARE_UserData_t *user_data = MIFARE_GetUserData();
-        status->balance_ml = user_data ? user_data->balance : 0;
+        status->balance_ml = g_auth_card_balance;
         status->remaining_ml = status->balance_ml;  // Remaining = current balance
     }
     
@@ -726,7 +875,7 @@ DispenserResult_t MIFARE_Dispenser_EmergencyStop(void)
         return DISPENSER_RESULT_OK;
     }
 
-    dispenser_stop_dispense("Emergency stop", RS485_ERR_EMERGENCY_STOP);
+    dispenser_stop_dispense("Emergency stop", RS485_ERR_EMERGENCY_STOP, EVENT_OPERATION_STOP_REASON_EMERGENCY);
     return DISPENSER_RESULT_OK;
 }
 
@@ -805,13 +954,13 @@ DispenserResult_t MIFARE_Dispenser_ManualStop(void)
         return DISPENSER_RESULT_OK;
     }
     
-    dispenser_stop_dispense("Manual stop", RS485_ERR_NONE);
+    dispenser_stop_dispense("Manual stop", RS485_ERR_NONE, EVENT_OPERATION_STOP_REASON_MANUAL);
     
     return DISPENSER_RESULT_OK;
 }
 
 /**
- * @brief Check if dispense is currently active (for buzzer polling)
+ * @brief Check if dispense is currently active (legacy snapshot helper)
  * @return true if dispense in progress, false otherwise
  */
 bool MIFARE_Dispenser_IsDispenseActive(void)
@@ -820,7 +969,7 @@ bool MIFARE_Dispenser_IsDispenseActive(void)
 }
 
 /**
- * @brief Get amount dispensed in current session (for buzzer polling)
+ * @brief Get amount dispensed in current session (legacy snapshot helper)
  * @return Amount dispensed in milliliters (0 if no dispense or nothing dispensed)
  */
 uint32_t Dispenser_GetDispensedAmountML(void)
@@ -831,15 +980,7 @@ uint32_t Dispenser_GetDispensedAmountML(void)
 /**
  * @brief Dispenser polling task - UNIFIED STATE MACHINE
  * 
- * Handles both card-based and no-card (manual) dispensing through the same state machine.
- * 
- * Sequence:
- * 1. Card scanned with balance > 0 → Dispense auto-starts (card mode)
- * 2. dispensestart command → Dispense starts (no-card mode)
- * 3. While dispensing: deduct from balance (card mode) or check target (no-card mode)
- * 4. Stops on: card removal, balance=0, target reached, no flow, or manual stop
- * 
- * @param argument Task argument (unused)
+ * 4. Stops on: card removal, balance=0, target reached, no flow, or manual stop.
  */
 static void MIFARE_Dispenser_Task(void* argument)
 {
@@ -852,11 +993,22 @@ static void MIFARE_Dispenser_Task(void* argument)
         TASK_HEARTBEAT_EVERY_SECOND("Dispenser");
         System_ReportTaskStatus(SYSTEM_TASK_ID_DISPENSER, true);
         
+        // Drain event queue to update auth state
+        if (s_dispenser_event_queue != NULL) {
+            Event_t* evt = NULL;
+            while (xQueueReceive(s_dispenser_event_queue, &evt, 0) == pdTRUE) {
+                if (evt != NULL) {
+                    process_dispenser_event(evt);
+                    Event_Release(evt);
+                }
+            }
+        }
+        
         // In no-card mode, skip card-related checks in IDLE state
         bool card_ready = false;
         static bool last_card_ready = false;
         if (!g_no_card_mode) {
-            card_ready = MIFARE_IsCardReady();
+            card_ready = g_auth_card_ready;
             // Log state transitions (edge detection)
             if (card_ready != last_card_ready) {
                 if (card_ready) {
@@ -873,40 +1025,38 @@ static void MIFARE_Dispenser_Task(void* argument)
             case DISPENSER_IDLE:
                 // Only check for card in card mode
                 if (!g_no_card_mode && card_ready) {
-                    if (MIFARE_IsAdminCard()) {
+                    if (g_auth_card_admin) {
                         DISPENSER_DEBUG("IDLE: Admin card present - no auto-dispense");
                         break;
-                    }
-
-                    // Get MIFARE state to check if auto-dispense is allowed
-                    MIFARE_TransactionState_t mifare_state = MIFARE_GetTransactionState();
-                    
-                    // Only auto-dispense if card is in normal READY state
-                    // Block auto-dispense for WAITING_REMOVAL (post-topup/init/deduction)
-                    if (mifare_state != TRANSACTION_STATE_READY) {
-                        DISPENSER_DEBUG("IDLE: Card ready but state=%d - no auto-dispense", mifare_state);
-                        break;  // Don't auto-dispense
                     }
                     
                     DISPENSER_DEBUG("IDLE: Card ready detected - checking for pending commands");
                     CLI_PendingCommandState_t* pending = CLI_GetPendingCommand();
                     if (pending != NULL && pending->active) {
                         DISPENSER_DEBUG("IDLE: Pending USB command found (cmd=%d) - skipping auto-dispense", pending->command);
+                        bool command_executed = false;
                         // For RECOVER command, verify UID matches before executing
                         if (pending->command == CLI_PENDING_CMD_RECOVER) {
-                            PN532_CardInfo_t card_info;
-                            if (MIFARE_GetCurrentCardInfo(&card_info)) {
-                                if (card_info.uid_length == pending->target_uid_length &&
-                                    memcmp(card_info.uid, pending->target_uid, pending->target_uid_length) == 0) {
-                                    // UID matches - execute recovery
-                                    CLI_ExecutePendingCommand(pending);
-                                }
-                                // UID doesn't match - don't execute, wait for correct card
+                            if (g_auth_card_uid_len == pending->target_uid_length &&
+                                memcmp(g_auth_card_uid, pending->target_uid, pending->target_uid_length) == 0) {
+                                // UID matches - execute recovery
+                                CLI_ExecutePendingCommand(pending);
+                                command_executed = true;
                             }
                         } else {
                             // Other commands (topup, cardinit) - execute immediately
                             CLI_ExecutePendingCommand(pending);
                             DISPENSER_DEBUG("IDLE: USB command executed");
+                            command_executed = true;
+                        }
+                        // A top-up/init/recover takes priority over dispensing. After it
+                        // runs, require the card to be removed before any other operation
+                        // (including auto-dispense) can start - prevents the just-topped-up
+                        // card from immediately auto-dispensing on the next poll cycle.
+                        if (command_executed) {
+                            DISPENSER_CRITICAL("[→] Card operation complete - remove card before next operation");
+                            g_dispenser_state = DISPENSER_WAITING_FOR_REMOVAL;
+                            g_card_last_seen_tick = xTaskGetTickCount();
                         }
                         // Don't auto-start dispense this cycle - let card be re-polled
                         break;
@@ -931,20 +1081,23 @@ static void MIFARE_Dispenser_Task(void* argument)
                     
                     if (elapsed_since_deduction >= DISPENSER_DEDUCTION_INTERVAL_MS) {
                         // Process flow and balance (handles all stop conditions)
+                        bool was_no_card_mode = g_no_card_mode;
                         bool should_continue = dispense(elapsed_since_deduction);
+                        uint8_t stop_error = g_last_error;
                         g_dispense_timer.last_deduction_time = current_time;
                         
                         if (!should_continue) {
                             // Dispense stopped - transition based on mode and reason
-                            if (!g_no_card_mode && !g_card_removal_confirmed) {
-                                // Card mode, card NOT confirmed removed - wait for removal
+                            if (!was_no_card_mode && g_auth_card_present) {
+                                // Card mode, card still present - wait for removal
                                 g_dispenser_state = DISPENSER_WAITING_FOR_REMOVAL;
                                 g_card_last_seen_tick = current_time;
                             } else {
-                                // No-card mode OR card already confirmed removed - go to IDLE
+                                // No-card mode OR card removed - go to IDLE
                                 g_dispenser_state = DISPENSER_IDLE;
-                                g_last_error = RS485_ERR_NONE;
-                                g_card_removal_confirmed = false;  // Reset flag
+                                if (stop_error == RS485_ERR_NONE || stop_error == RS485_ERR_CARD_REMOVED) {
+                                    g_last_error = RS485_ERR_NONE;
+                                }
                             }
                             break;
                         }
@@ -957,7 +1110,7 @@ static void MIFARE_Dispenser_Task(void* argument)
                 // This prevents automatic retry on flow timeout - user must remove and re-tap
                 {
                     // Check if card is no longer present (removed by user)
-                    bool card_is_present = MIFARE_IsCardPresent();
+                    bool card_is_present = g_auth_card_present;
                     
                     if (card_is_present) {
                         // Card still present - keep waiting for removal
@@ -981,13 +1134,12 @@ static void MIFARE_Dispenser_Task(void* argument)
          * truly idle (no card, no dispense). */
         if (g_self_clean_pending_safety &&
             g_dispenser_state == DISPENSER_IDLE &&
-            !MIFARE_IsCardPresent()) {
+            !g_auth_card_present) {
             g_self_clean_pending_safety = false;
             DISPENSER_CRITICAL("[→] Running boot safety self-clean");
             (void)Dispenser_StartSelfClean(0, 0);  /* use config defaults */
         }
 
-        // Adaptive polling: faster when dispensing or cleaning (timing-critical), slower when IDLE
         uint32_t poll_delay_ms =
             (g_dispenser_state == DISPENSER_DISPENSE_IN_PROGRESS ||
              g_dispenser_state == DISPENSER_SELF_CLEANING) ? 20 : 100;
@@ -1030,7 +1182,7 @@ void Task_Stop_Dispenser_Task(void)
     if (dispenser_task_handle != NULL) {
         // Stop any active dispense before deleting task
         if (g_dispense_timer.dispense_active) {
-            dispenser_stop_dispense("Task stopped", RS485_ERR_NONE);
+            dispenser_stop_dispense("Task stopped", RS485_ERR_NONE, EVENT_OPERATION_STOP_REASON_MANUAL);
         }
         vTaskDelete(dispenser_task_handle);
         dispenser_task_handle = NULL;
@@ -1043,7 +1195,7 @@ TaskHandle_t Dispenser_Task_GetHandle(void)
     return dispenser_task_handle;
 }
 
-/* UI Getter Functions -------------------------------------------------------*/
+/* Legacy Snapshot Helper Functions -----------------------------------------*/
 
 uint32_t Dispenser_GetBalanceMl(void)
 {
@@ -1052,8 +1204,7 @@ uint32_t Dispenser_GetBalanceMl(void)
         return 0;
     }
     
-    MIFARE_UserData_t *user_data = MIFARE_GetUserData();
-    return user_data ? user_data->balance : 0;
+    return g_auth_card_balance;
 }
 
 uint32_t Dispenser_GetDispenseVolumeRemainingMl(void)
@@ -1098,7 +1249,7 @@ void Dispenser_GetPeripheralRequest(uint8_t *out_pump_id, uint8_t *out_level)
     /* Card validated with balance: prime the booster so water flows
      * immediately when the valve opens. Once balance hits zero or the
      * card is removed, the MIFARE state leaves READY and this clears. */
-    else if (MIFARE_IsCardReady() && dispenser_has_balance()) {
+    else if (g_auth_card_ready && dispenser_has_balance()) {
         wants_pump = true;
     }
 
@@ -1113,14 +1264,12 @@ void Dispenser_GetPeripheralRequest(uint8_t *out_pump_id, uint8_t *out_level)
 
 uint32_t Dispenser_GetTotalDispensesCompleted(void)
 {
-    MIFARE_UsageData_t *usage_data = MIFARE_GetUsageData();
-    return usage_data ? usage_data->total_dispenses_completed : 0;
+    return g_dispenses_completed;
 }
 
 uint32_t Dispenser_GetTotalVolumePurchasedMl(void)
 {
-    MIFARE_UsageData_t *usage_data = MIFARE_GetUsageData();
-    return usage_data ? usage_data->total_volume_purchased : 0;
+    return g_total_volume_dispensed_ml;
 }
 
 float Dispenser_GetFlowRateLPM(void)
@@ -1227,7 +1376,7 @@ DispenserResult_t Dispenser_StartSelfClean(uint32_t volume_ml, uint32_t max_dura
         DISPENSER_ERROR("[✗] Self-clean refused: wait-and-dispense is armed");
         return DISPENSER_RESULT_BUSY;
     }
-    if (MIFARE_IsCardPresent()) {
+    if (g_auth_card_present) {
         DISPENSER_ERROR("[✗] Self-clean refused: card present");
         return DISPENSER_RESULT_BUSY;
     }
@@ -1260,7 +1409,19 @@ DispenserResult_t Dispenser_StartSelfClean(uint32_t volume_ml, uint32_t max_dura
     g_self_clean_active = true;
     g_dispenser_state = DISPENSER_SELF_CLEANING;
 
+    Event_Operation_Start_t* start_evt = (Event_Operation_Start_t*)EventPool_Alloc(EVT_OPERATION_START,
+                                                                                   sizeof(Event_Operation_Start_t));
+    if (start_evt != NULL) {
+        start_evt->operation_kind = EVENT_OPERATION_KIND_SELF_CLEAN;
+        start_evt->operation_mode = EVENT_OPERATION_MODE_AUTO;
+        start_evt->reserved = 0;
+        start_evt->target_ml = target;
+        start_evt->balance_ml = 0;
+        EventBroker_Publish((Event_t*)start_evt);
+    }
+
     dispenser_valve_open();
+    dispenser_publish_status_event(true);
     DISPENSER_CRITICAL("[→] Self-clean STARTED (target=%lu mL, max=%lu s)",
                        (unsigned long)target, (unsigned long)max_sec);
     return DISPENSER_RESULT_OK;
@@ -1287,7 +1448,7 @@ static void dispenser_self_clean_step(void)
     }
 
     /* Card pre-empts a clean cycle so a real customer never waits. */
-    if (MIFARE_IsCardPresent()) {
+    if (g_auth_card_present) {
         dispenser_self_clean_finish(false, "card detected");
         return;
     }
@@ -1341,6 +1502,18 @@ static void dispenser_self_clean_finish(bool success, const char* reason)
 
     g_self_clean_active = false;
     g_dispenser_state = DISPENSER_IDLE;
+    dispenser_publish_status_event(true);
+
+    Event_Operation_Stop_t* stop_evt = (Event_Operation_Stop_t*)EventPool_Alloc(EVT_OPERATION_STOP,
+                                                                                sizeof(Event_Operation_Stop_t));
+    if (stop_evt != NULL) {
+        stop_evt->operation_kind = EVENT_OPERATION_KIND_SELF_CLEAN;
+        stop_evt->operation_mode = EVENT_OPERATION_MODE_AUTO;
+        stop_evt->stop_reason = success ? EVENT_OPERATION_STOP_REASON_COMPLETE : EVENT_OPERATION_STOP_REASON_ERROR;
+        stop_evt->error_code = success ? RS485_ERR_NONE : RS485_ERR_GENERAL;
+        stop_evt->amount_ml = (uint32_t)(dispensed_ml + 0.5f);
+        EventBroker_Publish((Event_t*)stop_evt);
+    }
 
     if (success) {
         time_t now = RTC_GetUnixTime();
@@ -1370,18 +1543,39 @@ DispenserResult_t MIFARE_Dispenser_InitializeNewCustomer(uint32_t initial_balanc
 {
     DISPENSER_LOG("Initializing new customer card with %lu ml balance", initial_balance_ml);
     
-    const uint32_t timeout_ms = 10000;
-    MIFARE_Result_t result = MIFARE_RESULT_BUSY;
-    if (MIFARE_RequestInitCardAsync(initial_balance_ml, customer_id, timeout_ms)) {
-        result = dispenser_wait_for_async_result(timeout_ms);
+    if (s_trans_sem == NULL) {
+        return DISPENSER_RESULT_ERROR;
     }
     
-    if (result == MIFARE_RESULT_OK) {
-        DISPENSER_CRITICAL("[\u2713] New customer initialized with %lu ml balance", initial_balance_ml);
-        return DISPENSER_RESULT_OK;
+    // Allocate the request event
+    Event_RFID_InitCustomerRequest_t* req = (Event_RFID_InitCustomerRequest_t*)EventPool_Alloc(
+        EVT_RFID_INIT_CUSTOMER_REQUEST, sizeof(Event_RFID_InitCustomerRequest_t));
+    if (req == NULL) {
+        return DISPENSER_RESULT_ERROR;
+    }
+    req->initial_balance = initial_balance_ml;
+    req->customer_id = customer_id;
+    
+    // Reset transaction result
+    s_trans_result = DISPENSER_RESULT_ERROR;
+    
+    // Clear semaphore just in case it was left given
+    xSemaphoreTake(s_trans_sem, 0);
+    
+    // Publish request
+    EventBroker_Publish((Event_t*)req);
+    
+    // Wait on semaphore
+    if (xSemaphoreTake(s_trans_sem, pdMS_TO_TICKS(10000)) == pdTRUE) {
+        if (s_trans_result == DISPENSER_RESULT_OK) {
+            DISPENSER_CRITICAL("[✓] New customer initialized with %lu ml balance", initial_balance_ml);
+        } else {
+            DISPENSER_ERROR("Failed to initialize customer card");
+        }
+        return s_trans_result;
     }
     
-    DISPENSER_ERROR("Failed to initialize customer: %s", MIFARE_GetResultString(result));
+    DISPENSER_ERROR("Failed to initialize customer: Timeout");
     return DISPENSER_RESULT_ERROR;
 }
 
@@ -1392,25 +1586,51 @@ DispenserResult_t MIFARE_Dispenser_InitializeNewCustomer(uint32_t initial_balanc
  */
 DispenserResult_t MIFARE_Dispenser_TopupCard(uint32_t topup_ml)
 {
-    if (!MIFARE_IsCardReady()) {
+    if (!g_auth_card_ready) {
         DISPENSER_ERROR("Card not ready for topup");
-        return DISPENSER_RESULT_CARD_NOT_READY;
+        return DISPENSER_RESULT_ERROR;
+    }
+    
+    if (s_trans_sem == NULL) {
+        return DISPENSER_RESULT_ERROR;
     }
     
     DISPENSER_LOG("Adding %lu ml to card", topup_ml);
     
-    const uint32_t timeout_ms = 5000;
-    MIFARE_Result_t result = MIFARE_RESULT_BUSY;
-    if (MIFARE_RequestTopupAsync(topup_ml, timeout_ms)) {
-        result = dispenser_wait_for_async_result(timeout_ms);
+    // Allocate the request event
+    Event_RFID_TopupRequest_t* req = (Event_RFID_TopupRequest_t*)EventPool_Alloc(
+        EVT_RFID_TOPUP_REQUEST, sizeof(Event_RFID_TopupRequest_t));
+    if (req == NULL) {
+        return DISPENSER_RESULT_ERROR;
+    }
+    req->amount = topup_ml;
+    
+    // Reset transaction result
+    s_trans_result = DISPENSER_RESULT_ERROR;
+    
+    // Clear semaphore just in case it was left given
+    xSemaphoreTake(s_trans_sem, 0);
+    
+    // Publish request
+    EventBroker_Publish((Event_t*)req);
+    
+    // Wait on semaphore
+    if (xSemaphoreTake(s_trans_sem, pdMS_TO_TICKS(5000)) == pdTRUE) {
+        if (s_trans_result == DISPENSER_RESULT_OK) {
+            DISPENSER_CRITICAL("[✓] Added %lu ml to card", topup_ml);
+            
+            // Publish EVT_BALANCE_UPDATED to play the double beep feedback
+            Event_t* updated_evt = EventPool_Alloc(EVT_BALANCE_UPDATED, sizeof(Event_t));
+            if (updated_evt != NULL) {
+                EventBroker_Publish(updated_evt);
+            }
+        } else {
+            DISPENSER_ERROR("Failed to topup card");
+        }
+        return s_trans_result;
     }
     
-    if (result == MIFARE_RESULT_OK) {
-        DISPENSER_CRITICAL("[\u2713] Added %lu ml to card", topup_ml);
-        return DISPENSER_RESULT_OK;
-    }
-    
-    DISPENSER_ERROR("Failed to topup card: %s", MIFARE_GetResultString(result));
+    DISPENSER_ERROR("Failed to topup card: Timeout");
     return DISPENSER_RESULT_ERROR;
 }
 
@@ -1418,8 +1638,7 @@ DispenserResult_t MIFARE_Dispenser_TopupCard(uint32_t topup_ml)
 
 void MIFARE_Dispenser_UpdateUI(void)
 {
-    // UI polling implementation - polls this function to update display
-    // This is a placeholder - actual UI update logic goes here
+    // UI updates are delivered through EventBroker subscriptions.
 }
 
 void MIFARE_Dispenser_ResetTestMode(void)
@@ -1480,7 +1699,7 @@ static const char* dispenser_get_valve_state_name(ValveState_t state)
 }
 
 /**
- * @brief Get current valve state (for UI polling)
+ * @brief Get current valve state (legacy snapshot helper)
  * @return ValveState_t Current valve state
  */
 ValveState_t Dispenser_GetValveState(void)
@@ -1689,6 +1908,7 @@ static Application_Result_t dispenser_app_abort_clean(void)
  */
 static Application_Result_t dispenser_app_clear_fault(void)
 {
+    Dispenser_ClearLastError();
     Fault_Manager_Clear();
     return APP_RESULT_OK;
 }
@@ -1728,4 +1948,29 @@ static const Application_Instance_t s_dispenser_app_instance = {
 const Application_Instance_t* Dispenser_GetApplicationInterface(void)
 {
     return &s_dispenser_app_instance;
+}
+
+bool Dispenser_IsCardPresent(void)
+{
+    return g_auth_card_present;
+}
+
+bool Dispenser_IsCardReady(void)
+{
+    return g_auth_card_ready;
+}
+
+bool Dispenser_GetCardUID(uint8_t *uid_out, uint8_t *len_out)
+{
+    if (uid_out == NULL || len_out == NULL) {
+        return false;
+    }
+    if (!g_auth_card_present) {
+        *len_out = 0;
+        return false;
+    }
+    uint8_t len = (g_auth_card_uid_len <= 7) ? g_auth_card_uid_len : 7;
+    memcpy(uid_out, g_auth_card_uid, len);
+    *len_out = len;
+    return true;
 }

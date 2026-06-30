@@ -19,15 +19,14 @@
 /* Includes ------------------------------------------------------------------*/
 #include "RS485_Command_Adapter.h"
 #include "MyWota_Command_Processor.h"
-#include "RS485_Task.h"
 #include "RS485_Protocol.h"
 #include "RS485_Slave_Common_Handlers.h"
 #include "System_Command.h"
 #include "Dispenser_Controller.h"
 #include "Fault_Manager.h"
-#include "MIFARE_Transaction_Core.h"
-#include "PN532_Driver.h"
 #include "Application_Interface.h"
+
+extern TaskHandle_t task_get_handle_MIFARE_Polling_Task(void);
 #include "RTC_Manager.h"
 #include "RTC_Task.h"
 #include "SD_Logger_Task.h"
@@ -42,6 +41,9 @@
 #include "pico/time.h"
 #include "hardware/watchdog.h"
 #include <string.h>
+#include "RS485_Slave_App.h"
+#include "FreeRTOS.h"
+#include "task.h"
 
 /* Hardware Revision --------------------------------------------------------*/
 #ifndef RS485_ADAPTER_HW_REVISION
@@ -50,6 +52,7 @@
 
 /* Logging Configuration -----------------------------------------------------*/
 #define LOG_DEBUG_RS485_ADAPTER_EN  1
+#define RS485_FW_PROGRESS_DISPLAY_TIMEOUT_MS (90u * 1000u)
 
 #if LOG_DEBUG_RS485_ADAPTER_EN
     #define LOG_DEBUG_ADAPTER(...) USB_Log_Printf(__VA_ARGS__)
@@ -63,6 +66,7 @@ static bool cmd_get_device_info(const RS485_Frame_t *rx_frame, uint8_t sequence)
 static bool cmd_get_config(const RS485_Frame_t *rx_frame, uint8_t sequence);
 static bool cmd_heartbeat(const RS485_Frame_t *rx_frame, uint8_t sequence);
 static bool cmd_control_forward(const RS485_Frame_t *rx_frame, uint8_t sequence);
+static bool cmd_fw_progress(const RS485_Frame_t *rx_frame, uint8_t sequence);
 static bool cmd_debug_cmd(const RS485_Frame_t *rx_frame, uint8_t sequence);
 static bool cmd_debug_fetch(const RS485_Frame_t *rx_frame, uint8_t sequence);
 
@@ -73,6 +77,11 @@ static void rs485_send_response(uint8_t sequence, RS485_Command_t command,
                                  const void* payload, uint16_t length);
 static void rs485_fw_exclusive_changed(bool active, void *context);
 static void rs485_set_optional_task(TaskHandle_t handle, System_Task_ID_t task_id, bool suspend);
+static void rs485_log_status_edge(const char *source,
+                                  const RS485_Device_Status_t *status,
+                                  uint8_t *last_flags,
+                                  uint8_t *last_peripheral_request_id,
+                                  uint8_t *last_peripheral_request_level);
 
 /* Command Table -------------------------------------------------------------*/
 static const RS485_Command_Entry_t adapter_commands[] = {
@@ -94,12 +103,21 @@ static const RS485_Command_Entry_t adapter_commands[] = {
     {RS485_CMD_FW_DATA,          RS485_SlaveCommon_FW_HandleData,    "FW data chunk"},
     {RS485_CMD_FW_VERIFY,        RS485_SlaveCommon_FW_HandleVerify,  "FW verify image"},
     {RS485_CMD_FW_APPLY,         RS485_SlaveCommon_FW_HandleApply,   "FW apply / reboot"},
+    {RS485_CMD_FW_PROGRESS,      cmd_fw_progress,                    "FW progress notification"},
     {RS485_CMD_GET_TRANSACTIONS, RS485_SlaveCommon_TxnHandleGet,     "Pull pending transactions"},
     {RS485_CMD_TRANSACTION_ACK,  RS485_SlaveCommon_TxnHandleAck,     "Ack uploaded transactions"},
+    {RS485_CMD_POLL_EVENTS,      RS485_SlaveCommon_EventHandlePoll,  "Poll pending events"},
     /* Debug & Remote command output capture handlers */
     {RS485_CMD_DEBUG_CMD,        cmd_debug_cmd,                      "Execute remote debug command"},
     {RS485_CMD_DEBUG_FETCH,      cmd_debug_fetch,                    "Fetch debug output chunk"},
 };
+
+static struct {
+    bool active;
+    TickType_t last_update_tick;
+    RS485_FW_Progress_Payload_t payload;
+} s_fw_progress_display = {0};
+static bool s_fw_progress_stop_issued = false;
 
 static const RS485_Command_Interface_t command_interface = {
     .commands = adapter_commands,
@@ -140,6 +158,48 @@ RS485_Result_t RS485_Command_Adapter_Init(void)
     return result;
 }
 
+bool RS485_Command_Adapter_GetFirmwareProgress(uint8_t *phase_out,
+                                               uint8_t *progress_percent_out,
+                                               uint32_t *completed_work_out,
+                                               uint32_t *total_work_out)
+{
+    RS485_FW_Progress_Payload_t payload;
+    TickType_t last_update_tick;
+    bool active;
+
+    taskENTER_CRITICAL();
+    active = s_fw_progress_display.active;
+    last_update_tick = s_fw_progress_display.last_update_tick;
+    payload = s_fw_progress_display.payload;
+    taskEXIT_CRITICAL();
+
+    if (!active) {
+        return false;
+    }
+    if ((xTaskGetTickCount() - last_update_tick) > pdMS_TO_TICKS(RS485_FW_PROGRESS_DISPLAY_TIMEOUT_MS)) {
+        taskENTER_CRITICAL();
+        s_fw_progress_display.active = false;
+        s_fw_progress_stop_issued = false;
+        taskEXIT_CRITICAL();
+        return false;
+    }
+
+    if (phase_out != NULL) {
+        *phase_out = payload.phase;
+    }
+    if (progress_percent_out != NULL) {
+        *progress_percent_out = payload.progress_percent;
+    }
+    if (completed_work_out != NULL) {
+        *completed_work_out = payload.completed_work;
+    }
+    if (total_work_out != NULL) {
+        *total_work_out = payload.total_work;
+    }
+
+    return true;
+}
+
 static void rs485_set_optional_task(TaskHandle_t handle, System_Task_ID_t task_id, bool suspend)
 {
     if (handle == NULL) {
@@ -154,6 +214,38 @@ static void rs485_set_optional_task(TaskHandle_t handle, System_Task_ID_t task_i
         System_SetTaskMonitoringEnabled(task_id, true);
         System_ReportTaskStatus(task_id, true);
     }
+}
+
+static void rs485_log_status_edge(const char *source,
+                                  const RS485_Device_Status_t *status,
+                                  uint8_t *last_flags,
+                                  uint8_t *last_peripheral_request_id,
+                                  uint8_t *last_peripheral_request_level)
+{
+    if (status == NULL || last_flags == NULL ||
+        last_peripheral_request_id == NULL || last_peripheral_request_level == NULL) {
+        return;
+    }
+
+    if (*last_flags == status->flags &&
+        *last_peripheral_request_id == status->peripheral_request_id &&
+        *last_peripheral_request_level == status->peripheral_request_level) {
+        return;
+    }
+
+    LOG_DEBUG_ADAPTER("[RS485_ADAPTER] %s status edge: flags=0x%02X dispensing=%u self_clean=%u pump=%u level=%u valve=%u flow=%u\r\n",
+                      source,
+                      (unsigned)status->flags,
+                      (unsigned)((status->flags & RS485_STATUS_FLAG_DISPENSING) != 0u),
+                      (unsigned)((status->flags & RS485_STATUS_FLAG_SELF_CLEANING) != 0u),
+                      (unsigned)status->peripheral_request_id,
+                      (unsigned)status->peripheral_request_level,
+                      (unsigned)status->valve_cmd,
+                      (unsigned)status->flow_clpm);
+
+    *last_flags = status->flags;
+    *last_peripheral_request_id = status->peripheral_request_id;
+    *last_peripheral_request_level = status->peripheral_request_level;
 }
 
 static void rs485_fw_exclusive_changed(bool active, void *context)
@@ -171,7 +263,6 @@ static void rs485_fw_exclusive_changed(bool active, void *context)
 
     rs485_set_optional_task(task_get_handle_MIFARE_Polling_Task(), SYSTEM_TASK_ID_MIFARE_POLLING, active);
     rs485_set_optional_task(Dispenser_Task_GetHandle(), SYSTEM_TASK_ID_DISPENSER, active);
-    rs485_set_optional_task(task_get_handle_LCD_Display_Driver_Task(), SYSTEM_TASK_ID_LCD_DISPLAY, active);
     rs485_set_optional_task(Feedback_Task_GetHandle(), SYSTEM_TASK_ID_BUZZER_POLLING, active);
     rs485_set_optional_task(SD_Logger_Task_GetHandle(), SYSTEM_TASK_ID_SD_LOGGER, active);
     rs485_set_optional_task(RTC_Task_GetHandle(), SYSTEM_TASK_ID_RTC, active);
@@ -186,6 +277,13 @@ static void rs485_fw_exclusive_changed(bool active, void *context)
 static bool cmd_poll_status(const RS485_Frame_t *rx_frame, uint8_t sequence)
 {
     (void)rx_frame;  /* No payload expected */
+    static uint8_t cached_uid[7];
+    static uint8_t cached_uid_length = 0;
+    static uint32_t cached_balance = 0;
+    static bool cached_balance_valid = false;
+    static uint8_t last_logged_flags = 0xFFu;
+    static uint8_t last_logged_peripheral_request_id = 0xFFu;
+    static uint8_t last_logged_peripheral_request_level = 0xFFu;
     
     RS485_Device_Status_t status = {0};
     
@@ -226,6 +324,7 @@ static bool cmd_poll_status(const RS485_Frame_t *rx_frame, uint8_t sequence)
     status.flow_clpm_min = flow_min;
     status.flow_clpm_max = flow_max;
     status.valve_cmd     = Dispenser_IsValveCommanded() ? 1u : 0u;
+    status.total_dispensed = Dispenser_GetDispensedAmountML();
     uint32_t admin_remaining_ms = System_Command_GetAdminRemainingMs();
     if (admin_remaining_ms > 0u) {
         status.flags |= RS485_STATUS_FLAG_ADMIN_AUTH;
@@ -235,22 +334,35 @@ static bool cmd_poll_status(const RS485_Frame_t *rx_frame, uint8_t sequence)
         status.reserved_v2 = 0u;
     }
     
-    /* Get card information if available */
-    if (MIFARE_IsCardReady()) {
+    /* Get card information if available. Error/waiting states are still
+     * card-present and should keep reporting the UID. */
+    if (Dispenser_IsCardPresent()) {
         status.flags |= RS485_STATUS_FLAG_CARD_PRESENT;
         
-        /* Get card info using existing API */
-        PN532_CardInfo_t card_info;
-        if (MIFARE_GetCurrentCardInfo(&card_info)) {
-            uint8_t uid_len = (card_info.uid_length <= 7) ? card_info.uid_length : 7;
-            memcpy(status.card_uid, card_info.uid, uid_len);
+        uint8_t uid_len = 0;
+        if (Dispenser_GetCardUID(status.card_uid, &uid_len)) {
             status.card_uid_length = uid_len;
+            status.balance = Dispenser_GetBalanceMl();
+            memcpy(cached_uid, status.card_uid, uid_len);
+            cached_uid_length = uid_len;
+            cached_balance = status.balance;
+            cached_balance_valid = true;
+        } else if (cached_balance_valid && cached_uid_length == uid_len &&
+                   memcmp(cached_uid, status.card_uid, uid_len) == 0) {
+            status.balance = cached_balance;
         }
+    } else {
+        cached_balance_valid = false;
+        cached_uid_length = 0;
     }
     
     /* Send status response */
     rs485_send_response(sequence, RS485_CMD_STATUS_RESPONSE, 
                         &status, sizeof(RS485_Device_Status_t));
+    rs485_log_status_edge("poll", &status,
+                          &last_logged_flags,
+                          &last_logged_peripheral_request_id,
+                          &last_logged_peripheral_request_level);
     
     LOG_DEBUG_ADAPTER("[RS485_ADAPTER] Status sent: state=%d, balance=%lu, card=%s\r\n",
                       status.state, status.balance, 
@@ -347,6 +459,49 @@ static bool cmd_control_forward(const RS485_Frame_t *rx_frame, uint8_t sequence)
     return MyWota_Command_Processor_ExecuteRS485(rx_frame, sequence);
 }
 
+static bool cmd_fw_progress(const RS485_Frame_t *rx_frame, uint8_t sequence)
+{
+    RS485_FW_Progress_Payload_t payload;
+    bool display_active;
+
+    if (rx_frame == NULL || rx_frame->header.length < sizeof(payload)) {
+        rs485_send_nak(sequence, RS485_NAK_INVALID_PARAM);
+        return true;
+    }
+
+    memcpy(&payload, rx_frame->payload, sizeof(payload));
+    if (payload.progress_percent > 100u) {
+        payload.progress_percent = 100u;
+    }
+    if (payload.total_work != 0u && payload.completed_work > payload.total_work) {
+        payload.completed_work = payload.total_work;
+    }
+
+    display_active = payload.phase != RS485_FW_PROGRESS_PHASE_IDLE &&
+                     payload.phase != RS485_FW_PROGRESS_PHASE_COMPLETE &&
+                     payload.phase != RS485_FW_PROGRESS_PHASE_FAILED &&
+                     payload.phase != RS485_FW_PROGRESS_PHASE_CANCELLED;
+
+    if (display_active) {
+        bool should_stop = !s_fw_progress_stop_issued || Dispenser_IsDispenseActive();
+        if (should_stop) {
+            (void)MIFARE_Dispenser_ManualStop();
+            s_fw_progress_stop_issued = true;
+        }
+    } else {
+        s_fw_progress_stop_issued = false;
+    }
+
+    taskENTER_CRITICAL();
+    s_fw_progress_display.payload = payload;
+    s_fw_progress_display.last_update_tick = xTaskGetTickCount();
+    s_fw_progress_display.active = display_active;
+    taskEXIT_CRITICAL();
+
+    rs485_send_ack(sequence);
+    return true;
+}
+
 /* Helper Functions ----------------------------------------------------------*/
 
 /**
@@ -419,6 +574,16 @@ static bool cmd_debug_cmd(const RS485_Frame_t *rx_frame, uint8_t sequence)
         .context = NULL
     };
     CLI_Execute(cmd_line, &capture_channel);
+
+    CLI_PendingCommandState_t *pending = CLI_GetPendingCommand();
+    if (pending != NULL && pending->channel == &capture_channel) {
+        pending->channel = NULL;
+    }
+
+    /* Post-execution cleanup: if remote admin is single-command, clear it */
+    if (System_Command_GetRemoteAdminSessionID() == 0xFFFFFFFFu) {
+        System_Command_ClearRemoteAdminGrant();
+    }
 #endif
 
     uint8_t payload[3];
@@ -462,3 +627,147 @@ static bool cmd_debug_fetch(const RS485_Frame_t *rx_frame, uint8_t sequence)
 
     return true;
 }
+
+/* RS485 Slave App Callbacks -------------------------------------------------*/
+
+/**
+ * @brief Get Slave configuration details for AO RS485 startup
+ */
+bool RS485_SlaveApp_GetConfig(RS485_SlaveApp_Config_t* config)
+{
+    if (config == NULL) {
+        return false;
+    }
+
+    /* Stage firmware updates in upper half of flash. PICO_FLASH_SIZE_BYTES is
+     * supplied by the pico-sdk; fall back to 2 MB if undefined. */
+#ifndef PICO_FLASH_SIZE_BYTES
+#define PICO_FLASH_SIZE_BYTES (2u * 1024u * 1024u)
+#endif
+    const uint32_t fw_bootloader_size = 64u * 1024u;
+    const uint32_t fw_app_max_size = 980u * 1024u;
+    const uint32_t fw_stage_offset = fw_bootloader_size + fw_app_max_size;
+    const uint32_t fw_stage_max = (uint32_t)PICO_FLASH_SIZE_BYTES - fw_stage_offset - (16u * 1024u);
+
+    config->device_type = RS485_DEVICE_TYPE_WATER_DISPENSER;
+    config->default_address = 0x01;
+    config->fw_major = FW_VERSION_MAJOR;
+    config->fw_minor = FW_VERSION_MINOR;
+    config->fw_patch = FW_VERSION_PATCH;
+    config->fw_flash_offset = fw_stage_offset;
+    config->fw_max_size = fw_stage_max;
+    config->enable_file_transfer = false;
+
+    return true;
+}
+
+/**
+ * @brief Register command handlers and firmware-exclusive callbacks
+ */
+void RS485_SlaveApp_RegisterHandlers(void)
+{
+    (void)RS485_RegisterCommandInterface(&command_interface);
+    RS485_SlaveCommon_FW_SetExclusiveCallback(rs485_fw_exclusive_changed, NULL);
+}
+
+/**
+ * @brief Update the cached device status sent back to master on status poll
+ */
+void RS485_SlaveApp_UpdateStatus(void)
+{
+    static uint16_t cached_flow_clpm = 0xFFFF;
+    static uint16_t cached_flow_clpm_min = 0xFFFF;
+    static uint16_t cached_flow_clpm_max = 0xFFFF;
+    static uint32_t last_sample_tick = 0;
+    static uint8_t last_logged_flags = 0xFFu;
+    static uint8_t last_logged_peripheral_request_id = 0xFFu;
+    static uint8_t last_logged_peripheral_request_level = 0xFFu;
+    
+    RS485_Device_Status_t status = {0};
+    
+    /* Get application instance */
+    const Application_Instance_t* app = Application_GetActive();
+    
+    if (app != NULL && app->callbacks != NULL) {
+        status.device_type = app->type;
+        
+        if (app->callbacks->get_state != NULL) {
+            status.state = app->callbacks->get_state();
+        }
+        
+        if (app->callbacks->get_primary_balance != NULL) {
+            status.balance = app->callbacks->get_primary_balance();
+        }
+        
+        if (app->callbacks->is_operation_active != NULL) {
+            if (app->callbacks->is_operation_active()) {
+                status.flags |= RS485_STATUS_FLAG_DISPENSING;
+            }
+        }
+    }
+
+    /* Get last error from Dispenser Controller directly */
+    status.error_code = Dispenser_GetLastError();
+
+    /* Self-clean reporting (CCH-orchestrated periodic flush) */
+    if (Dispenser_IsSelfCleaning()) {
+        status.flags |= RS485_STATUS_FLAG_SELF_CLEANING;
+    }
+    status.last_clean_unix_time = Dispenser_GetLastCleanUnixTime();
+
+    /* Fault state machine */
+    status.fault_state          = (uint8_t)Fault_Manager_GetState();
+    status.fault_reason         = (uint8_t)Fault_Manager_GetReason();
+    status.filter_remaining_pct = 0xFF;  /* N/A from slave; CCH derives it */
+
+    /* Pressure / booster pump request */
+    Dispenser_GetPeripheralRequest(&status.peripheral_request_id, &status.peripheral_request_level);
+
+    /* Flow diagnostics: latest + 8-sample min/max ring; valve commanded state.
+     * Sampled once per second (every 1000ms) to populate the 8-sample ring buffer correctly. */
+    uint32_t now = xTaskGetTickCount();
+    if (last_sample_tick == 0 || (now - last_sample_tick >= pdMS_TO_TICKS(1000))) {
+        last_sample_tick = now;
+        Dispenser_SampleFlowDiagnostics(&cached_flow_clpm, &cached_flow_clpm_min, &cached_flow_clpm_max);
+    }
+    status.flow_clpm     = cached_flow_clpm;
+    status.flow_clpm_min = cached_flow_clpm_min;
+    status.flow_clpm_max = cached_flow_clpm_max;
+    status.valve_cmd     = Dispenser_IsValveCommanded() ? 1u : 0u;
+
+    uint32_t admin_remaining_ms = System_Command_GetAdminRemainingMs();
+    if (admin_remaining_ms > 0u) {
+        status.flags |= RS485_STATUS_FLAG_ADMIN_AUTH;
+        uint32_t admin_remaining_sec = (admin_remaining_ms + 999u) / 1000u;
+        status.reserved_v2 = (admin_remaining_sec > 255u) ? 255u : (uint8_t)admin_remaining_sec;
+    } else {
+        status.reserved_v2 = 0u;
+    }
+    
+    /* Get card information if available */
+    if (Dispenser_IsCardPresent()) {
+        status.flags |= RS485_STATUS_FLAG_CARD_PRESENT;
+        
+        uint8_t uid_len = 0;
+        if (Dispenser_GetCardUID(status.card_uid, &uid_len)) {
+            status.card_uid_length = uid_len;
+            status.balance = Dispenser_GetBalanceMl();
+        }
+    }
+    
+    /* Push to standard service status cache */
+    rs485_log_status_edge("cache", &status,
+                          &last_logged_flags,
+                          &last_logged_peripheral_request_id,
+                          &last_logged_peripheral_request_level);
+    RS485_Slave_SetStatus(&status);
+}
+
+/**
+ * @brief Hook for when RS485 slave has successfully started
+ */
+void RS485_SlaveApp_OnStarted(uint8_t address)
+{
+    LOG_DEBUG_ADAPTER("[RS485_ADAPTER] Slave Started (Addr: %d)\r\n", address);
+}
+

@@ -112,6 +112,7 @@ static const Config_Key_Entry_t mywota_config_schema[] = {
     /* Dispenser settings */
     {"dispenser.max_dispense_duration_seconds", CONFIG_VAL_UINT32, &g_system_config.dispenser_logic.wash_duration_seconds, 0, "Max dispense duration (sec)"},
     {"dispenser.card_removal_delay_ms", CONFIG_VAL_UINT32, &g_system_config.dispenser_logic.card_removal_delay_ms, 0, "Card removal delay"},
+    {"dispenser.flow_pulses_per_liter", CONFIG_VAL_UINT16, &g_system_config.dispenser_logic.flow_pulses_per_liter, 0, "Flow calibration (pulses/L, 0=default)"},
     
     /* Buzzer settings */
     {"buzzer.enabled",                CONFIG_VAL_BOOL,   &g_system_config.buzzer.enabled,                 0, "Enable buzzer"},

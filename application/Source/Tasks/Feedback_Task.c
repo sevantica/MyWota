@@ -1,6 +1,6 @@
 /**
  * @file Feedback_Task.c
- * @brief Application Task for Feedback (Sound) Logic Implementation
+ * @brief Application Task for Feedback (Sound) Logic - MyWota (Dispenser)
  * @attention
  * Copyright (c) Sevantica 2026.
  * All rights reserved.
@@ -16,146 +16,135 @@
 #include "Dispenser_Controller.h"
 #include "USB_Logging.h"
 #include "Heartbeat_Task.h"
+#include "Event_Broker.h"
+#include "Active_Object.h"
+#include "timers.h"
 
-/* Defines */
-#define FEEDBACK_POLL_INTERVAL_MS     (50)
+/* Private Variables */
+static ActiveObject_t s_ao_feedback;
+
+/* Static Allocation Buffers */
 #define FEEDBACK_TASK_STACK_SIZE      (256)
 #define FEEDBACK_TASK_PRIORITY        (1)
 
-/* Private Variables */
-static TaskHandle_t s_feedback_task_handle = NULL;
+static StaticTask_t s_ao_feedback_tcb;
+static StackType_t s_ao_feedback_stack[FEEDBACK_TASK_STACK_SIZE];
 
-/* Static Allocation Buffers */
-static StaticTask_t feedback_task_tcb;
-static StackType_t feedback_task_stack[FEEDBACK_TASK_STACK_SIZE];
+/* Software Timer for repeating patterns */
+static TimerHandle_t s_beep_timer = NULL;
+static StaticTimer_t s_beep_timer_buf;
 
-/* Implementaiton */
-static void Feedback_Task(void *pvParameters)
+/* Private Function Prototypes */
+static void state_startup(ActiveObject_t *me, Event_t const *e);
+static void state_ready(ActiveObject_t *me, Event_t const *e);
+
+static void beep_timer_cb(TimerHandle_t xTimer)
 {
-    (void)pvParameters;
-    
-    USB_Log_Printf("[FEEDBACK] Task started\r\n");
-    
+    Feedback_Pattern_t pattern = (Feedback_Pattern_t)pvTimerGetTimerID(xTimer);
+    Feedback_Play(pattern);
+}
+
+static void stop_beep_timer(void)
+{
+    if (s_beep_timer != NULL && xTimerIsTimerActive(s_beep_timer)) {
+        xTimerStop(s_beep_timer, 0);
+    }
+}
+
+static void start_beep_timer(Feedback_Pattern_t pattern, uint32_t interval_ms)
+{
+    stop_beep_timer();
+    if (s_beep_timer != NULL && interval_ms > 0) {
+        vTimerSetTimerID(s_beep_timer, (void*)(uintptr_t)pattern);
+        xTimerChangePeriod(s_beep_timer, pdMS_TO_TICKS(interval_ms), 0);
+        xTimerStart(s_beep_timer, 0);
+    }
+}
+
+static void state_startup(ActiveObject_t *me, Event_t const *e)
+{
+    if (e->header.id == AO_EVT_INIT) {
+        USB_Log_Printf("[AO Feedback] State: STARTUP\r\n");
+        
+        s_beep_timer = xTimerCreateStatic("Feedback_Timer",
+                                          pdMS_TO_TICKS(1000),
+                                          pdTRUE,
+                                          NULL,
+                                          beep_timer_cb,
+                                          &s_beep_timer_buf);
+        
+        ActiveObject_Transition(me, state_ready);
+    }
+}
+
+static void state_ready(ActiveObject_t *me, Event_t const *e)
+{
     const SystemConfig_t* cfg = Config_Get();
     const Buzzer_Config_t* bz_cfg = &cfg->buzzer;
 
-    static bool s_last_dispense_state = false;
-    static uint32_t s_last_init_beep_tick = 0;
-    static uint32_t s_last_removal_pattern_tick = 0;
-    static uint32_t s_last_error_pattern_tick = 0;
-    static bool s_logged_app_status = false;
-    static MIFARE_TransactionState_t s_last_mifare_state = TRANSACTION_STATE_IDLE;
-    
-    // Play a nice double-beep indicating the application has successfully booted and the task is running
-    Feedback_Play(FEEDBACK_PATTERN_DOUBLE_BEEP);
-
-    for (;;) {
-        /* Heartbeat */
-        TASK_HEARTBEAT_EVERY_SECOND("Feedback");
-        System_ReportTaskStatus(SYSTEM_TASK_ID_BUZZER_POLLING, true);
-        
-        uint32_t current_tick = xTaskGetTickCount();
-        
-        /* 1. Poll MIFARE Transaction State */
-        MIFARE_TransactionState_t mifare_state = MIFARE_GetTransactionState();
-        
-        if (mifare_state == TRANSACTION_STATE_CARD_DETECTED) {
-            // Card detected but not validated
-            uint32_t time_since_last_beep = pdTICKS_TO_MS(current_tick - s_last_init_beep_tick);
-            if (time_since_last_beep >= bz_cfg->card_init_beep_interval_ms) {
-                Feedback_Play(FEEDBACK_PATTERN_CARD_DETECTED);
-                s_last_init_beep_tick = current_tick;
-            }
-        } else if (mifare_state == TRANSACTION_STATE_WAITING_REMOVAL) {
-            // Waiting for removal
-            if (s_last_mifare_state != TRANSACTION_STATE_WAITING_REMOVAL) {
-                // Just entered state
-                Feedback_Play(FEEDBACK_PATTERN_REMOVAL);
-                s_last_removal_pattern_tick = current_tick;
-                USB_Log_Printf("[FEEDBACK] Card removal required - playing pattern\r\n");
-            } else {
-                // Repeat
-                uint32_t time_since_last_pattern = pdTICKS_TO_MS(current_tick - s_last_removal_pattern_tick);
-                if (time_since_last_pattern >= bz_cfg->removal_pattern_repeat_ms) {
-                    Feedback_Play(FEEDBACK_PATTERN_REMOVAL);
-                    s_last_removal_pattern_tick = current_tick;
-                }
-            }
-        } else if (mifare_state == TRANSACTION_STATE_ERROR_NO_FLOW) {
-            // Error
-            if (s_last_mifare_state != TRANSACTION_STATE_ERROR_NO_FLOW) {
-                Feedback_Play(FEEDBACK_PATTERN_ERROR);
-                s_last_error_pattern_tick = current_tick;
-                USB_Log_Printf("[FEEDBACK] No flow error - playing error pattern\r\n");
-            } else {
-                // Repeat every 3s
-                uint32_t time_since_last_pattern = pdTICKS_TO_MS(current_tick - s_last_error_pattern_tick);
-                if (time_since_last_pattern >= 3000) {
-                     Feedback_Play(FEEDBACK_PATTERN_ERROR);
-                     s_last_error_pattern_tick = current_tick;
-                }
-            }
-        }
-        
-        s_last_mifare_state = mifare_state;
-
-        /* 2. Poll Application/Dispenser State */
-        const Application_Instance_t* app = Application_GetActive();
-        
-        if (!s_logged_app_status) {
-            if (app) {
-                USB_Log_Printf("[FEEDBACK] App registered: %s\r\n", app->name ? app->name : "NULL");
-            }
-            s_logged_app_status = true;
-        }
-
-        if (app != NULL && app->callbacks != NULL) {
-            bool current_dispense_state = false;
-            // For MyWota, is_operation_active maps to MIFARE_Dispenser_IsDispenseActive
-            if (app->callbacks->is_operation_active != NULL) {
-                current_dispense_state = app->callbacks->is_operation_active();
-            }
-            
-            if (current_dispense_state != s_last_dispense_state) {
-                 if (current_dispense_state) {
-                     // Start
-                     USB_Log_Printf("[FEEDBACK] Dispense START\r\n");
-                     Feedback_Play(FEEDBACK_PATTERN_START);
-                 } else {
-                     // Stop
-                     // Check if volume dispensed
-                     uint32_t vol = Dispenser_GetDispensedAmountML();
-                     if (vol > 0) {
-                         USB_Log_Printf("[FEEDBACK] Dispense STOP (User Volume: %lu)\r\n", vol);
-                         Feedback_Play(FEEDBACK_PATTERN_STOP);
-                     } else {
-                         USB_Log_Printf("[FEEDBACK] Dispense STOP (No Volume)\r\n");
-                     }
-                 }
-                 s_last_dispense_state = current_dispense_state;
-            }
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(FEEDBACK_POLL_INTERVAL_MS));
+    if (e->header.id == AO_EVT_ENTRY) {
+        USB_Log_Printf("[AO Feedback] State: READY\r\n");
+        ActiveObject_Subscribe(me, EVT_RFID_CARD_DETECTED);
+        ActiveObject_Subscribe(me, EVT_RFID_CARD_REMOVED);
+        ActiveObject_Subscribe(me, EVT_RFID_TRANSACTION_SUCCESS);
+        ActiveObject_Subscribe(me, EVT_RFID_TRANSACTION_FAILED);
+        ActiveObject_Subscribe(me, EVT_OPERATION_START);
+        ActiveObject_Subscribe(me, EVT_OPERATION_STOP);
+        ActiveObject_Subscribe(me, EVT_BALANCE_UPDATED);
+    }
+    else if (e->header.id == EVT_RFID_CARD_DETECTED) {
+        USB_Log_Printf("[AO Feedback] Event: CARD_DETECTED\r\n");
+        Feedback_Play(FEEDBACK_PATTERN_CARD_DETECTED);
+        start_beep_timer(FEEDBACK_PATTERN_CARD_DETECTED, bz_cfg->card_init_beep_interval_ms);
+    }
+    else if (e->header.id == EVT_RFID_TRANSACTION_SUCCESS) {
+        USB_Log_Printf("[AO Feedback] Event: TRANSACTION_SUCCESS (Waiting Card Removal)\r\n");
+        Feedback_Play(FEEDBACK_PATTERN_REMOVAL);
+        start_beep_timer(FEEDBACK_PATTERN_REMOVAL, bz_cfg->removal_pattern_repeat_ms);
+    }
+    else if (e->header.id == EVT_RFID_TRANSACTION_FAILED) {
+        USB_Log_Printf("[AO Feedback] Event: TRANSACTION_FAILED (Error state)\r\n");
+        Feedback_Play(FEEDBACK_PATTERN_ERROR);
+        start_beep_timer(FEEDBACK_PATTERN_ERROR, 3000);
+    }
+    else if (e->header.id == EVT_RFID_CARD_REMOVED) {
+        USB_Log_Printf("[AO Feedback] Event: CARD_REMOVED\r\n");
+        stop_beep_timer();
+    }
+    else if (e->header.id == EVT_OPERATION_START) {
+        USB_Log_Printf("[AO Feedback] Event: DISPENSE_START\r\n");
+        stop_beep_timer();
+        Feedback_Play(FEEDBACK_PATTERN_START);
+    }
+    else if (e->header.id == EVT_OPERATION_STOP) {
+        USB_Log_Printf("[AO Feedback] Event: DISPENSE_STOP\r\n");
+        stop_beep_timer();
+        Feedback_Play(FEEDBACK_PATTERN_STOP);
+    }
+    else if (e->header.id == EVT_BALANCE_UPDATED) {
+        USB_Log_Printf("[AO Feedback] Event: BALANCE_UPDATED\r\n");
+        Feedback_Play(FEEDBACK_PATTERN_DOUBLE_BEEP);
     }
 }
 
 void Feedback_Task_Start(void)
 {
-    if (s_feedback_task_handle != NULL) return;
+    if (s_ao_feedback.task != NULL) return;
 
-    s_feedback_task_handle = xTaskCreateStatic(
-        Feedback_Task,
-        "FeedbackTask",
-        FEEDBACK_TASK_STACK_SIZE,
-        NULL,
-        FEEDBACK_TASK_PRIORITY,
-        feedback_task_stack,
-        &feedback_task_tcb
-    );
+    ActiveObject_Init(&s_ao_feedback, "FeedbackTask", NULL);
+    
+    /* Disables monitoring since this task blocks on event queue */
+    System_SetTaskMonitoringEnabled(SYSTEM_TASK_ID_BUZZER_POLLING, false);
+
+    ActiveObject_Start(&s_ao_feedback,
+                       state_startup,
+                       &s_ao_feedback_tcb,
+                       s_ao_feedback_stack,
+                       FEEDBACK_TASK_STACK_SIZE,
+                       FEEDBACK_TASK_PRIORITY);
 }
 
 TaskHandle_t Feedback_Task_GetHandle(void)
 {
-    return s_feedback_task_handle;
+    return s_ao_feedback.task;
 }

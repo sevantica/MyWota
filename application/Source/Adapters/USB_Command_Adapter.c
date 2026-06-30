@@ -21,7 +21,6 @@
 #include "MyWota_Command_Processor.h"
 #include "USB_Logging.h"
 #include "Dispenser_Controller.h"
-#include "MIFARE_Transaction_Core.h"
 #include "Module_Interface.h"
 #include "MyWota_System.h"
 #include "System_Command.h"
@@ -79,12 +78,12 @@ size_t USB_Command_Adapter_GetCommandCount(void)
 void USB_Command_Adapter_PrintStatus(const CLI_Channel_t* channel)
 {
     /* Display card balance if card is ready */
-    if (MIFARE_IsCardReady()) {
-        USB_Log_Printf("Balance:           %lu L\r\n", MIFARE_GetBalance() / 1000u);
+    if (Dispenser_IsCardReady()) {
+        USB_Log_Printf("Balance:           %lu L\r\n", Dispenser_GetBalanceMl() / 1000u);
     }
     
     /* Display dispenser status */
-    if (MIFARE_Dispenser_IsDispenseActive()) {
+    if (Dispenser_IsDispenseActive()) {
         USB_Log_Printf("Dispenser:         ACTIVE (Dispensed: %lu ml)\r\n", Dispenser_GetDispensedAmountML());
     } else {
         USB_Log_Printf("Dispenser:         IDLE\r\n");

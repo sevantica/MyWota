@@ -2,6 +2,26 @@
     "version": "2.0.0",
     "tasks": [
         {
+            "label": "MyWota - Bump Patch Version",
+            "type": "shell",
+            "command": "powershell",
+            "args": [
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                "${workspaceFolder}\\scripts\\bump-version.ps1"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}"
+            },
+            "group": "build",
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            },
+            "problemMatcher": []
+        },
+        {
             "label": "MyWota - Configure Build",
             "type": "shell",
             "command": "powershell",
@@ -21,6 +41,23 @@
         },
         {
             "label": "MyWota - Build",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "MyWota - Bump Patch Version",
+                "MyWota - Build (ninja)"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "dedicated"
+            },
+            "problemMatcher": "$gcc"
+        },
+        {
+            "label": "MyWota - Build (ninja)",
             "type": "process",
             "command": "${env:USERPROFILE}/.pico-sdk/ninja/v1.12.1/ninja.exe",
             "args": [
@@ -28,10 +65,7 @@
                 "${workspaceFolder}/build",
                 "-j4"
             ],
-            "group": {
-                "kind": "build",
-                "isDefault": true
-            },
+            "group": "build",
             "presentation": {
                 "reveal": "always",
                 "panel": "dedicated"

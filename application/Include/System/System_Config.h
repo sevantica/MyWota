@@ -42,7 +42,7 @@
 #define CONFIG_MAX_VERSION_SEARCH   10      /* Search up to version 10 */
 #define CONFIG_SD_TIMEOUT_MS        3000    /* 3 second timeout for SD card */
 #define CONFIG_MAGIC_NUMBER         0x42594C57  /* "BYLW" - CCH config marker */
-#define CONFIG_VERSION              14      /* Bump to 14: mifare.admin_init_password */
+#define CONFIG_VERSION              15      /* Bump to 15: dispenser_logic.flow_pulses_per_liter */
 
 /* Flash storage configuration - use last 4KB sector of 2MB flash */
 #define CONFIG_FLASH_SIZE           (2 * 1024 * 1024)           /* 2MB flash */
@@ -148,6 +148,10 @@ typedef struct {
     /* Hard cap on water per wash session (mL). BigYellow only; MyWota leaves
      * this at 0 since dispenser balance already gates volume. */
     uint32_t max_wash_volume_ml;
+    /* Flow sensor calibration: YS-S201 pulses per liter. Increase to reduce a
+     * measured-volume over-read, decrease to correct an under-read. 0 = use the
+     * driver default (YS_S201_PULSES_PER_LITER). */
+    uint16_t flow_pulses_per_liter;
 } DispenserLogic_Config_t;
 
 /**
@@ -376,6 +380,11 @@ Config_Result_t Config_SaveToVersionedFile(void);
  * @brief Print current configuration to USB log
  */
 void Config_PrintToUSB(void);
+
+/**
+ * @brief Print current configuration to a generic CLI channel
+ */
+void Config_PrintToChannel(const void* channel);
 
 /**
  * @brief Reset system configuration to factor defaults and save

@@ -33,7 +33,6 @@
 #include "MIFARE_Transaction_Core.h"
 
 /* Task Headers */
-#include "RS485_Task.h"
 
 /* Defines */
 #define LOG_CRITICAL_SYSTEM(...) USB_Log_Printf(__VA_ARGS__)
@@ -109,6 +108,12 @@ void Module_Init(void)
 
     const SystemConfig_t* cfg = Config_Get();
 
+    /* RS485 is started by shared AO_RS485 in System_Core before Module_Init. */
+    if (cfg->modules.rs485_enabled) {
+        s_module_states[MODULE_RS485] = MODULE_STATE_RUNNING;
+        System_RegisterTask(SYSTEM_TASK_ID_RS485, "RS485");
+    }
+
     /* 4. Peripheral Adapters */
     /* RTC persistence is now managed by the shared RTC_Service in sevantica_drivers */
     
@@ -158,14 +163,6 @@ void Module_Init(void)
         Task_Start_Dispenser_Task();
         s_module_states[MODULE_DISPENSER] = MODULE_STATE_RUNNING;
         System_RegisterTask(SYSTEM_TASK_ID_DISPENSER, "Dispenser");
-    }
-    
-    /* RS485 */
-    if (cfg->modules.rs485_enabled) {
-        Task_Start_RS485_Task();
-        RS485_Command_Adapter_Init();
-        s_module_states[MODULE_RS485] = MODULE_STATE_RUNNING;
-        System_RegisterTask(SYSTEM_TASK_ID_RS485, "RS485");
     }
     
     LOG_CRITICAL_SYSTEM("[MODULE] MyWota Initialization Complete\r\n");
@@ -222,8 +219,6 @@ bool System_StartModule(System_Module_t module)
             return false;
             
         case MODULE_RS485:
-            Task_Start_RS485_Task();
-            RS485_Command_Adapter_Init();
             s_module_states[MODULE_RS485] = MODULE_STATE_RUNNING;
             System_RegisterTask(SYSTEM_TASK_ID_RS485, "RS485");
             return true;

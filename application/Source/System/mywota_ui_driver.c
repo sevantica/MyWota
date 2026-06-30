@@ -1,4 +1,4 @@
-/*
+﻿/*
  * MyWota UI Driver - Optimized for STM32F411 with ILI9488
  * 
  * Features:
@@ -32,10 +32,13 @@
 #include "System_Events.h"
 #include "Hardware_Access.h" /* For SPI_MSG_DEF and centralized hardware definitions */
 #include "USB_Logging.h"
-#include "MIFARE_Transaction_Core.h"  /* For getter functions */
+#include "Event_Broker.h"
+#include "MIFARE_Transaction_Core.h"  /* For shared MIFARE state enums */
 #include "Dispenser_Controller.h"        /* For dispenser functions */
 #include "System_Config.h"                /* For SD card configuration */
 #include "CLI_Processor.h"
+#include "RS485_Command_Adapter.h"
+#include "RS485_FW_Update.h"
 #ifdef LV_USE_ILI9341
 #include "display/ili9341/lv_ili9341.h"
 #endif
@@ -55,6 +58,7 @@
 #define LVGL_TASK_PERIOD_MS             5U
 #define LCD_INITIAL_RENDER_TIMEOUT_MS   3000U
 #define LCD_INITIAL_RENDER_LOG_MS       500U
+#define UI_TOTAL_REMAINING_BAR_GREEN    0x05820AU
 
 /* UI Display Context - tracks UI-specific state for display persistence */
 typedef struct {
@@ -83,9 +87,28 @@ typedef struct {
     /* Cached display values (shown during persistence timeout) */
     char last_phone_number[12];
     uint32_t last_card_balance_ml;
+    uint32_t card_balance_ml;
+    uint32_t last_topup_ml;
+    MIFARE_CardState_t card_state;
+    MIFARE_TransactionState_t transaction_state;
+    MIFARE_OperationContext_t operation_context;
+    bool rfid_card_present;
+    bool admin_card_present;
+    bool phone_valid;
     
     /* Force UI refresh on next update (e.g., when new card inserted) */
     bool force_refresh_on_next_update;
+
+    /* Short-lived manual dispense error banner, driven by operation-stop events */
+    bool manual_no_flow_display_active;
+    uint32_t manual_no_flow_display_start_time;
+
+    /* Operation state snapshot, driven by operation events */
+    bool dispense_active;
+    bool manual_dispense_active;
+    bool self_clean_active;
+    uint32_t dispense_amount_ml;
+    uint32_t dispense_remaining_ml;
 } UI_Display_Context_t;
 
 /* Timing Constants */
@@ -93,6 +116,8 @@ typedef struct {
 #define FPS_UPDATE_INTERVAL_MS          ONE_SECOND_MS
 #define LCD_RESET_DELAY_MS              500U
 #define DISPENSE_COOLDOWN_MS            5000U  /* 5 second cooldown after dispense stops */
+#define MANUAL_NO_FLOW_DISPLAY_MS       10000U
+#define LCD_EVENT_QUEUE_LENGTH          8U
 
 /* Logging Configuration -----------------------------------------------------*/
 #define LOG_DEBUG_LCD_DISPLAY_DRIVER_EN      1
@@ -131,6 +156,9 @@ static StaticSemaphore_t lvgl_mutex_buffer;
 static TaskHandle_t lcd_task_handle;
 static StaticTask_t lcd_task_tcb;
 static StackType_t lcd_task_stack[LCD_DISPLAY_TASK_STACK_WORDS];
+static QueueHandle_t lcd_event_queue = NULL;
+static StaticQueue_t lcd_event_queue_buffer;
+static uint8_t lcd_event_queue_storage[LCD_EVENT_QUEUE_LENGTH * sizeof(Event_t*)];
 
 /* Performance Monitoring - removed unused frame_count variable */
 
@@ -158,7 +186,23 @@ static UI_Display_Context_t ui_ctx = {
     .last_failed_module_cycle_time = 0,
     .current_failed_module_index = 0,
     .last_phone_number = "",  /* Will be set to config value on first update */
-    .last_card_balance_ml = 0
+    .last_card_balance_ml = 0,
+    .card_balance_ml = 0,
+    .last_topup_ml = 0,
+    .card_state = MIFARE_CARD_STATE_ABSENT,
+    .transaction_state = TRANSACTION_STATE_IDLE,
+    .operation_context = MIFARE_CONTEXT_NONE,
+    .rfid_card_present = false,
+    .admin_card_present = false,
+    .phone_valid = false,
+    .force_refresh_on_next_update = false,
+    .manual_no_flow_display_active = false,
+    .manual_no_flow_display_start_time = 0,
+    .dispense_active = false,
+    .manual_dispense_active = false,
+    .self_clean_active = false,
+    .dispense_amount_ml = 0,
+    .dispense_remaining_ml = 0
 };
 
 /* Performance Optimization - Cache previous state to avoid redundant updates */
@@ -167,6 +211,7 @@ static ValveState_t last_valve_state = (ValveState_t)0xFF;  /* Invalid value for
 static uint32_t last_dispense_timer_seconds = 0xFFFFFFFF;  /* Cache for dispenser timer */
 static uint32_t last_dispense_token_count = 0xFFFFFFFF;  /* Cache for token count display */
 static char last_customer_id[32] = "";  /* Cache for customer ID */
+static int32_t last_total_remaining_percentage = -1;  /* Cache for percentage display */
 
 /* Background color cache - detect config changes for live updates */
 static uint32_t last_bg_color = 0xFFFFFFFF;
@@ -200,6 +245,10 @@ static void init_ui_visibility_from_config(void);
 static UI_State_t map_card_state_to_ui_state(MIFARE_CardState_t card_state, bool is_dispensing);
 static void apply_ui_state_config(UI_State_t ui_state);
 static void apply_background_colors_from_config(void);
+static void set_obj_hidden(lv_obj_t * obj, bool hidden);
+static void apply_firmware_update_percentage(int32_t percentage);
+static void apply_firmware_update_ui(uint32_t bytes_received, uint32_t expected_size);
+static void drain_lcd_events(void);
 
 /* ========================================================================== */
 /*                         CORE TASK FUNCTION PROTOTYPES                     */
@@ -226,6 +275,108 @@ static void lvgl_freertos_delay(uint32_t ms)
     vTaskDelay(pdMS_TO_TICKS(ms));
 }
 
+static void drain_lcd_events(void)
+{
+    if (lcd_event_queue == NULL) {
+        return;
+    }
+
+    Event_t* event = NULL;
+    while (xQueueReceive(lcd_event_queue, &event, 0) == pdTRUE) {
+        if (event != NULL) {
+            if (event->header.id == EVT_OPERATION_START &&
+                event->header.size >= sizeof(Event_Operation_Start_t)) {
+                Event_Operation_Start_t* start_event = (Event_Operation_Start_t*)event;
+                if (start_event->operation_kind == EVENT_OPERATION_KIND_DISPENSE) {
+                    ui_ctx.dispense_active = true;
+                    ui_ctx.manual_dispense_active = (start_event->operation_mode == EVENT_OPERATION_MODE_MANUAL);
+                    ui_ctx.dispense_amount_ml = 0;
+                    ui_ctx.dispense_remaining_ml = start_event->target_ml > 0 ?
+                                                    start_event->target_ml :
+                                                    start_event->balance_ml;
+                    ui_ctx.force_refresh_on_next_update = true;
+                } else if (start_event->operation_kind == EVENT_OPERATION_KIND_SELF_CLEAN) {
+                    ui_ctx.self_clean_active = true;
+                    ui_ctx.force_refresh_on_next_update = true;
+                }
+            } else if (event->header.id == EVT_OPERATION_PROGRESS &&
+                       event->header.size >= sizeof(Event_Operation_Progress_t)) {
+                Event_Operation_Progress_t* progress_event = (Event_Operation_Progress_t*)event;
+                if (progress_event->operation_kind == EVENT_OPERATION_KIND_DISPENSE) {
+                    ui_ctx.dispense_active = true;
+                    ui_ctx.manual_dispense_active = (progress_event->operation_mode == EVENT_OPERATION_MODE_MANUAL);
+                    ui_ctx.dispense_amount_ml = progress_event->amount_ml;
+                    ui_ctx.dispense_remaining_ml = progress_event->remaining_ml;
+                } else if (progress_event->operation_kind == EVENT_OPERATION_KIND_SELF_CLEAN) {
+                    ui_ctx.self_clean_active = true;
+                }
+            } else if (event->header.id == EVT_OPERATION_STOP &&
+                event->header.size >= sizeof(Event_Operation_Stop_t)) {
+                Event_Operation_Stop_t* stop_event = (Event_Operation_Stop_t*)event;
+                if (stop_event->operation_kind == EVENT_OPERATION_KIND_DISPENSE) {
+                    bool manual_dispense = (stop_event->operation_mode == EVENT_OPERATION_MODE_MANUAL);
+                    ui_ctx.dispense_active = false;
+                    ui_ctx.manual_dispense_active = false;
+                    ui_ctx.dispense_amount_ml = stop_event->amount_ml;
+                    ui_ctx.dispense_remaining_ml = 0;
+
+                    if (manual_dispense && stop_event->stop_reason == EVENT_OPERATION_STOP_REASON_NO_FLOW) {
+                        ui_ctx.manual_no_flow_display_active = true;
+                        ui_ctx.manual_no_flow_display_start_time = xTaskGetTickCount();
+                    } else if (manual_dispense) {
+                        ui_ctx.manual_no_flow_display_active = false;
+                        ui_ctx.manual_no_flow_display_start_time = 0;
+                    }
+                    ui_ctx.force_refresh_on_next_update = true;
+                } else if (stop_event->operation_kind == EVENT_OPERATION_KIND_SELF_CLEAN) {
+                    ui_ctx.self_clean_active = false;
+                    ui_ctx.force_refresh_on_next_update = true;
+                }
+            } else if (event->header.id == EVT_RFID_STATE_CHANGED &&
+                       event->header.size >= sizeof(Event_RFID_State_t)) {
+                Event_RFID_State_t* state_event = (Event_RFID_State_t*)event;
+                bool auto_dispense_active = ui_ctx.dispense_active && !ui_ctx.manual_dispense_active;
+                ui_ctx.card_state = (MIFARE_CardState_t)state_event->card_state;
+                ui_ctx.transaction_state = (MIFARE_TransactionState_t)state_event->transaction_state;
+                ui_ctx.operation_context = (MIFARE_OperationContext_t)state_event->operation_context;
+                ui_ctx.rfid_card_present = (state_event->flags & EVENT_RFID_STATE_FLAG_CARD_PRESENT) != 0u;
+                ui_ctx.admin_card_present = (state_event->flags & EVENT_RFID_STATE_FLAG_ADMIN_CARD) != 0u;
+                ui_ctx.phone_valid = (state_event->flags & EVENT_RFID_STATE_FLAG_PHONE_VALID) != 0u;
+                if (!auto_dispense_active) {
+                    ui_ctx.card_balance_ml = state_event->balance;
+                }
+                ui_ctx.last_topup_ml = state_event->last_topup;
+                if (ui_ctx.phone_valid) {
+                    strncpy(ui_ctx.last_phone_number, state_event->customer_id, sizeof(ui_ctx.last_phone_number) - 1);
+                    ui_ctx.last_phone_number[sizeof(ui_ctx.last_phone_number) - 1] = '\0';
+                }
+                if (!auto_dispense_active && ui_ctx.card_state == MIFARE_CARD_STATE_PRESENT && ui_ctx.card_balance_ml > 0) {
+                    ui_ctx.last_card_balance_ml = ui_ctx.card_balance_ml;
+                }
+                ui_ctx.force_refresh_on_next_update = true;
+            } else if (event->header.id == EVT_RFID_BALANCE_CONFIRMED &&
+                       event->header.size >= sizeof(Event_Balance_Updated_t)) {
+                Event_Balance_Updated_t* balance_event = (Event_Balance_Updated_t*)event;
+                ui_ctx.card_balance_ml = balance_event->balance;
+                ui_ctx.last_topup_ml = balance_event->last_topup;
+                if (balance_event->balance > 0) {
+                    ui_ctx.last_card_balance_ml = balance_event->balance;
+                }
+                ui_ctx.force_refresh_on_next_update = true;
+            } else if (event->header.id == EVT_DISPENSER_STATUS_CHANGED &&
+                       event->header.size >= sizeof(Event_Dispenser_Status_t)) {
+                Event_Dispenser_Status_t* status_event = (Event_Dispenser_Status_t*)event;
+                ui_ctx.dispense_active = (status_event->flags & EVENT_DISPENSER_FLAG_ACTIVE) != 0u;
+                ui_ctx.self_clean_active = (status_event->flags & EVENT_DISPENSER_FLAG_SELF_CLEAN) != 0u;
+                ui_ctx.manual_dispense_active = (status_event->flags & EVENT_DISPENSER_FLAG_NO_CARD_MODE) != 0u;
+                ui_ctx.dispense_amount_ml = status_event->dispensed_ml;
+                ui_ctx.dispense_remaining_ml = status_event->remaining_ml;
+            }
+            Event_Release(event);
+        }
+    }
+}
+
 /**
  * @brief Main LCD Display Driver Task
  * @param argument Task argument (unused)
@@ -247,6 +398,21 @@ static void LCD_Display_Task(void *argument)
         LOG_CRITICAL_LCD_DISPLAY_DRIVER("[✗] LCD Display Task initialization FAILED\r\n");
         vTaskDelete(NULL);
         return;
+    }
+
+    lcd_event_queue = xQueueCreateStatic(LCD_EVENT_QUEUE_LENGTH,
+                                         sizeof(Event_t*),
+                                         lcd_event_queue_storage,
+                                         &lcd_event_queue_buffer);
+    if (lcd_event_queue == NULL) {
+        LOG_ERROR_LCD_DISPLAY_DRIVER("LCD: ERROR - Failed to create event queue\r\n");
+    } else if (!EventBroker_Subscribe(lcd_event_queue, EVT_OPERATION_START) ||
+               !EventBroker_Subscribe(lcd_event_queue, EVT_OPERATION_PROGRESS) ||
+               !EventBroker_Subscribe(lcd_event_queue, EVT_OPERATION_STOP) ||
+               !EventBroker_Subscribe(lcd_event_queue, EVT_RFID_STATE_CHANGED) ||
+               !EventBroker_Subscribe(lcd_event_queue, EVT_RFID_BALANCE_CONFIRMED) ||
+               !EventBroker_Subscribe(lcd_event_queue, EVT_DISPENSER_STATUS_CHANGED)) {
+        LOG_ERROR_LCD_DISPLAY_DRIVER("LCD: ERROR - Failed to subscribe to state events\r\n");
     }
 
     LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: Resetting display controller...\r\n");
@@ -394,6 +560,7 @@ static void LCD_Display_Task(void *argument)
         /* Feed watchdog every second - MUST be first in loop */
         TASK_HEARTBEAT_EVERY_SECOND("LCD");
         System_ReportTaskStatus(SYSTEM_TASK_ID_LCD_DISPLAY, true);
+        drain_lcd_events();
        
         /* Update UI based on system state at regular intervals */
         unsigned long now_tick = xTaskGetTickCount();
@@ -611,7 +778,10 @@ static void reset_ui_to_idle(void)
     strncpy(ui_ctx.last_phone_number, config->ui.no_card_customer_id, sizeof(ui_ctx.last_phone_number) - 1);
     ui_ctx.last_phone_number[sizeof(ui_ctx.last_phone_number) - 1] = '\0';
     ui_ctx.last_card_balance_ml = 0;
+    ui_ctx.rfid_card_present = false;
     ui_ctx.showing_persisted_data = false;
+    ui_ctx.manual_no_flow_display_active = false;
+    ui_ctx.manual_no_flow_display_start_time = 0;
 }
 
 /**
@@ -645,6 +815,73 @@ static UI_State_t map_card_state_to_ui_state(MIFARE_CardState_t card_state, bool
         default:
             return UI_STATE_IDLE;
     }
+}
+
+static void set_obj_hidden(lv_obj_t * obj, bool hidden)
+{
+    if (obj == NULL) {
+        return;
+    }
+
+    if (hidden) {
+        lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_clear_flag(obj, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void apply_firmware_update_percentage(int32_t percentage)
+{
+    char percentage_text[16];
+
+    if (percentage < 0) {
+        percentage = 0;
+    }
+    if (percentage > 100) {
+        percentage = 100;
+    }
+
+    snprintf(percentage_text, sizeof(percentage_text), "%ld%%", (long)percentage);
+
+    if (ui_customerID != NULL) {
+        lv_label_set_text(ui_customerID, "Updating");
+        set_obj_hidden(ui_customerID, false);
+        snprintf(last_customer_id, sizeof(last_customer_id), "%s", "Updating");
+    }
+
+    if (ui_cardErrorStatus != NULL) {
+        lv_label_set_text(ui_cardErrorStatus, "Wait");
+        set_obj_hidden(ui_cardErrorStatus, false);
+    }
+
+    if (ui_cardRemaining != NULL) {
+        lv_label_set_text(ui_cardRemaining, percentage_text);
+        set_obj_hidden(ui_cardRemaining, false);
+    }
+
+    if (ui_totalRemainingBar != NULL) {
+        lv_obj_set_style_bg_color(ui_totalRemainingBar, lv_color_hex(UI_TOTAL_REMAINING_BAR_GREEN), LV_PART_INDICATOR | LV_STATE_DEFAULT);
+        lv_bar_set_value(ui_totalRemainingBar, percentage, LV_ANIM_OFF);
+        set_obj_hidden(ui_totalRemainingBar, false);
+    }
+
+    set_obj_hidden(ui_flowRateSensor, true);
+    set_obj_hidden(ui_buttonState, true);
+
+    last_total_remaining_percentage = percentage;
+    last_dispense_timer_seconds = 0xFFFFFFFF;
+    last_dispense_token_count = 0xFFFFFFFF;
+}
+
+static void apply_firmware_update_ui(uint32_t bytes_received, uint32_t expected_size)
+{
+    int32_t percentage = 0;
+
+    if (expected_size > 0U) {
+        percentage = (int32_t)(((uint64_t)bytes_received * 100U) / expected_size);
+    }
+
+    apply_firmware_update_percentage(percentage);
 }
 
 /**
@@ -743,926 +980,661 @@ static void init_ui_visibility_from_config(void)
     LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: UI visibility configured for IDLE state\r\n");
 }
 
+/* ========================================================================== */
+/*                       UI DISPLAY STATE MACHINE                            */
+/* ========================================================================== */
+
+/**
+ * UI_Disp_State_t is the single "mode" that drives every widget on the
+ * operational screen.  It is evaluated fresh each render tick from the
+ * event-cache snapshot in ui_ctx.  Transitions are pure (no side-effects in
+ * the evaluator); each widget has its own render helper that switches on the
+ * current state.
+ *
+ * Priority (highest first, first match wins):
+ *   CLEANING  →  DISPENSING  →  DISPENSING_MANUAL  →  NO_FLOW_MANUAL
+ *   →  ADMIN  →  CARD_READING  →  WAITING_REMOVAL  →  NO_FLOW_CARD
+ *   →  CARD_ERROR  →  NO_BALANCE  →  CARD_READY  →  COOLDOWN
+ *   →  PERSISTENCE  →  IDLE
+ *
+ * FW_UPDATE uses an early-return path before state evaluation (preserved).
+ * MODULE_FAILURE overrides cardErrorStatus and ledIndicator within any state.
+ */
+typedef enum {
+    UI_DS_IDLE = 0,
+    UI_DS_CLEANING,
+    UI_DS_CARD_READING,
+    UI_DS_ADMIN,
+    UI_DS_CARD_READY,
+    UI_DS_DISPENSING,
+    UI_DS_DISPENSING_MANUAL,
+    UI_DS_NO_FLOW_MANUAL,
+    UI_DS_NO_FLOW_CARD,
+    UI_DS_NO_BALANCE,
+    UI_DS_CARD_ERROR,
+    UI_DS_WAITING_REMOVAL,
+    UI_DS_COOLDOWN,
+    UI_DS_PERSISTENCE,
+    UI_DS_COUNT
+} UI_Disp_State_t;
+
+/* Format a millilitre value as "NNN ml", "N.N L" or "NN L" */
+static void ui_fmt_ml(char *buf, size_t size, uint32_t ml)
+{
+    if (ml < 1000u) {
+        snprintf(buf, size, "%lu ml", (unsigned long)ml);
+    } else if (ml < 10000u) {
+        unsigned long x10 = (unsigned long)(ml / 100u);
+        snprintf(buf, size, "%lu.%lu L", x10 / 10u, x10 % 10u);
+    } else {
+        snprintf(buf, size, "%lu L", (unsigned long)(ml / 1000u));
+    }
+}
+
+/* Pure state evaluator — no LVGL calls, no side-effects */
+static UI_Disp_State_t ui_disp_determine_state(
+    bool self_clean, bool dispense_active, bool card_present,
+    bool manual_no_flow, bool admin_card,
+    MIFARE_CardState_t cst, MIFARE_TransactionState_t txn,
+    bool card_no_flow, bool card_auth, uint32_t balance_ml,
+    bool in_cooldown, bool persisting)
+{
+    if (self_clean)                               return UI_DS_CLEANING;
+    if (dispense_active && card_present)          return UI_DS_DISPENSING;
+    if (dispense_active)                          return UI_DS_DISPENSING_MANUAL;
+    if (manual_no_flow)                           return UI_DS_NO_FLOW_MANUAL;
+    if (admin_card)                               return UI_DS_ADMIN;
+    if (cst == MIFARE_CARD_STATE_INITIALIZING     ||
+        cst == MIFARE_CARD_STATE_NEEDS_POLLING_CYCLE ||
+        txn == TRANSACTION_STATE_CARD_DETECTED    ||
+        txn == TRANSACTION_STATE_AUTHENTICATING   ||
+        txn == TRANSACTION_STATE_READING_DATA     ||
+        txn == TRANSACTION_STATE_VALIDATING)      return UI_DS_CARD_READING;
+    if (txn == TRANSACTION_STATE_WAITING_REMOVAL) return UI_DS_WAITING_REMOVAL;
+    if (card_no_flow && card_present)             return UI_DS_NO_FLOW_CARD;
+    if (cst == MIFARE_CARD_STATE_ERROR)           return UI_DS_CARD_ERROR;
+    if (cst == MIFARE_CARD_STATE_PRESENT &&
+        balance_ml == 0u)                         return UI_DS_NO_BALANCE;
+    if (card_auth)                                return UI_DS_CARD_READY;
+    if (in_cooldown)                              return UI_DS_COOLDOWN;
+    if (persisting)                               return UI_DS_PERSISTENCE;
+    return UI_DS_IDLE;
+}
+
+/* Alternate between two strings every interval_ms */
+static const char *ui_alt(bool *flag, uint32_t *last_tick,
+                           uint32_t interval_ms,
+                           const char *primary, const char *secondary)
+{
+    uint32_t now = (uint32_t)xTaskGetTickCount();
+    if ((now - *last_tick) >= pdMS_TO_TICKS(interval_ms)) {
+        *flag = !(*flag);
+        *last_tick = now;
+    }
+    return *flag ? secondary : primary;
+}
+
+/* ─── Per-widget render helpers ─────────────────────────────────────────── */
+
+static void render_customer_id(UI_Disp_State_t state, const char *no_card_id)
+{
+    if (ui_customerID == NULL) return;
+
+    const char *text;
+    switch (state) {
+        case UI_DS_CLEANING:
+            text = "System";
+            break;
+        case UI_DS_ADMIN:
+            text = "Admin";
+            break;
+        case UI_DS_DISPENSING_MANUAL:
+        case UI_DS_NO_FLOW_MANUAL:
+            text = "Manual";
+            break;
+        case UI_DS_CARD_READING:
+        case UI_DS_CARD_READY:
+        case UI_DS_DISPENSING:
+        case UI_DS_NO_FLOW_CARD:
+        case UI_DS_NO_BALANCE:
+        case UI_DS_CARD_ERROR:
+        case UI_DS_WAITING_REMOVAL:
+            text = ui_ctx.phone_valid ? ui_ctx.last_phone_number : no_card_id;
+            break;
+        case UI_DS_COOLDOWN:
+        case UI_DS_PERSISTENCE:
+            /* Card gone — keep showing last customer name if we have one */
+            text = (ui_ctx.last_phone_number[0] != '\0')
+                   ? ui_ctx.last_phone_number : no_card_id;
+            break;
+        default: /* UI_DS_IDLE */
+            text = no_card_id;
+            break;
+    }
+
+    if (strcmp(last_customer_id, text) != 0) {
+        strncpy(last_customer_id, text, sizeof(last_customer_id) - 1);
+        last_customer_id[sizeof(last_customer_id) - 1] = '\0';
+        lv_label_set_text(ui_customerID, last_customer_id);
+    }
+}
+
+static void render_card_error_status(UI_Disp_State_t state,
+                                      bool card_waiting_tap,
+                                      MIFARE_OperationContext_t op_ctx)
+{
+    if (ui_cardErrorStatus == NULL) return;
+
+    /* Persistent toggle state for each alternating-message state */
+    static bool     alt_waiting = false;  static uint32_t alt_waiting_t  = 0u;
+    static bool     alt_no_flow = false;  static uint32_t alt_no_flow_t  = 0u;
+    static bool     alt_no_bal  = false;  static uint32_t alt_no_bal_t   = 0u;
+    static bool     alt_c_err   = false;  static uint32_t alt_c_err_t    = 0u;
+    /* Dispensed-amount cache (shared by DISPENSING and COOLDOWN) */
+    static uint32_t last_disp_x10   = 0xFFFFFFFFu;
+    static char     last_err_text[16] = "";
+
+    /* Module failures override every state */
+    if (ui_ctx.has_module_failures) {
+        static uint32_t mod_cycle_t = 0u;
+        uint32_t now = (uint32_t)xTaskGetTickCount();
+        if ((now - mod_cycle_t) >= pdMS_TO_TICKS(2000u)) {
+            ui_ctx.current_failed_module_index =
+                (ui_ctx.current_failed_module_index + 1u) % ui_ctx.failed_module_count;
+            mod_cycle_t = now;
+        }
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%s",
+                 System_GetModuleName(ui_ctx.failed_modules[ui_ctx.current_failed_module_index]));
+        lv_label_set_text(ui_cardErrorStatus, buf);
+        set_obj_hidden(ui_cardErrorStatus, false);
+        return;
+    }
+
+    /* Show dispensed volume while dispensing or in cooldown (positive flow only) */
+    uint32_t dispensed_ml = 0u;
+    if (state == UI_DS_DISPENSING || state == UI_DS_DISPENSING_MANUAL) {
+        dispensed_ml = ui_ctx.dispense_amount_ml;
+    } else if (state == UI_DS_COOLDOWN) {
+        dispensed_ml = ui_ctx.dispensed_amount_ml;
+    }
+
+    if (dispensed_ml > 0u) {
+        uint32_t x10 = dispensed_ml / 100u;
+        if (x10 != last_disp_x10) {
+            last_disp_x10 = x10;
+            char buf[16];
+            if (x10 < 100u) {
+                snprintf(buf, sizeof(buf), "%lu.%lu L",
+                         (unsigned long)(x10 / 10u), (unsigned long)(x10 % 10u));
+            } else {
+                snprintf(buf, sizeof(buf), "%lu L", (unsigned long)(x10 / 10u));
+            }
+            lv_label_set_text(ui_cardErrorStatus, buf);
+            strncpy(last_err_text, buf, sizeof(last_err_text) - 1);
+            last_err_text[sizeof(last_err_text) - 1] = '\0';
+        }
+        set_obj_hidden(ui_cardErrorStatus, false);
+        return;
+    }
+
+    /* Reset dispensed cache when not in a dispensing-amount state */
+    last_disp_x10 = 0xFFFFFFFFu;
+
+    const char *text = NULL;
+    bool visible     = true;
+
+    switch (state) {
+        case UI_DS_IDLE:
+            text = card_waiting_tap ? "Tap Card" : "No Card";
+            break;
+        case UI_DS_CLEANING:
+            text = "Cleaning";
+            break;
+        case UI_DS_CARD_READING:
+            text = "In Progress";
+            break;
+        case UI_DS_ADMIN:
+            text = "Admin";
+            break;
+        case UI_DS_CARD_READY:
+        case UI_DS_DISPENSING:           /* zero-flow active dispense: not started yet */
+            text = "Ready";
+            break;
+        case UI_DS_DISPENSING_MANUAL:    /* zero-flow manual dispense: nothing to show yet */
+            visible = false;
+            break;
+        case UI_DS_COOLDOWN:             /* zero-dispensed cooldown: shouldn't normally occur */
+            visible = false;
+            break;
+        case UI_DS_NO_FLOW_MANUAL:
+            text = "No Flow";
+            break;
+        case UI_DS_NO_FLOW_CARD:
+            text = ui_alt(&alt_no_flow, &alt_no_flow_t, 2000u, "No Flow",    "Remove Card");
+            break;
+        case UI_DS_NO_BALANCE:
+            text = ui_alt(&alt_no_bal,  &alt_no_bal_t,  2000u, "No Balance", "Remove Card");
+            break;
+        case UI_DS_CARD_ERROR:
+            text = ui_alt(&alt_c_err,   &alt_c_err_t,   2000u, "No Init",    "Remove Card");
+            break;
+        case UI_DS_WAITING_REMOVAL: {
+            const char *status = (op_ctx == MIFARE_CONTEXT_TOPUP) ? "Topped Up" : "Complete";
+            text = ui_alt(&alt_waiting, &alt_waiting_t, 2000u, status, "Remove Card");
+            break;
+        }
+        case UI_DS_PERSISTENCE:
+            set_obj_hidden(ui_cardErrorStatus, false); /* keep last shown text */
+            return;
+        default:
+            visible = false;
+            break;
+    }
+
+    if (!visible) {
+        set_obj_hidden(ui_cardErrorStatus, true);
+        return;
+    }
+
+    if (text != NULL && strcmp(last_err_text, text) != 0) {
+        strncpy(last_err_text, text, sizeof(last_err_text) - 1);
+        last_err_text[sizeof(last_err_text) - 1] = '\0';
+        lv_label_set_text(ui_cardErrorStatus, last_err_text);
+    }
+    set_obj_hidden(ui_cardErrorStatus, false);
+}
+
+static void render_card_remaining(UI_Disp_State_t state, uint32_t display_balance_ml)
+{
+    if (ui_cardRemaining == NULL) return;
+
+    static uint32_t last_val = 0xFFFFFFFFu;
+    bool     hidden = false;
+    uint32_t val    = 0u;
+
+    switch (state) {
+        case UI_DS_IDLE:
+        case UI_DS_CLEANING:
+        case UI_DS_CARD_READING:
+        case UI_DS_ADMIN:
+        case UI_DS_NO_FLOW_MANUAL:
+        case UI_DS_NO_BALANCE:
+        case UI_DS_CARD_ERROR:
+            hidden = true;
+            break;
+        case UI_DS_CARD_READY:
+        case UI_DS_NO_FLOW_CARD:
+        case UI_DS_WAITING_REMOVAL:
+        case UI_DS_COOLDOWN:
+        case UI_DS_PERSISTENCE:
+            val    = display_balance_ml;
+            hidden = (val == 0u);
+            break;
+        case UI_DS_DISPENSING:
+            val    = display_balance_ml;
+            hidden = false;
+            break;
+        case UI_DS_DISPENSING_MANUAL: {
+            uint32_t remaining = (ui_ctx.showing_persisted_data && ui_ctx.last_card_balance_ml > 0u)
+                                 ? ui_ctx.last_card_balance_ml
+                                 : ui_ctx.dispense_remaining_ml;
+            val    = remaining;
+            hidden = false;
+            break;
+        }
+        default:
+            hidden = true;
+            break;
+    }
+
+    set_obj_hidden(ui_cardRemaining, hidden);
+    if (hidden) {
+        last_val = 0xFFFFFFFFu;
+        return;
+    }
+
+    if (val != last_val) {
+        last_val = val;
+        char buf[16];
+        ui_fmt_ml(buf, sizeof(buf), val);
+        lv_label_set_text(ui_cardRemaining, buf);
+    }
+}
+
+static void render_total_remaining_bar(UI_Disp_State_t state,
+                                        uint32_t balance_ml, uint32_t last_topup_ml)
+{
+    if (ui_totalRemainingBar == NULL) return;
+
+    static int32_t last_pct = -1;
+    int32_t pct = last_pct; /* default: keep last value */
+
+    switch (state) {
+        case UI_DS_IDLE:
+        case UI_DS_CLEANING:
+        case UI_DS_CARD_READING:
+        case UI_DS_ADMIN:
+        case UI_DS_NO_FLOW_MANUAL:
+        case UI_DS_NO_BALANCE:
+        case UI_DS_CARD_ERROR:
+        case UI_DS_DISPENSING_MANUAL:
+            pct = 0;
+            break;
+        case UI_DS_CARD_READY:
+        case UI_DS_DISPENSING:
+        case UI_DS_NO_FLOW_CARD:
+        case UI_DS_WAITING_REMOVAL:
+            if (last_topup_ml > 0u) {
+                pct = (int32_t)((balance_ml * 100u) / last_topup_ml);
+                if (pct < 0)   pct = 0;
+                if (pct > 100) pct = 100;
+            }
+            break;
+        default: /* COOLDOWN, PERSISTENCE: keep last */
+            break;
+    }
+
+    if (pct != last_pct) {
+        lv_bar_set_value(ui_totalRemainingBar, pct, LV_ANIM_OFF);
+        last_pct = pct;
+    }
+}
+
+static void render_level_colour(UI_Disp_State_t state, uint32_t display_balance_ml)
+{
+    if (ui_levelColourIndicator == NULL) return;
+
+    typedef enum { LC_HIDDEN, LC_RED, LC_AMBER, LC_GREEN } LevelColor_t;
+    static LevelColor_t last_lc = LC_HIDDEN;
+    LevelColor_t lc = last_lc; /* default: keep last */
+
+    switch (state) {
+        case UI_DS_IDLE:
+        case UI_DS_CLEANING:
+        case UI_DS_CARD_READING:
+        case UI_DS_ADMIN:
+        case UI_DS_NO_FLOW_MANUAL:
+        case UI_DS_NO_BALANCE:
+        case UI_DS_CARD_ERROR:
+        case UI_DS_DISPENSING_MANUAL:
+            lc = LC_HIDDEN;
+            break;
+        case UI_DS_CARD_READY:
+        case UI_DS_DISPENSING:
+        case UI_DS_NO_FLOW_CARD:
+        case UI_DS_WAITING_REMOVAL:
+        case UI_DS_COOLDOWN:
+        case UI_DS_PERSISTENCE: {
+            uint32_t v = (display_balance_ml > 0u)
+                         ? display_balance_ml : ui_ctx.last_card_balance_ml;
+            lc = (v < 15000u) ? LC_RED : (v < 20000u) ? LC_AMBER : LC_GREEN;
+            break;
+        }
+        default:
+            break;
+    }
+
+    if (lc == last_lc) return;
+    last_lc = lc;
+
+    switch (lc) {
+        case LC_RED:
+            lv_obj_set_style_bg_color(ui_levelColourIndicator,
+                                      lv_color_hex(0xCC0000u), LV_PART_MAIN | LV_STATE_DEFAULT);
+            set_obj_hidden(ui_levelColourIndicator, false);
+            break;
+        case LC_AMBER:
+            lv_obj_set_style_bg_color(ui_levelColourIndicator,
+                                      lv_color_hex(0xFF9900u), LV_PART_MAIN | LV_STATE_DEFAULT);
+            set_obj_hidden(ui_levelColourIndicator, false);
+            break;
+        case LC_GREEN:
+            lv_obj_set_style_bg_color(ui_levelColourIndicator,
+                                      lv_color_hex(0x05820Au), LV_PART_MAIN | LV_STATE_DEFAULT);
+            set_obj_hidden(ui_levelColourIndicator, false);
+            break;
+        case LC_HIDDEN:
+        default:
+            set_obj_hidden(ui_levelColourIndicator, true);
+            break;
+    }
+}
+
+static void render_led_indicator(UI_Disp_State_t state)
+{
+    if (ui_ledIndicator == NULL) return;
+
+    typedef enum { LED_HIDDEN, LED_GREEN, LED_FLASH_RED } LED_State_t;
+    static LED_State_t last_led = LED_HIDDEN;
+    LED_State_t led;
+
+    if (ui_ctx.has_module_failures) {
+        led = LED_FLASH_RED;
+    } else {
+        switch (state) {
+            case UI_DS_ADMIN:
+            case UI_DS_CARD_READY:
+            case UI_DS_DISPENSING:
+                led = LED_GREEN;
+                break;
+            case UI_DS_CARD_READING:
+            case UI_DS_NO_FLOW_CARD:
+            case UI_DS_NO_BALANCE:
+            case UI_DS_CARD_ERROR:
+            case UI_DS_WAITING_REMOVAL:
+                led = LED_FLASH_RED;
+                break;
+            default:
+                led = LED_HIDDEN;
+                break;
+        }
+    }
+
+    /* Flashing is handled every tick regardless of state-change */
+    if (led == LED_FLASH_RED) {
+        uint32_t now = (uint32_t)xTaskGetTickCount();
+        if ((now - ui_ctx.last_led_toggle_time) >= pdMS_TO_TICKS(250u)) {
+            ui_ctx.led_is_on           = !ui_ctx.led_is_on;
+            ui_ctx.last_led_toggle_time = now;
+        }
+        if (ui_ctx.led_is_on) {
+            lv_obj_set_style_bg_color(ui_ledIndicator,
+                                      lv_color_hex(0xFF0000u), LV_PART_MAIN | LV_STATE_DEFAULT);
+            set_obj_hidden(ui_ledIndicator, false);
+        } else {
+            set_obj_hidden(ui_ledIndicator, true);
+        }
+        last_led = led;
+        return;
+    }
+
+    if (led == last_led) return;
+    last_led = led;
+
+    switch (led) {
+        case LED_GREEN:
+            lv_obj_set_style_bg_color(ui_ledIndicator,
+                                      lv_color_hex(0x00FF00u), LV_PART_MAIN | LV_STATE_DEFAULT);
+            set_obj_hidden(ui_ledIndicator, false);
+            break;
+        case LED_HIDDEN:
+        default:
+            set_obj_hidden(ui_ledIndicator, true);
+            break;
+    }
+}
+
+/* ─── Main update entry point ──────────────────────────────────────────── */
+
 /**
  * @brief Update UI based on current system state
- * @note Called periodically with LVGL semaphore held. 
- *       UI reacts to system state - it does not drive it.
+ * @note Called periodically with LVGL semaphore held.
+ *       Evaluates display state once, then dispatches to per-widget renders.
  */
 static void update_ui_from_system_state(void)
 {
-    /* ===== Check for live config changes (background colors, etc.) ===== */
     apply_background_colors_from_config();
-    
-    /* ===== Check for module startup failures ===== */
-    const SystemConfig_t* cfg = Config_Get();
-    ui_ctx.failed_module_count = 0;
-    
-    /* Check each enabled module's state - flag as failed if enabled but not running */
-    if (cfg->modules.lcd_display_enabled && System_GetModuleState(MODULE_LCD_DISPLAY) != MODULE_STATE_RUNNING) {
-        ui_ctx.failed_modules[ui_ctx.failed_module_count++] = MODULE_LCD_DISPLAY;
+
+    /* ── Firmware update: early-return path ──────────────────────────────── */
+    uint32_t fw_bytes_received = 0u;
+    uint32_t fw_expected_size  = 0u;
+    uint8_t  cch_fw_phase      = 0u;
+    uint8_t  cch_fw_percent    = 0u;
+    uint32_t cch_fw_completed  = 0u;
+    uint32_t cch_fw_total      = 0u;
+    bool cch_fw_active = RS485_Command_Adapter_GetFirmwareProgress(
+                             &cch_fw_phase, &cch_fw_percent,
+                             &cch_fw_completed, &cch_fw_total);
+
+    if (RS485_FW_Update_GetProgress(&fw_bytes_received, &fw_expected_size)) {
+        if (cch_fw_active && cch_fw_total > fw_expected_size && fw_expected_size > 0u) {
+            uint32_t combined = (cch_fw_total - fw_expected_size) + fw_bytes_received;
+            apply_firmware_update_percentage(
+                (int32_t)(((uint64_t)combined * 100u) / cch_fw_total));
+        } else {
+            apply_firmware_update_ui(fw_bytes_received, fw_expected_size);
+        }
+        ui_ctx.force_refresh_on_next_update = false;
+        return;
     }
-    if (cfg->modules.mifare_polling_enabled && System_GetModuleState(MODULE_MIFARE_POLLING) != MODULE_STATE_RUNNING) {
-        ui_ctx.failed_modules[ui_ctx.failed_module_count++] = MODULE_MIFARE_POLLING;
+    if (cch_fw_active) {
+        apply_firmware_update_percentage((int32_t)cch_fw_percent);
+        ui_ctx.force_refresh_on_next_update = false;
+        return;
     }
-    if (cfg->modules.dispenser_enabled && System_GetModuleState(MODULE_DISPENSER) != MODULE_STATE_RUNNING) {
-        ui_ctx.failed_modules[ui_ctx.failed_module_count++] = MODULE_DISPENSER;
+
+    /* ── Module failure check ─────────────────────────────────────────────── */
+    const SystemConfig_t *cfg = Config_Get();
+    ui_ctx.failed_module_count = 0u;
+    if (cfg->modules.lcd_display_enabled    && System_GetModuleState(MODULE_LCD_DISPLAY)    != MODULE_STATE_RUNNING) ui_ctx.failed_modules[ui_ctx.failed_module_count++] = MODULE_LCD_DISPLAY;
+    if (cfg->modules.mifare_polling_enabled && System_GetModuleState(MODULE_MIFARE_POLLING) != MODULE_STATE_RUNNING) ui_ctx.failed_modules[ui_ctx.failed_module_count++] = MODULE_MIFARE_POLLING;
+    if (cfg->modules.dispenser_enabled      && System_GetModuleState(MODULE_DISPENSER)      != MODULE_STATE_RUNNING) ui_ctx.failed_modules[ui_ctx.failed_module_count++] = MODULE_DISPENSER;
+    if (cfg->modules.buzzer_enabled         && System_GetModuleState(MODULE_BUZZER)         != MODULE_STATE_RUNNING) ui_ctx.failed_modules[ui_ctx.failed_module_count++] = MODULE_BUZZER;
+    if (cfg->modules.io_expander_enabled    && System_GetModuleState(MODULE_IO_EXPANDER)    != MODULE_STATE_RUNNING) ui_ctx.failed_modules[ui_ctx.failed_module_count++] = MODULE_IO_EXPANDER;
+    if (cfg->modules.rs485_enabled          && System_GetModuleState(MODULE_RS485)          != MODULE_STATE_RUNNING) ui_ctx.failed_modules[ui_ctx.failed_module_count++] = MODULE_RS485;
+    ui_ctx.has_module_failures = (ui_ctx.failed_module_count > 0u);
+
+    /* ── Derive inputs from event cache ──────────────────────────────────── */
+    uint32_t current_time             = (uint32_t)xTaskGetTickCount();
+    MIFARE_CardState_t      cst       = ui_ctx.card_state;
+    MIFARE_TransactionState_t txn     = ui_ctx.transaction_state;
+    uint32_t card_balance_ml          = ui_ctx.card_balance_ml;
+    bool admin_card_present           = ui_ctx.admin_card_present;
+    bool is_dispensing                = ui_ctx.dispense_active;
+    bool card_present_now             = ui_ctx.rfid_card_present ||
+                                         (cst == MIFARE_CARD_STATE_PRESENT ||
+                                         cst == MIFARE_CARD_STATE_NEEDS_POLLING_CYCLE);
+    bool card_authenticated           = (cst == MIFARE_CARD_STATE_PRESENT &&
+                                         (card_balance_ml > 0u || admin_card_present));
+
+    /* Cache card balance while card is present */
+    if (cst == MIFARE_CARD_STATE_PRESENT && card_balance_ml > 0u) {
+        ui_ctx.last_card_balance_ml = card_balance_ml;
     }
-    if (cfg->modules.buzzer_enabled && System_GetModuleState(MODULE_BUZZER) != MODULE_STATE_RUNNING) {
-        ui_ctx.failed_modules[ui_ctx.failed_module_count++] = MODULE_BUZZER;
-    }
-    if (cfg->modules.io_expander_enabled && System_GetModuleState(MODULE_IO_EXPANDER) != MODULE_STATE_RUNNING) {
-        ui_ctx.failed_modules[ui_ctx.failed_module_count++] = MODULE_IO_EXPANDER;
-    }
-    if (cfg->modules.rs485_enabled && System_GetModuleState(MODULE_RS485) != MODULE_STATE_RUNNING) {
-        ui_ctx.failed_modules[ui_ctx.failed_module_count++] = MODULE_RS485;
-    }
-    
-    ui_ctx.has_module_failures = (ui_ctx.failed_module_count > 0);
-    
-    /* ===== Poll current system state from modules ===== */
-    uint32_t card_balance_tokens = MIFARE_GetBalance();
-    MIFARE_CardState_t card_state = MIFARE_GetCardState();
-    MIFARE_TransactionState_t txn_state = MIFARE_GetTransactionState();
-    bool admin_card_present = MIFARE_IsAdminCard();
-    CLI_PendingCommandState_t* pending_card_command = CLI_GetPendingCommand();
-    bool card_process_waiting_for_tap = (pending_card_command != NULL &&
-                                         pending_card_command->active &&
-                                         card_state == MIFARE_CARD_STATE_ABSENT);
-    bool card_present_now = (card_state == MIFARE_CARD_STATE_PRESENT || 
-                             card_state == MIFARE_CARD_STATE_NEEDS_POLLING_CYCLE);
-    bool card_authenticated = (card_state == MIFARE_CARD_STATE_PRESENT && (card_balance_tokens > 0 || admin_card_present));
-    
-    /* Cache balance when card is ready (before error states can clear it) */
-    if (card_state == MIFARE_CARD_STATE_PRESENT && card_balance_tokens > 0) {
-        ui_ctx.last_card_balance_ml = card_balance_tokens; // Assuming tokens are equivalent to ml for display purposes
-    }
-    bool is_dispensing = Dispenser_IsDispenseActive();
-    uint32_t current_time = xTaskGetTickCount();
-    
-    /* Update legacy variable */
-    card_present = card_present_now ? 1 : 0;
-    
-    /* DEBUG LOGGING */
-    static uint32_t last_debug_log_time = 0;
-    if ((current_time - last_debug_log_time) > 1000) {
-        last_debug_log_time = current_time;
-        if (is_dispensing) {
-            USB_Log_Printf("UI_DEBUG: Dispensing=1, Card=%d, RemLabel=%p\r\n", 
-                          card_present_now, ui_cardRemaining);
-            if (ui_cardRemaining) {
-                 USB_Log_Printf("UI_DEBUG: Label Hidden=%d\r\n", 
-                               lv_obj_has_flag(ui_cardRemaining, LV_OBJ_FLAG_HIDDEN));
-            }
+
+    /* ── Manual no-flow banner timeout ───────────────────────────────────── */
+    if (ui_ctx.manual_no_flow_display_active) {
+        if (pdTICKS_TO_MS(current_time - ui_ctx.manual_no_flow_display_start_time)
+                >= MANUAL_NO_FLOW_DISPLAY_MS) {
+            ui_ctx.manual_no_flow_display_active     = false;
+            ui_ctx.manual_no_flow_display_start_time = 0u;
+            ui_ctx.force_refresh_on_next_update      = true;
         }
     }
-    
-    /* ===== Track dispense stop for cooldown period ===== */
+    bool manual_no_flow = ui_ctx.manual_no_flow_display_active;
+    bool card_no_flow   = (txn == TRANSACTION_STATE_ERROR_NO_FLOW);
+
+    /* ── Cooldown tracking ────────────────────────────────────────────────── */
     if (ui_ctx.was_dispensing && !is_dispensing) {
-        /* Dispense just stopped - start cooldown period */
         ui_ctx.dispense_stopped_time = current_time;
-        ui_ctx.in_cooldown = true;
-        ui_ctx.dispensed_amount_ml = Dispenser_GetDispensedAmountML();
+        ui_ctx.in_cooldown           = true;
+        ui_ctx.dispensed_amount_ml   = ui_ctx.dispense_amount_ml;
     }
     ui_ctx.was_dispensing = is_dispensing;
-    
-    /* ===== Check if cooldown period expired ===== */
     if (ui_ctx.in_cooldown && !is_dispensing) {
-        uint32_t time_since_stop = pdTICKS_TO_MS(current_time - ui_ctx.dispense_stopped_time);
-        if (time_since_stop >= DISPENSE_COOLDOWN_MS) {
+        if (pdTICKS_TO_MS(current_time - ui_ctx.dispense_stopped_time) >= DISPENSE_COOLDOWN_MS) {
             ui_ctx.in_cooldown = false;
         }
     }
-    
-    /* ===== Detect card insertion edge - overrides cooldown ===== */
+
+    /* ── Card presence edge detection ────────────────────────────────────── */
     if (!ui_ctx.was_card_present && card_present_now) {
-        /* Card just inserted - cancel cooldown and persistence immediately */
-        ui_ctx.in_cooldown = false;
-        ui_ctx.showing_persisted_data = false;
-        ui_ctx.force_refresh_on_next_update = true;  /* Force all cached values to refresh */
+        /* Card inserted — cancel any lingering transient states */
+        ui_ctx.in_cooldown                       = false;
+        ui_ctx.showing_persisted_data            = false;
+        ui_ctx.manual_no_flow_display_active     = false;
+        ui_ctx.manual_no_flow_display_start_time = 0u;
+        ui_ctx.force_refresh_on_next_update      = true;
     }
-    
-    /* ===== Detect card removal edge ===== */
     if (ui_ctx.was_card_present && !card_present_now) {
-        /* Card just removed - start persistence timer */
-        ui_ctx.card_removed_time = current_time;
+        ui_ctx.card_removed_time      = current_time;
         ui_ctx.showing_persisted_data = true;
     }
     ui_ctx.was_card_present = card_present_now;
-    
-    /* ===== Check if persistence timeout expired ===== */
+
+    /* Persistence timeout — reset to idle when expired */
     if (ui_ctx.showing_persisted_data && !card_present_now) {
-        uint32_t ui_hide_delay = Config_Get()->ui.ui_hide_delay_ms;
-        if ((current_time - ui_ctx.card_removed_time) >= ui_hide_delay) {
-            /* Timeout expired - reset to idle */
+        if (pdTICKS_TO_MS(current_time - ui_ctx.card_removed_time)
+                >= cfg->ui.ui_hide_delay_ms) {
             reset_ui_to_idle();
             apply_ui_state_config(UI_STATE_IDLE);
+            ui_ctx.force_refresh_on_next_update = false;
             return;
         }
     }
-    
-    /* ===== Determine current UI state ===== */
-    UI_State_t current_ui_state = map_card_state_to_ui_state(card_state, is_dispensing);
-    
-    /* ===== Apply state-specific UI configuration (only if changed) ===== */
-    /* Force refresh on new card insertion OR if state changed */
-    if (current_ui_state != last_applied_ui_state || ui_ctx.force_refresh_on_next_update) {
-        apply_ui_state_config(current_ui_state);
-        last_applied_ui_state = current_ui_state;
-        /* Force valve state colors to update when UI state changes */
-        last_valve_state = (ValveState_t)0xFF;  /* Invalid value triggers update */
-    }
-    
-    /* ===== Update customer ID (only when changed) ===== */
-    const SystemConfig_t* config = Config_Get();
-    if (ui_customerID != NULL) {
-        const char* new_customer_id = NULL;
-        
-        if (admin_card_present) {
-            new_customer_id = "Admin";
-        } else if (card_state == MIFARE_CARD_STATE_PRESENT) {
-            /* Card present - get and cache phone number */
-            char phone_str[12];
-            if (MIFARE_GetCustomerPhoneNumber(phone_str, sizeof(phone_str))) {
-                strncpy(ui_ctx.last_phone_number, phone_str, sizeof(ui_ctx.last_phone_number) - 1);
-                ui_ctx.last_phone_number[sizeof(ui_ctx.last_phone_number) - 1] = '\0';
-                new_customer_id = ui_ctx.last_phone_number;
-            }
-        } else if (!ui_ctx.showing_persisted_data) {
-            /* No card and not persisting */
-            if (is_dispensing) {
-                /* Manual dispense active - show "Manual" */
-                new_customer_id = "Manual";
-                /* Force visibility for manual mode */
-                if (lv_obj_has_flag(ui_customerID, LV_OBJ_FLAG_HIDDEN)) {
-                    lv_obj_clear_flag(ui_customerID, LV_OBJ_FLAG_HIDDEN);
-                }
-            } else {
-                /* Show configured default */
-                new_customer_id = config->ui.no_card_customer_id;
-            }
-        }
-        
-        /* Only update label if text changed */
-        if (new_customer_id != NULL && strcmp(last_customer_id, new_customer_id) != 0) {
-            strncpy(last_customer_id, new_customer_id, sizeof(last_customer_id) - 1);
-            last_customer_id[sizeof(last_customer_id) - 1] = '\0';
-            lv_label_set_text(ui_customerID, last_customer_id);
-        }
-        /* When persisting after card removal, label keeps cached value */
-    }
-    
-    /* ===== Determine error status first (needed for dispensedSession visibility) ===== */
-    const char* error_text = NULL;
-    bool should_show_error = false;
-    
-    /* Check all error conditions - prioritize specific errors over generic balance check */
-    if (txn_state == TRANSACTION_STATE_ERROR_NO_FLOW) {
-        /* No flow error - show specific message */
-        error_text = "No Flow";
-        should_show_error = true;
-    } else if (card_state == MIFARE_CARD_STATE_INITIALIZING ||
-               card_state == MIFARE_CARD_STATE_NEEDS_POLLING_CYCLE ||
-               txn_state == TRANSACTION_STATE_CARD_DETECTED ||
-               txn_state == TRANSACTION_STATE_AUTHENTICATING ||
-               txn_state == TRANSACTION_STATE_READING_DATA ||
-               txn_state == TRANSACTION_STATE_VALIDATING) {
-        /* Card operation in progress - show working status */
-        error_text = "In Progress";
-        should_show_error = true;
-    } else if (txn_state == TRANSACTION_STATE_WAITING_REMOVAL) {
-        /* Operation complete - show appropriate status based on context */
-        MIFARE_OperationContext_t ctx = MIFARE_GetOperationContext();
-        if (ctx == MIFARE_CONTEXT_INIT) {
-            error_text = "Complete";
-        } else {
-            error_text = "Topped Up";
-        }
-        should_show_error = true;
-    } else if (card_state == MIFARE_CARD_STATE_ABSENT && !ui_ctx.in_cooldown) {
-        /* No card present (only show after cooldown expires) */
-        error_text = card_process_waiting_for_tap ? "Tap Card" : "No Card";
-        should_show_error = true;
-    } else if (card_state == MIFARE_CARD_STATE_PRESENT && 
-               txn_state == TRANSACTION_STATE_WAITING_REMOVAL) {
-        /* Operation complete - keep showing balance but display status message */
-        should_show_error = true;
-    } else if (card_state == MIFARE_CARD_STATE_ERROR) {
-        /* Card failed to initialize */
-        should_show_error = true;
-    } else if (admin_card_present) {
-        should_show_error = false;
-    } else if (card_state == MIFARE_CARD_STATE_PRESENT && card_balance_tokens == 0 && 
-               txn_state != TRANSACTION_STATE_ERROR_NO_FLOW) {
-        /* Card authenticated but no balance (not a flow error) */
-        should_show_error = true;
-    } else if (card_authenticated) {
-        /* Hide when card authenticated with balance */
-        should_show_error = false;
-    } else if (ui_ctx.in_cooldown) {
-        /* Show error after cooldown expires */
-        should_show_error = true;
-    }
-    
-    /* ===== Update cardErrorStatus label ===== */
-    if (ui_cardErrorStatus != NULL) {
-        static uint32_t last_dispensed_error_liters_x10 = 0xFFFFFFFF;
-        static char last_error_text[16] = "";  // Moved here to allow reset
-        
-        /* Reset cache when transitioning out of dispense/cooldown to force update */
-        static bool was_in_dispense_or_cooldown = false;
-        bool is_in_dispense_or_cooldown = (is_dispensing || ui_ctx.in_cooldown);
-        
-        /* Force refresh on new card insertion OR when exiting dispense/cooldown */
-        if (ui_ctx.force_refresh_on_next_update || 
-            (was_in_dispense_or_cooldown && !is_in_dispense_or_cooldown)) {
-            /* Reset all caches to force immediate update */
-            last_dispensed_error_liters_x10 = 0xFFFFFFFF;
-            last_error_text[0] = '\0';  // Clear error text cache
-        }
-        was_in_dispense_or_cooldown = is_in_dispense_or_cooldown;
-        
-        /* Check if a new card is being processed (takes priority over cooldown display) */
-        bool card_processing_in_progress = (
-            txn_state == TRANSACTION_STATE_CARD_DETECTED ||
-            txn_state == TRANSACTION_STATE_AUTHENTICATING ||
-            txn_state == TRANSACTION_STATE_READING_DATA ||
-            txn_state == TRANSACTION_STATE_VALIDATING ||
-            card_state == MIFARE_CARD_STATE_INITIALIZING ||
-            card_state == MIFARE_CARD_STATE_NEEDS_POLLING_CYCLE
-        );
-        
-        /* Get current dispensed amount for display logic */
-        uint32_t current_dispensed_ml = is_dispensing ? Dispenser_GetDispensedAmountML() : ui_ctx.dispensed_amount_ml;
-        bool has_positive_flow = (current_dispensed_ml > 0);
-        
-        /* Dispensing/cooldown shows dispensed amount - ONLY when there's positive flow */
-        /* If no water was dispensed, skip to normal error handling (shows "No Flow" or "Ready") */
-        if (((is_dispensing && has_positive_flow) || (ui_ctx.in_cooldown && has_positive_flow)) && !card_processing_in_progress) {
-            /* Show dispensed amount on cardErrorStatus (only when flow is positive) */
-            static char dispensed_error_str[16];
-            
-            uint32_t dispensed_ml = is_dispensing ? Dispenser_GetDispensedAmountML() : ui_ctx.dispensed_amount_ml;
-            uint32_t dispensed_liters_x10 = dispensed_ml / 100;  /* Convert ml to 0.1L units */
-            
-            /* Only update if value changed */
-            if (dispensed_liters_x10 != last_dispensed_error_liters_x10) {
-                last_dispensed_error_liters_x10 = dispensed_liters_x10;
-                
-                if (dispensed_liters_x10 < 100) {
-                    /* Under 10L - show decimal */
-                    snprintf(dispensed_error_str, sizeof(dispensed_error_str), "%lu.%lu L", 
-                             dispensed_liters_x10 / 10, dispensed_liters_x10 % 10);
-                } else {
-                    /* 10L or more - show whole number only */
-                    snprintf(dispensed_error_str, sizeof(dispensed_error_str), "%lu L", 
-                             dispensed_liters_x10 / 10);
-                }
-                lv_label_set_text(ui_cardErrorStatus, dispensed_error_str);
-            }
-            
-            /* Make visible */
-            if (lv_obj_has_flag(ui_cardErrorStatus, LV_OBJ_FLAG_HIDDEN)) {
-                lv_obj_clear_flag(ui_cardErrorStatus, LV_OBJ_FLAG_HIDDEN);
-            }
-        } else if (card_processing_in_progress) {
-            /* New card being processed - show "In Progress" */
-            if (strcmp(last_error_text, "In Progress") != 0) {
-                lv_label_set_text(ui_cardErrorStatus, "In Progress");
-                strncpy(last_error_text, "In Progress", sizeof(last_error_text) - 1);
-                last_error_text[sizeof(last_error_text) - 1] = '\0';
-            }
-            if (lv_obj_has_flag(ui_cardErrorStatus, LV_OBJ_FLAG_HIDDEN)) {
-                lv_obj_clear_flag(ui_cardErrorStatus, LV_OBJ_FLAG_HIDDEN);
-            }
-        } else if (txn_state == TRANSACTION_STATE_WAITING_REMOVAL) {
-            /* Operation complete - alternate between status and "Remove Card" based on context */
-            static uint32_t last_toggle_time_waiting = 0;
-            static bool show_remove_waiting = false;
-            uint32_t now = xTaskGetTickCount();
-            
-            if ((now - last_toggle_time_waiting) >= pdMS_TO_TICKS(2000)) {
-                show_remove_waiting = !show_remove_waiting;
-                last_toggle_time_waiting = now;
-            }
-            
-            MIFARE_OperationContext_t ctx = MIFARE_GetOperationContext();
-            const char *status_msg = (ctx == MIFARE_CONTEXT_INIT) ? "Complete" : "Topped Up";
-            const char *msg = show_remove_waiting ? "Remove Card" : status_msg;
-            if (strcmp(last_error_text, msg) != 0) {
-                lv_label_set_text(ui_cardErrorStatus, msg);
-                strncpy(last_error_text, msg, sizeof(last_error_text) - 1);
-                last_error_text[sizeof(last_error_text) - 1] = '\0';
-            }
-            if (lv_obj_has_flag(ui_cardErrorStatus, LV_OBJ_FLAG_HIDDEN)) {
-                lv_obj_clear_flag(ui_cardErrorStatus, LV_OBJ_FLAG_HIDDEN);
-            }
-        } else if (admin_card_present && !is_dispensing) {
-            /* Admin card ready - no dispensing balance shown */
-            if (strcmp(last_error_text, "Admin") != 0) {
-                lv_label_set_text(ui_cardErrorStatus, "Admin");
-                strncpy(last_error_text, "Admin", sizeof(last_error_text) - 1);
-                last_error_text[sizeof(last_error_text) - 1] = '\0';
-            }
-            if (lv_obj_has_flag(ui_cardErrorStatus, LV_OBJ_FLAG_HIDDEN)) {
-                lv_obj_clear_flag(ui_cardErrorStatus, LV_OBJ_FLAG_HIDDEN);
-            }
-        } else if (card_authenticated && card_balance_tokens > 0 && !is_dispensing) {
-            /* Card ready with balance, not yet dispensing - show "Ready" */
-            if (strcmp(last_error_text, "Ready") != 0) {
-                lv_label_set_text(ui_cardErrorStatus, "Ready");
-                strncpy(last_error_text, "Ready", sizeof(last_error_text) - 1);
-                last_error_text[sizeof(last_error_text) - 1] = '\0';
-            }
-            if (lv_obj_has_flag(ui_cardErrorStatus, LV_OBJ_FLAG_HIDDEN)) {
-                lv_obj_clear_flag(ui_cardErrorStatus, LV_OBJ_FLAG_HIDDEN);
-            }
-        } else if (ui_ctx.has_module_failures) {
-            /* Module failures override normal error displays */
-            /* Cycle through failed module names every 2 seconds */
-            uint32_t now = xTaskGetTickCount();
-            if ((now - ui_ctx.last_failed_module_cycle_time) >= pdMS_TO_TICKS(2000)) {
-                ui_ctx.current_failed_module_index++;
-                if (ui_ctx.current_failed_module_index >= ui_ctx.failed_module_count) {
-                    ui_ctx.current_failed_module_index = 0;
-                }
-                ui_ctx.last_failed_module_cycle_time = now;
-            }
-            
-            /* Build error text: just module name */
-            char module_error_text[32];
-            System_Module_t failed_module = ui_ctx.failed_modules[ui_ctx.current_failed_module_index];
-            const char* module_name = System_GetModuleName(failed_module);
-            snprintf(module_error_text, sizeof(module_error_text), "%s", module_name);
-            
-            /* Always update and show module failure errors */
-            lv_label_set_text(ui_cardErrorStatus, module_error_text);
-            if (lv_obj_has_flag(ui_cardErrorStatus, LV_OBJ_FLAG_HIDDEN)) {
-                lv_obj_clear_flag(ui_cardErrorStatus, LV_OBJ_FLAG_HIDDEN);
-            }
-        } else {
-            /* Normal error handling (when no module failures and not dispensing) */
-            bool should_show = should_show_error;  /* Use pre-calculated error state */
-            
-            /* Check for "In Progress" states first - takes priority */
-            static bool logged_in_progress = false;
-            if (txn_state == TRANSACTION_STATE_CARD_DETECTED ||
-                txn_state == TRANSACTION_STATE_AUTHENTICATING ||
-                txn_state == TRANSACTION_STATE_READING_DATA ||
-                txn_state == TRANSACTION_STATE_VALIDATING ||
-                card_state == MIFARE_CARD_STATE_INITIALIZING ||
-                card_state == MIFARE_CARD_STATE_NEEDS_POLLING_CYCLE) {
-                error_text = "In Progress";
-                should_show = true;
-                /* Debug: Log when In Progress is detected (once per card) */
-                if (!logged_in_progress) {
-                    USB_Log_Printf("[UI] In Progress detected: txn=%d, card=%d\r\n", txn_state, card_state);
-                    logged_in_progress = true;
-                }
-            } else {
-                /* Reset flag when NOT in progress so next card logs again */
-                logged_in_progress = false;
-            }
-            
-            if (txn_state == TRANSACTION_STATE_ERROR_NO_FLOW) {
-                /* No flow error - alternate between "No Flow" and "Remove Card" */
-                static uint32_t last_toggle_time_no_flow = 0;
-                static bool show_remove_message_no_flow = false;
-                uint32_t now = xTaskGetTickCount();
-                
-                if ((now - last_toggle_time_no_flow) >= pdMS_TO_TICKS(2000)) {
-                    show_remove_message_no_flow = !show_remove_message_no_flow;
-                    last_toggle_time_no_flow = now;
-                }
-                
-                error_text = show_remove_message_no_flow ? "Remove Card" : "No Flow";
-                should_show = true;
-            } else if (txn_state == TRANSACTION_STATE_WAITING_REMOVAL) {
-                /* Operation complete - alternate between status and "Remove Card" based on context */
-                static uint32_t last_toggle_time_waiting_lvl = 0;
-                static bool show_remove_message_waiting_lvl = false;
-                uint32_t now = xTaskGetTickCount();
-                
-                if ((now - last_toggle_time_waiting_lvl) >= pdMS_TO_TICKS(2000)) {
-                    show_remove_message_waiting_lvl = !show_remove_message_waiting_lvl;
-                    last_toggle_time_waiting_lvl = now;
-                }
-                
-                MIFARE_OperationContext_t ctx = MIFARE_GetOperationContext();
-                const char *status_msg = (ctx == MIFARE_CONTEXT_INIT) ? "Complete" : "Topped Up";
-                error_text = show_remove_message_waiting_lvl ? "Remove Card" : status_msg;
-                should_show = true;
-            } else if (card_state == MIFARE_CARD_STATE_ABSENT && !ui_ctx.in_cooldown) {
-                /* No card present (only show after cooldown expires) */
-                error_text = card_process_waiting_for_tap ? "Tap Card" : "No Card";
-                should_show = true;
-            } else if (card_state == MIFARE_CARD_STATE_PRESENT && 
-                       txn_state == TRANSACTION_STATE_WAITING_REMOVAL) {
-            /* Operation complete - alternate between status and "Remove Card" based on context */
-            static uint32_t last_toggle_time_flow = 0;
-            static bool show_remove_message_flow = false;
-            uint32_t now = xTaskGetTickCount();
-            
-            /* Toggle message every 2 seconds */
-            if ((now - last_toggle_time_flow) >= pdMS_TO_TICKS(2000)) {
-                show_remove_message_flow = !show_remove_message_flow;
-                last_toggle_time_flow = now;
-            }
-            
-            MIFARE_OperationContext_t ctx = MIFARE_GetOperationContext();
-            const char *status_msg = (ctx == MIFARE_CONTEXT_INIT) ? "Complete" : "Topped Up";
-            error_text = show_remove_message_flow ? "Remove Card" : status_msg;
-            should_show = true;
-        } else if (card_state == MIFARE_CARD_STATE_ERROR) {
-            /* Card failed to initialize - alternate between "No Init" and "Remove Card" every 2 seconds */
-            static uint32_t last_toggle_time = 0;
-            static bool show_remove_message = false;
-            uint32_t now = xTaskGetTickCount();
-            
-            /* Toggle message every 2 seconds */
-            if ((now - last_toggle_time) >= pdMS_TO_TICKS(2000)) {
-                show_remove_message = !show_remove_message;
-                last_toggle_time = now;
-            }
-            
-            error_text = show_remove_message ? "Remove Card" : "No Init";
-            should_show = true;
-        } else if (admin_card_present) {
-            error_text = "Admin";
-            should_show = true;
-        } else if (card_state == MIFARE_CARD_STATE_PRESENT && card_balance_tokens == 0) {
-            /* Card authenticated but no balance - alternate between "No Balance" and "Remove Card" every 2 seconds */
-            static uint32_t last_toggle_time_balance = 0;
-            static bool show_remove_message_balance = false;
-            uint32_t now = xTaskGetTickCount();
-            
-            /* Toggle message every 2 seconds */
-            if ((now - last_toggle_time_balance) >= pdMS_TO_TICKS(2000)) {
-                show_remove_message_balance = !show_remove_message_balance;
-                last_toggle_time_balance = now;
-            }
-            
-            error_text = show_remove_message_balance ? "Remove Card" : "No Balance";
-            should_show = true;
-        } else if (card_authenticated) {
-            /* Card authenticated with balance - show "Ready" */
-            error_text = "Ready";
-            should_show = true;
-        } else if (ui_ctx.in_cooldown) {
-            /* Show error after cooldown expires */
-            should_show = true;
-            /* Keep whatever error state was active */
-            if (txn_state == TRANSACTION_STATE_ERROR_NO_FLOW) {
-                /* No flow error during cooldown - alternate messages */
-                static uint32_t last_toggle_time_no_flow_cooldown = 0;
-                static bool show_remove_message_no_flow_cooldown = false;
-                uint32_t now = xTaskGetTickCount();
-                
-                if ((now - last_toggle_time_no_flow_cooldown) >= pdMS_TO_TICKS(2000)) {
-                    show_remove_message_no_flow_cooldown = !show_remove_message_no_flow_cooldown;
-                    last_toggle_time_no_flow_cooldown = now;
-                }
-                
-                error_text = show_remove_message_no_flow_cooldown ? "Remove Card" : "No Flow";
-            } else if (txn_state == TRANSACTION_STATE_WAITING_REMOVAL) {
-                /* Operation complete during cooldown - alternate based on context */
-                static uint32_t last_toggle_time_waiting_cooldown = 0;
-                static bool show_remove_message_waiting_cooldown = false;
-                uint32_t now = xTaskGetTickCount();
-                
-                if ((now - last_toggle_time_waiting_cooldown) >= pdMS_TO_TICKS(2000)) {
-                    show_remove_message_waiting_cooldown = !show_remove_message_waiting_cooldown;
-                    last_toggle_time_waiting_cooldown = now;
-                }
-                
-                MIFARE_OperationContext_t ctx = MIFARE_GetOperationContext();
-                const char *status_msg = (ctx == MIFARE_CONTEXT_INIT) ? "Complete" : "Topped Up";
-                error_text = show_remove_message_waiting_cooldown ? "Remove Card" : status_msg;
-            } else if (card_state == MIFARE_CARD_STATE_ABSENT) {
-                error_text = card_process_waiting_for_tap ? "Tap Card" : "No Card";
-            } else if (card_state == MIFARE_CARD_STATE_ERROR) {
-                /* Use same alternating pattern as above */
-                static uint32_t last_toggle_time_cooldown = 0;
-                static bool show_remove_message_cooldown = false;
-                uint32_t now = xTaskGetTickCount();
-                
-                if ((now - last_toggle_time_cooldown) >= pdMS_TO_TICKS(2000)) {
-                    show_remove_message_cooldown = !show_remove_message_cooldown;
-                    last_toggle_time_cooldown = now;
-                }
-                
-                error_text = show_remove_message_cooldown ? "Remove Card" : "No Init";
-            } else if (admin_card_present) {
-                error_text = "Admin";
-            } else if (card_state == MIFARE_CARD_STATE_PRESENT && card_balance_tokens == 0) {
-                /* Use same alternating pattern for no balance */
-                static uint32_t last_toggle_time_balance_cooldown = 0;
-                static bool show_remove_message_balance_cooldown = false;
-                uint32_t now = xTaskGetTickCount();
-                
-                if ((now - last_toggle_time_balance_cooldown) >= pdMS_TO_TICKS(2000)) {
-                    show_remove_message_balance_cooldown = !show_remove_message_balance_cooldown;
-                    last_toggle_time_balance_cooldown = now;
-                }
-                
-                error_text = show_remove_message_balance_cooldown ? "Remove Card" : "No Balance";
-            }
-        }
-        
-        /* Update label text if needed */
-        if (should_show && error_text != NULL) {
-            if (strcmp(last_error_text, error_text) != 0) {
-                lv_label_set_text(ui_cardErrorStatus, error_text);
-                strncpy(last_error_text, error_text, sizeof(last_error_text) - 1);
-                last_error_text[sizeof(last_error_text) - 1] = '\0';
-            }
-            /* Make visible */
-            if (lv_obj_has_flag(ui_cardErrorStatus, LV_OBJ_FLAG_HIDDEN)) {
-                lv_obj_clear_flag(ui_cardErrorStatus, LV_OBJ_FLAG_HIDDEN);
-            }
-        } else {
-            /* Hide error status */
-            if (!lv_obj_has_flag(ui_cardErrorStatus, LV_OBJ_FLAG_HIDDEN)) {
-                lv_obj_add_flag(ui_cardErrorStatus, LV_OBJ_FLAG_HIDDEN);
-            }
-        }
-        }  /* End of else (normal error handling) */
-    }  /* End of if (ui_cardErrorStatus != NULL) */
-    
-    /* ===== Update card remaining display (only when changed) ===== */
-    /* Use cached balance if current balance is 0 due to error state, post-init/topup, or cooldown */
-    uint32_t display_balance_ml = card_balance_tokens;
-    if (card_balance_tokens == 0 && ui_ctx.last_card_balance_ml > 0) {
-        /* Balance is 0 but we have cached value - use it for these states */
-        if (txn_state == TRANSACTION_STATE_ERROR_NO_FLOW ||
-            txn_state == TRANSACTION_STATE_WAITING_REMOVAL ||
-            ui_ctx.in_cooldown ||
-            is_dispensing ||
-            ui_ctx.showing_persisted_data) {
+
+    /* Legacy tracking variable */
+    card_present = card_present_now ? 1 : 0;
+
+    /* Pending card command (e.g. CLI write) waiting for tap */
+    CLI_PendingCommandState_t *pending_cmd = CLI_GetPendingCommand();
+    bool card_waiting_tap = (pending_cmd != NULL && pending_cmd->active &&
+                             cst == MIFARE_CARD_STATE_ABSENT);
+
+    /* display_balance_ml: use cached value in states where live balance may be 0 */
+    uint32_t display_balance_ml = card_balance_ml;
+    if (card_balance_ml == 0u && ui_ctx.last_card_balance_ml > 0u) {
+        if (card_no_flow || txn == TRANSACTION_STATE_WAITING_REMOVAL ||
+            ui_ctx.in_cooldown || is_dispensing || ui_ctx.showing_persisted_data) {
             display_balance_ml = ui_ctx.last_card_balance_ml;
         }
     }
-    
-    /* Uses ui_cardRemaining label to show balance in liters */
-    if (ui_cardRemaining != NULL) {
-        bool dispense_active = is_dispensing;
-        
-        /* Track display mode changes to force refresh when switching formats */
-        typedef enum {
-            TIMER_MODE_NONE,
-            TIMER_MODE_TOKEN_RATIO,  /* xx/yy format */
-            TIMER_MODE_TIME,         /* MM:SS format */
-            TIMER_MODE_EMPTY         /* --:-- format */
-        } TimerDisplayMode_t;
-        
-        static TimerDisplayMode_t last_timer_mode = TIMER_MODE_NONE;
-        TimerDisplayMode_t current_mode;
-        
-        /* Determine current display mode - always show value when card present or dispensing */
-        if (dispense_active || card_present_now) {
-            current_mode = TIMER_MODE_TIME;
-        } else {
-            current_mode = TIMER_MODE_EMPTY;
-        }
-        
-        /* Force refresh if mode changed OR manual dispense active (to ensure visibility) */
-        if (current_mode != last_timer_mode || ui_ctx.force_refresh_on_next_update ||
-            (is_dispensing && !card_present_now && last_timer_mode != TIMER_MODE_TIME)) {  /* Manual dispense start */
-            last_dispense_timer_seconds = 0xFFFFFFFF;  /* Reset all caches */
-            last_dispense_token_count = 0xFFFFFFFF;
-            last_timer_mode = current_mode;
-        }
 
-        /* Update visibility to match levelColourIndicator logic */
-        bool show_remaining = false;
-        if ((card_authenticated && card_balance_tokens > 0) || dispense_active) {
-            show_remaining = true;
-        } else if (card_state == MIFARE_CARD_STATE_ABSENT && !ui_ctx.in_cooldown && !ui_ctx.showing_persisted_data) {
-            show_remaining = false;
-        } else {
-            /* Keep previous visibility if it was already visible (e.g. during errors or persistence) */
-            show_remaining = !lv_obj_has_flag(ui_cardRemaining, LV_OBJ_FLAG_HIDDEN);
-        }
+    /* ── Evaluate display state ───────────────────────────────────────────── */
+    UI_Disp_State_t disp_state = ui_disp_determine_state(
+        ui_ctx.self_clean_active,
+        is_dispensing, card_present_now,
+        manual_no_flow, admin_card_present,
+        cst, txn,
+        card_no_flow, card_authenticated, card_balance_ml,
+        ui_ctx.in_cooldown, ui_ctx.showing_persisted_data);
 
-        if (show_remaining) {
-            if (lv_obj_has_flag(ui_cardRemaining, LV_OBJ_FLAG_HIDDEN)) {
-                lv_obj_clear_flag(ui_cardRemaining, LV_OBJ_FLAG_HIDDEN);
-            }
-        } else {
-            if (!lv_obj_has_flag(ui_cardRemaining, LV_OBJ_FLAG_HIDDEN)) {
-                lv_obj_add_flag(ui_cardRemaining, LV_OBJ_FLAG_HIDDEN);
-            }
-        }
-        
-        /* Format balance as single string for ui_cardRemaining label */
-        static char balance_str[16];
-        
-        if (dispense_active && card_present_now) {
-            /* Dispense active AND card present - show balance */
-            if (display_balance_ml != last_dispense_timer_seconds) {
-                last_dispense_timer_seconds = display_balance_ml;
-                if (display_balance_ml < 1000) {
-                    /* Under 1L - show in ml */
-                    snprintf(balance_str, sizeof(balance_str), "%lu ml", display_balance_ml);
-                } else if (display_balance_ml < 10000) {
-                    /* 1L to under 10L - show decimal */
-                    uint32_t liters_x10 = display_balance_ml / 100;
-                    snprintf(balance_str, sizeof(balance_str), "%lu.%lu L", 
-                             liters_x10 / 10, liters_x10 % 10);
-                } else {
-                    /* 10L or more - show whole number only */
-                    snprintf(balance_str, sizeof(balance_str), "%lu L", 
-                             display_balance_ml / 1000);
-                }
-                lv_label_set_text(ui_cardRemaining, balance_str);
-            }
-            
-        } else if (dispense_active) {
-            /* Dispense active without card - show remaining volume */
-            uint32_t remaining_ml;
-            
-            /* Force visibility for manual dispense */
-            if (lv_obj_has_flag(ui_cardRemaining, LV_OBJ_FLAG_HIDDEN)) {
-                lv_obj_clear_flag(ui_cardRemaining, LV_OBJ_FLAG_HIDDEN);
-                LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: Manual dispense - Unhiding ui_cardRemaining\r\n");
-            }
-            
-            /* If card was just removed during dispense (persisting), use cached balance */
-            if (ui_ctx.showing_persisted_data && ui_ctx.last_card_balance_ml > 0) {
-                remaining_ml = ui_ctx.last_card_balance_ml;
-            } else {
-                remaining_ml = Dispenser_GetDispenseVolumeRemainingMl();
-            }
-            
-            if (remaining_ml != last_dispense_timer_seconds) {
-                last_dispense_timer_seconds = remaining_ml;
-                if (remaining_ml < 1000) {
-                    /* Under 1L - show in ml */
-                    snprintf(balance_str, sizeof(balance_str), "%lu ml", remaining_ml);
-                } else if (remaining_ml < 10000) {
-                    /* 1L to under 10L - show decimal */
-                    uint32_t liters_x10 = remaining_ml / 100;
-                    snprintf(balance_str, sizeof(balance_str), "%lu.%lu L", 
-                             liters_x10 / 10, liters_x10 % 10);
-                } else {
-                    /* 10L or more - show whole number only */
-                    snprintf(balance_str, sizeof(balance_str), "%lu L", 
-                             remaining_ml / 1000);
-                }
-                LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: Manual dispense - Updating text to '%s' (ml=%lu)\r\n", balance_str, remaining_ml);
-                lv_label_set_text(ui_cardRemaining, balance_str);
-            }
-            
-        } else if ((card_authenticated || 
-                    txn_state == TRANSACTION_STATE_WAITING_REMOVAL || 
-                    txn_state == TRANSACTION_STATE_ERROR_NO_FLOW ||
-                    ui_ctx.in_cooldown ||
-                    ui_ctx.showing_persisted_data) && display_balance_ml > 0) {
-            /* Card authenticated (or in post-operation/error/cooldown/persisted states) - show balance
-             * Keeps visible during no-flow errors to match levelColourIndicator */
-            if (display_balance_ml != last_dispense_timer_seconds) {
-                last_dispense_timer_seconds = display_balance_ml;
-                last_dispense_token_count = 0xFFFFFFFF;
-                if (display_balance_ml < 1000) {
-                    /* Under 1L - show in ml */
-                    snprintf(balance_str, sizeof(balance_str), "%lu ml", display_balance_ml);
-                } else if (display_balance_ml < 10000) {
-                    /* 1L to under 10L - show decimal */
-                    uint32_t liters_x10 = display_balance_ml / 100;
-                    snprintf(balance_str, sizeof(balance_str), "%lu.%lu L", 
-                             liters_x10 / 10, liters_x10 % 10);
-                } else {
-                    /* 10L or more - show whole number only */
-                    snprintf(balance_str, sizeof(balance_str), "%lu L", 
-                             display_balance_ml / 1000);
-                }
-                lv_label_set_text(ui_cardRemaining, balance_str);
-            }
-        } else if (card_state == MIFARE_CARD_STATE_ABSENT && !ui_ctx.in_cooldown && !ui_ctx.showing_persisted_data) {
-            /* No card AND not in cooldown AND not persisting - reset to default text (hidden anyway) */
-            /* During cooldown/persistence, keep showing previous balance */
-            if (last_dispense_timer_seconds != 0xFFFFFFFE) {
-                last_dispense_timer_seconds = 0xFFFFFFFE;
-                last_dispense_token_count = 0xFFFFFFFF;
-                lv_label_set_text(ui_cardRemaining, "--.- L");
-            }
-        }
-        /* During card processing (In Progress) or cooldown/persistence - don't update if condition above not met, keep previous value */
+    static UI_Disp_State_t last_disp_state = UI_DS_COUNT;
+    if (disp_state != last_disp_state || ui_ctx.force_refresh_on_next_update) {
+        /* Invalidate per-widget caches so renders re-draw immediately */
+        last_dispense_timer_seconds     = 0xFFFFFFFFu;
+        last_dispense_token_count       = 0xFFFFFFFFu;
+        last_total_remaining_percentage = -1;
+        last_valve_state                = (ValveState_t)0xFFu;
+        last_disp_state                 = disp_state;
+        LOG_DEBUG_LCD_DISPLAY_DRIVER("LCD: display state → %d\r\n", (int)disp_state);
     }
-    
-    /* ===== Update totalRemainingBar (percentage based on balance/last_topup) ===== */
-    if (ui_totalRemainingBar != NULL) {
-        static int32_t last_bar_percentage = -1;
-        int32_t bar_percentage = last_bar_percentage;  /* Keep last value by default */
-        
-        /* Force refresh on new card insertion */
-        if (ui_ctx.force_refresh_on_next_update) {
-            last_bar_percentage = -1;
-        }
-        
-        if (card_present_now) {
-            /* Card present - calculate percentage */
-            uint32_t last_topup_tokens = MIFARE_GetLastTopup();
-            
-            if (last_topup_tokens > 0) {
-                /* Calculate percentage: (balance / last_topup) * 100 */
-                bar_percentage = (int32_t)((card_balance_tokens * 100) / last_topup_tokens);
-                
-                /* Clamp to 0-100 range */
-                if (bar_percentage < 0) bar_percentage = 0;
-                if (bar_percentage > 100) bar_percentage = 100;
-            }
-            /* If no last topup recorded but card present - keep current percentage */
-        } else if (card_state == MIFARE_CARD_STATE_ABSENT && !ui_ctx.in_cooldown && !ui_ctx.showing_persisted_data) {
-            /* No card AND not in cooldown AND not persisting - reset to 0% */
-            /* During cooldown or persistence, keep last percentage */
-            bar_percentage = 0;
-        } else {
-            /* Keep last_bar_percentage by default */
-        }
-        
-        /* Update bar value if changed */
-        if (bar_percentage != last_bar_percentage) {
-            lv_bar_set_value(ui_totalRemainingBar, bar_percentage, LV_ANIM_OFF);
-            last_bar_percentage = bar_percentage;
-        }
+
+    /* Legacy UI_State_t drives customerID visibility via apply_ui_state_config */
+    UI_State_t lvgl_state = map_card_state_to_ui_state(cst, is_dispensing);
+    if (lvgl_state != last_applied_ui_state || ui_ctx.force_refresh_on_next_update) {
+        apply_ui_state_config(lvgl_state);
+        last_applied_ui_state = lvgl_state;
     }
-    
-    /* ===== Update levelColourIndicator (balance level color) ===== */
-    /* Color based on absolute balance remaining (not percentage):
-     * < 15L (15000ml) = Red
-     * < 20L (20000ml) = Amber
-     * >= 20L = Green
-     */
-    if (ui_levelColourIndicator != NULL) {
-        typedef enum {
-            LEVEL_COLOR_NONE,
-            LEVEL_COLOR_RED,
-            LEVEL_COLOR_AMBER,
-            LEVEL_COLOR_GREEN,
-            LEVEL_COLOR_HIDDEN
-        } LevelColor_t;
-        
-        static LevelColor_t last_level_color = LEVEL_COLOR_NONE;
-        LevelColor_t current_level_color;
-        
-        if (ui_ctx.force_refresh_on_next_update) {
-            last_level_color = LEVEL_COLOR_NONE;
-        }
-        
-        /* Only show after card is fully authenticated (not during In Progress) */
-        /* Keep visible during dispensing, no-flow errors, and cooldown */
-        if ((card_authenticated && card_balance_tokens > 0) || is_dispensing) {
-            /* Determine color by ml thresholds */
-            /* During dispense without card, we use display_balance_ml (which might be 0 but we use cached value) */
-            uint32_t current_val = (card_balance_tokens > 0) ? card_balance_tokens : ui_ctx.last_card_balance_ml;
-            
-            if (current_val < 15000) {
-                /* Under 15L - Red (critical) */
-                current_level_color = LEVEL_COLOR_RED;
-            } else if (current_val < 20000) {
-                /* 15L to under 20L - Amber (warning) */
-                current_level_color = LEVEL_COLOR_AMBER;
-            } else {
-                /* 20L or more - Green (good) */
-                current_level_color = LEVEL_COLOR_GREEN;
-            }
-        } else if (card_state == MIFARE_CARD_STATE_ABSENT && !ui_ctx.in_cooldown && !ui_ctx.showing_persisted_data) {
-            /* No card AND not in cooldown AND not persisting - hide indicator */
-            current_level_color = LEVEL_COLOR_HIDDEN;
-        } else {
-            /* Card processing or no balance - keep previous color if any (handles no-flow error / cooldown / persistence) */
-            if (last_level_color != LEVEL_COLOR_NONE && last_level_color != LEVEL_COLOR_HIDDEN) {
-                current_level_color = last_level_color;  /* Keep previous color */
-            } else {
-                current_level_color = LEVEL_COLOR_HIDDEN;
-            }
-        }
-        
-        /* Update only if color changed */
-        if (current_level_color != last_level_color) {
-            switch (current_level_color) {
-                case LEVEL_COLOR_RED:
-                    lv_obj_set_style_bg_color(ui_levelColourIndicator, lv_color_hex(0xCC0000), LV_PART_MAIN | LV_STATE_DEFAULT);
-                    if (lv_obj_has_flag(ui_levelColourIndicator, LV_OBJ_FLAG_HIDDEN)) {
-                        lv_obj_clear_flag(ui_levelColourIndicator, LV_OBJ_FLAG_HIDDEN);
-                    }
-                    break;
-                    
-                case LEVEL_COLOR_AMBER:
-                    lv_obj_set_style_bg_color(ui_levelColourIndicator, lv_color_hex(0xFF9900), LV_PART_MAIN | LV_STATE_DEFAULT);
-                    if (lv_obj_has_flag(ui_levelColourIndicator, LV_OBJ_FLAG_HIDDEN)) {
-                        lv_obj_clear_flag(ui_levelColourIndicator, LV_OBJ_FLAG_HIDDEN);
-                    }
-                    break;
-                    
-                case LEVEL_COLOR_GREEN:
-                    lv_obj_set_style_bg_color(ui_levelColourIndicator, lv_color_hex(0x05820A), LV_PART_MAIN | LV_STATE_DEFAULT);
-                    if (lv_obj_has_flag(ui_levelColourIndicator, LV_OBJ_FLAG_HIDDEN)) {
-                        lv_obj_clear_flag(ui_levelColourIndicator, LV_OBJ_FLAG_HIDDEN);
-                    }
-                    break;
-                    
-                case LEVEL_COLOR_HIDDEN:
-                case LEVEL_COLOR_NONE:
-                    if (!lv_obj_has_flag(ui_levelColourIndicator, LV_OBJ_FLAG_HIDDEN)) {
-                        lv_obj_add_flag(ui_levelColourIndicator, LV_OBJ_FLAG_HIDDEN);
-                    }
-                    break;
-            }
-            last_level_color = current_level_color;
-        }
-    }
-    
-    /* ===== Update ledIndicator (card state indicator) ===== */
-    if (ui_ledIndicator != NULL) {
-        typedef enum {
-            LED_STATE_HIDDEN,
-            LED_STATE_GREEN,
-            LED_STATE_FLASH_RED
-        } LED_State_t;
-        
-        static LED_State_t last_led_state = LED_STATE_HIDDEN;
-        LED_State_t current_led_state;
-        
-        /* Force refresh on new card insertion */
-        if (ui_ctx.force_refresh_on_next_update) {
-            last_led_state = LED_STATE_HIDDEN;
-        }
-        
-        /* Determine LED state based on card state and module failures */
-        if (ui_ctx.has_module_failures) {
-            /* Module failures - flash red to alert operator */
-            current_led_state = LED_STATE_FLASH_RED;
-        } else if (card_state == MIFARE_CARD_STATE_ABSENT) {
-            /* No card - hide LED */
-            current_led_state = LED_STATE_HIDDEN;
-        } else if (card_state == MIFARE_CARD_STATE_PRESENT && card_authenticated) {
-            /* Card validated with balance - solid green */
-            current_led_state = LED_STATE_GREEN;
-        } else if (card_state == MIFARE_CARD_STATE_INITIALIZING || 
-                   card_state == MIFARE_CARD_STATE_NEEDS_POLLING_CYCLE ||
-                   card_state == MIFARE_CARD_STATE_ERROR ||
-                   (card_state == MIFARE_CARD_STATE_PRESENT && card_balance_tokens == 0) ||
-                   (card_state == MIFARE_CARD_STATE_PRESENT && txn_state == TRANSACTION_STATE_WAITING_REMOVAL)) {
-            /* Card validating, error state, no balance, or no flow - flash red at 2Hz */
-            current_led_state = LED_STATE_FLASH_RED;
-        } else {
-            /* Default - keep last state when card present, hide otherwise */
-            current_led_state = card_present_now ? last_led_state : LED_STATE_HIDDEN;
-        }
-        
-        /* Handle flashing state - 2Hz = 250ms on, 250ms off */
-        if (current_led_state == LED_STATE_FLASH_RED) {
-            const uint32_t flash_interval_ms = 250;  /* 2Hz = 250ms on/off */
-            uint32_t now = xTaskGetTickCount();
-            
-            if ((now - ui_ctx.last_led_toggle_time) >= pdMS_TO_TICKS(flash_interval_ms)) {
-                ui_ctx.led_is_on = !ui_ctx.led_is_on;
-                ui_ctx.last_led_toggle_time = now;
-                
-                if (ui_ctx.led_is_on) {
-                    lv_obj_set_style_bg_color(ui_ledIndicator, lv_color_hex(0xFF0000), LV_PART_MAIN | LV_STATE_DEFAULT);
-                    if (lv_obj_has_flag(ui_ledIndicator, LV_OBJ_FLAG_HIDDEN)) {
-                        lv_obj_clear_flag(ui_ledIndicator, LV_OBJ_FLAG_HIDDEN);
-                    }
-                } else {
-                    /* Flash off - hide during off phase */
-                    if (!lv_obj_has_flag(ui_ledIndicator, LV_OBJ_FLAG_HIDDEN)) {
-                        lv_obj_add_flag(ui_ledIndicator, LV_OBJ_FLAG_HIDDEN);
-                    }
-                }
-            }
-        } else if (current_led_state != last_led_state) {
-            /* State changed - apply new solid color or visibility */
-            switch (current_led_state) {
-                case LED_STATE_GREEN:
-                    lv_obj_set_style_bg_color(ui_ledIndicator, lv_color_hex(0x00FF00), LV_PART_MAIN | LV_STATE_DEFAULT);
-                    if (lv_obj_has_flag(ui_ledIndicator, LV_OBJ_FLAG_HIDDEN)) {
-                        lv_obj_clear_flag(ui_ledIndicator, LV_OBJ_FLAG_HIDDEN);
-                    }
-                    break;
-                    
-                case LED_STATE_HIDDEN:
-                    if (!lv_obj_has_flag(ui_ledIndicator, LV_OBJ_FLAG_HIDDEN)) {
-                        lv_obj_add_flag(ui_ledIndicator, LV_OBJ_FLAG_HIDDEN);
-                    }
-                    break;
-                    
-                case LED_STATE_FLASH_RED:
-                    /* Handled above */
-                    break;
-            }
-        }
-        
-        last_led_state = current_led_state;
-    }
-    
-    /* Clear force refresh flag after all updates complete */
+
+    /* ── Widget renders ───────────────────────────────────────────────────── */
+    render_customer_id(disp_state, cfg->ui.no_card_customer_id);
+    render_card_error_status(disp_state, card_waiting_tap, ui_ctx.operation_context);
+    render_card_remaining(disp_state, display_balance_ml);
+    render_total_remaining_bar(disp_state, card_balance_ml, ui_ctx.last_topup_ml);
+    render_level_colour(disp_state, display_balance_ml);
+    render_led_indicator(disp_state);
+
     ui_ctx.force_refresh_on_next_update = false;
-
-/* Note: Dispense option symbols (vacSymbol, pressWasherSymbol, washBrushSymbol) 
-     * and colored buttons (redButton, blueButton, greedButton) removed - 
-     * these elements don't exist in the current UI design */
 }
-
-

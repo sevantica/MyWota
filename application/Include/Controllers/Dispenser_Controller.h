@@ -108,8 +108,8 @@ DispenserResult_t MIFARE_Dispenser_Init(void);
 /**
  * @brief Request dispense (scans card, deducts token, starts timer)
  * @return DispenserResult_t Request result
- * @note This function polls MIFARE_Transaction_Manager for card data,
- *       modifies token count, and manages the dispense timer
+ * @note This function reacts to the MIFARE transaction snapshot,
+ *       modifies volume balance, and manages the dispense timer.
  */
 DispenserResult_t MIFARE_Dispenser_StartDispense(void);
 
@@ -137,7 +137,7 @@ bool MIFARE_Dispenser_IsDispenseActive(void);
  * @param initial_balance_ml Initial water volume in milliliters
  * @param customer_id Unique customer identifier (0 to auto-generate from card serial)
  * @return DispenserResult_t Operation result
- * @note This polls transaction manager, modifies user data, and writes to card
+ * @note Updates the current transaction snapshot, modifies user data, and writes to card.
  */
 DispenserResult_t MIFARE_Dispenser_InitializeNewCustomer(uint32_t initial_balance_ml, uint64_t customer_id);
 
@@ -145,17 +145,17 @@ DispenserResult_t MIFARE_Dispenser_InitializeNewCustomer(uint32_t initial_balanc
  * @brief Add water volume to an existing customer card (top-up)
  * @param topup_ml Number of milliliters of water to add
  * @return DispenserResult_t Operation result
- * @note This polls transaction manager, increments balance, and writes to card
+ * @note Updates the current transaction snapshot, increments balance, and writes to card.
  */
 DispenserResult_t MIFARE_Dispenser_TopupCard(uint32_t topup_ml);
 
 /**
- * @brief Start the dispenser polling task
+ * @brief Start the dispenser event/status service task
  */
 void Task_Start_Dispenser_Task(void);
 
 /**
- * @brief Stop the dispenser polling task
+ * @brief Stop the dispenser event/status service task
  */
 void Task_Stop_Dispenser_Task(void);
 
@@ -164,7 +164,7 @@ void Task_Stop_Dispenser_Task(void);
  */
 TaskHandle_t Dispenser_Task_GetHandle(void);
 
-/* UI Helper Functions - Business logic layer exposes these for UI to poll */
+/* Legacy snapshot helpers for command/RS485 adapters. UI consumes events. */
 uint32_t Dispenser_GetBalanceMl(void);            // Get current balance in milliliters from card
 uint32_t Dispenser_GetDispenseVolumeRemainingMl(void);  // Get remaining dispense volume in milliliters (same as balance when dispensing)
 bool Dispenser_IsDispenseActive(void);            // Returns true if dispense is active
@@ -173,6 +173,10 @@ uint32_t Dispenser_GetTotalDispensesCompleted(void); // Lifetime dispenses
 uint32_t Dispenser_GetTotalVolumePurchasedMl(void); // Lifetime volume purchased in ml
 ValveState_t Dispenser_GetValveState(void);       // Get current valve state (OPEN/CLOSED)
 float Dispenser_GetFlowRateLPM(void);             // Get current flow rate in liters per minute
+uint8_t Dispenser_GetLastError(void);              // Get last RS485_App_Error_t value
+bool Dispenser_IsCardPresent(void);
+bool Dispenser_IsCardReady(void);
+bool Dispenser_GetCardUID(uint8_t *uid_out, uint8_t *len_out);
 
 /**
  * @brief Sample the slave's flow diagnostics ring (called by RS485 status responder).
@@ -284,7 +288,7 @@ bool Dispenser_IsSelfCleaning(void);
 uint32_t Dispenser_GetLastCleanUnixTime(void);
 
 /**
- * @brief Get current dispenser state (for RS485 status reporting).
+ * @brief Get current dispenser state (legacy RS485 snapshot reporting).
  */
 DispenserState_t Dispenser_GetControllerState(void);
 
@@ -301,10 +305,6 @@ const Application_Instance_t* Dispenser_GetApplicationInterface(void);
  */
 Application_Result_t Dispenser_ConvertResult(DispenserResult_t result);
 
-/**
- * @brief Get the last error code from the dispenser
- * @return Error code (uint8_t casting of RS485_App_Error_t)
- */
-uint8_t Dispenser_GetLastError(void);
+void Dispenser_ClearLastError(void);
 
 #endif /* APPLICATION_INCLUDE_DISPENSER_CONTROLLER_H_ */

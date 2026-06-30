@@ -67,6 +67,7 @@ static System_Command_Status_t cmd_fault_clear(const System_Command_Request_t *r
 {
     (void)request;
     (void)response;
+    Dispenser_ClearLastError();
     Fault_Manager_Clear();
     return SYSTEM_CMD_STATUS_OK;
 }
