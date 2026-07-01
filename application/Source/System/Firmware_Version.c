@@ -24,7 +24,6 @@
 
 /*Private variables ----------------------------------------------------------*/
 static char version_buffer[32];
-static char build_datetime_buffer[64];
 
 /*Public Functions ----------------------------------------------------------*/
 

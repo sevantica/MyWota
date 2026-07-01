@@ -1,4 +1,4 @@
-﻿/*
+/*
  * MyWota UI Driver - Optimized for STM32F411 with ILI9488
  * 
  * Features:
@@ -29,7 +29,6 @@
 #include "ui.h"
 #include "Module_Interface.h"
 #include "MyWota_System.h"
-#include "System_Events.h"
 #include "Hardware_Access.h" /* For SPI_MSG_DEF and centralized hardware definitions */
 #include "USB_Logging.h"
 #include "Event_Broker.h"
@@ -165,7 +164,6 @@ static uint8_t lcd_event_queue_storage[LCD_EVENT_QUEUE_LENGTH * sizeof(Event_t*)
 /* UI State Variables */
 static unsigned long elapsed_seconds = 0;            /* Elapsed seconds */
 static uint8_t  screen_switched = 0;
-static uint8_t  card_present = 0;
 static unsigned long start_tick_ms = 0;              /* Start tick */
 /* (FPS tracking removed - was unused) */
 static unsigned long last_data_poll_ms = 0;          /* Last data poll tick */
@@ -1584,8 +1582,7 @@ static void update_ui_from_system_state(void)
         }
     }
 
-    /* Legacy tracking variable */
-    card_present = card_present_now ? 1 : 0;
+
 
     /* Pending card command (e.g. CLI write) waiting for tap */
     CLI_PendingCommandState_t *pending_cmd = CLI_GetPendingCommand();
